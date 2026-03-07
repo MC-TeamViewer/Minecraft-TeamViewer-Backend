@@ -27,6 +27,7 @@ from server.protocol import (
     PingPacket,
     PongPacket,
     ResyncRequestPacket,
+    WaypointsDeletePacket,
 )
 from server.state import ServerState
 
@@ -368,6 +369,7 @@ async def admin_ws(websocket: WebSocket):
                     "permanent": permanent,
                     "tacticalType": tactical_type,
                     "sourceType": "admin_tactical",
+                    "deletableBy": "owner",  # Admin waypoints can only be deleted by owner
                 }
 
                 try:
@@ -387,6 +389,53 @@ async def admin_ws(websocket: WebSocket):
                         action="command_tactical_waypoint_set",
                         waypointId=waypoint_id,
                         waypoint=validated.model_dump(),
+                    ),
+                )
+                continue
+
+            if isinstance(packet, WaypointsDeletePacket):
+                room_code = state.normalize_room_code(state.get_admin_room(admin_id))
+                admin_source_id = state.build_admin_tactical_source_id(room_code)
+                removed_ids: list[str] = []
+
+                for waypoint_id in packet.waypointIds:
+                    if not isinstance(waypoint_id, str):
+                        continue
+                    waypoint_id = waypoint_id.strip()
+                    if not waypoint_id:
+                        continue
+
+                    source_bucket = state.waypoint_reports.get(waypoint_id)
+                    if not isinstance(source_bucket, dict) or not source_bucket:
+                        continue
+
+                    removed_for_waypoint = False
+                    for source_id, node in list(source_bucket.items()):
+                        if not isinstance(node, dict):
+                            continue
+
+                        waypoint_data = node.get("data", {})
+                        if not isinstance(waypoint_data, dict):
+                            continue
+
+                        deletable_by = str(waypoint_data.get("deletableBy", "everyone") or "everyone").strip().lower()
+                        if deletable_by == "everyone":
+                            removed_for_waypoint = state.delete_report(state.waypoint_reports, waypoint_id, source_id) or removed_for_waypoint
+                            continue
+
+                        if deletable_by == "owner" and source_id == admin_source_id:
+                            removed_for_waypoint = state.delete_report(state.waypoint_reports, waypoint_id, source_id) or removed_for_waypoint
+
+                    if removed_for_waypoint:
+                        removed_ids.append(waypoint_id)
+
+                await send_packet(
+                    websocket,
+                    AdminAckPacket(
+                        ok=bool(removed_ids),
+                        action="waypoints_delete",
+                        waypointIds=removed_ids,
+                        error=None if removed_ids else "waypoint_not_found",
                     ),
                 )
                 continue
@@ -704,12 +753,40 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             if packet.type == "waypoints_delete":
-                # 路标删除：仅删除当前来源提交的目标路标。
+                # 路标删除：根据 deletableBy 权限控制删除逻辑。
                 waypoint_ids = packet.waypointIds
 
                 for waypoint_id in waypoint_ids:
                     if not isinstance(waypoint_id, str):
                         continue
+                    
+                    # 检查 waypoint 是否存在
+                    source_bucket = state.waypoint_reports.get(waypoint_id)
+                    if not isinstance(source_bucket, dict) or not source_bucket:
+                        continue
+                    
+                    # 获取第一个来源的节点数据来检查权限（假设同一 waypoint 的不同来源有相同的权限设置）
+                    first_node = next(iter(source_bucket.values()), None)
+                    if not isinstance(first_node, dict):
+                        continue
+                    
+                    waypoint_data = first_node.get("data", {})
+                    if not isinstance(waypoint_data, dict):
+                        continue
+                    
+                    # 检查删除权限：deletableBy="owner" 时仅创建者可删除
+                    deletable_by = waypoint_data.get("deletableBy", "everyone")
+                    if deletable_by == "owner":
+                        # 仅当提交者是创建者时才允许删除
+                        if submit_player_id not in source_bucket:
+                            logger.debug(
+                                "Waypoint delete denied: playerId=%s is not owner of waypoint=%s",
+                                submit_player_id,
+                                waypoint_id,
+                            )
+                            continue
+                    
+                    # 执行删除：删除当前提交者的报告
                     state.delete_report(state.waypoint_reports, waypoint_id, submit_player_id)
 
                 continue

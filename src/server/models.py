@@ -62,8 +62,9 @@ class WaypointData(BaseModel):
     targetEntityType: Optional[str] = Field(default=None, description="命中实体类型", json_schema_extra={"reliableTransport": True})
     targetEntityName: Optional[str] = Field(default=None, description="命中实体名称", json_schema_extra={"reliableTransport": True})
     roomCode: Optional[str] = Field(default=None, description="房间号，用于房间隔离显示", json_schema_extra={"reliableTransport": True})
-    permanent: Optional[bool] = Field(default=None, description="是否长期有效（不按默认TTL清理）", json_schema_extra={"reliableTransport": True})
+    permanent: Optional[bool] = Field(default=None, description="是否长期有效（不按默认 TTL 清理）", json_schema_extra={"reliableTransport": True})
     tacticalType: Optional[str] = Field(default=None, description="战术类型，如 attack/defend/gather", json_schema_extra={"reliableTransport": True})
     sourceType: Optional[str] = Field(default=None, description="来源类型，如 admin_tactical", json_schema_extra={"reliableTransport": True})
+    deletableBy: Optional[str] = Field(default="everyone", description="删除权限控制：everyone(任何人可删除)|owner(仅创建者可删除)", json_schema_extra={"reliableTransport": True})
 
     model_config = ConfigDict(extra="ignore")

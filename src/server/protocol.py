@@ -140,7 +140,8 @@ AdminInboundPacket = Annotated[
     | CommandPlayerMarkClearPacket
     | CommandPlayerMarkClearAllPacket
     | CommandSameServerFilterSetPacket
-    | CommandTacticalWaypointSetPacket,
+    | CommandTacticalWaypointSetPacket
+    | WaypointsDeletePacket,
     Field(discriminator="type"),
 ]
 
