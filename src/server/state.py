@@ -441,6 +441,17 @@ class ServerState:
             if now - float(ts) > self.TAB_REPORT_TIMEOUT_SEC:
                 del self.tab_player_reports[source_id]
 
+    def touch_tab_player_report(self, submit_player_id: Optional[str], current_time: float) -> bool:
+        if not isinstance(submit_player_id, str) or not submit_player_id:
+            return False
+
+        report = self.tab_player_reports.get(submit_player_id)
+        if not isinstance(report, dict):
+            return False
+
+        report["timestamp"] = float(current_time)
+        return True
+
     def _build_same_server_groups(
         self,
         current_time: Optional[float] = None,

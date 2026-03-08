@@ -550,6 +550,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.debug("Ignore player packet before handshake registration submitPlayerId=%s", submit_player_id)
                 continue
 
+            if (
+                packet.type not in {"tab_players_update", "tab_players_patch"}
+                and not isinstance(packet, SourceStateClearPacket)
+            ):
+                state.touch_tab_player_report(submit_player_id, time.time())
+
             if packet.type == "state_keepalive":
                 current_time = time.time()
                 touched_players = state.touch_reports(
