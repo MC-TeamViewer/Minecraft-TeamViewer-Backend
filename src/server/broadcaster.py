@@ -97,10 +97,12 @@ class Broadcaster:
     def _compute_scope_patch_for_scopes(self, old_state: dict, new_state: dict, scopes: tuple[str, ...]) -> dict:
         patch = {}
         for scope in scopes:
-            patch[scope] = self.state.compute_scope_patch(
+            scope_patch = self.state.compute_scope_patch(
                 self._wrap_plain_scope(old_state.get(scope, {})),
                 self._wrap_plain_scope(new_state.get(scope, {})),
             )
+            if scope_patch.get("upsert") or scope_patch.get("delete"):
+                patch[scope] = scope_patch
         return patch
 
     @staticmethod
@@ -121,7 +123,8 @@ class Broadcaster:
             meta_patch["connections"] = new_state.get("connections", [])
             meta_patch["connections_count"] = new_state.get("connections_count", 0)
 
-        scope_patch["meta"] = meta_patch
+        if meta_patch:
+            scope_patch["meta"] = meta_patch
         return scope_patch
 
     @staticmethod

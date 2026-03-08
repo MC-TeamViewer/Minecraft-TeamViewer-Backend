@@ -192,7 +192,7 @@ async def admin_ws(websocket: WebSocket):
     """管理端订阅通道：用于查看服务端实时快照。"""
     await websocket.accept()
     admin_id = str(id(websocket))
-    state.admin_connections[admin_id] = websocket
+    handshake_completed = False
     try:
         while True:
             try:
@@ -232,6 +232,8 @@ async def admin_ws(websocket: WebSocket):
                     client_program_version,
                     admin_room,
                 )
+                state.admin_connections[admin_id] = websocket
+                handshake_completed = True
                 await send_packet(
                     websocket,
                     HandshakeAckPacket(
@@ -246,6 +248,10 @@ async def admin_ws(websocket: WebSocket):
                     ),
                 )
                 await broadcaster.send_admin_snapshot_full(admin_id)
+                continue
+
+            if not handshake_completed:
+                await send_packet(websocket, AdminAckPacket(ok=False, error="handshake_required"))
                 continue
 
             if isinstance(packet, PingPacket):

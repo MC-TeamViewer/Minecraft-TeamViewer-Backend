@@ -302,9 +302,9 @@ class SnapshotFullPacket(OutboundPacket):
 class PatchPacket(OutboundPacket):
     type: Literal["patch"] = "patch"
     channel: str | None = None
-    players: dict[str, Any] = Field(default_factory=dict)
-    entities: dict[str, Any] = Field(default_factory=dict)
-    waypoints: dict[str, Any] = Field(default_factory=dict)
+    players: dict[str, Any] | None = None
+    entities: dict[str, Any] | None = None
+    waypoints: dict[str, Any] | None = None
     playerMarks: dict[str, Any] | None = None
     meta: dict[str, Any] | None = None
 
