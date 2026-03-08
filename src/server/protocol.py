@@ -87,6 +87,13 @@ class TabPlayersUpdatePacket(PacketModel):
     tabPlayers: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class TabPlayersPatchPacket(PacketModel):
+    type: Literal["tab_players_patch"]
+    submitPlayerId: str | None = None
+    upsert: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    delete: list[str] = Field(default_factory=list)
+
+
 class PlayersPatchPacket(PacketModel):
     type: Literal["players_patch"]
     submitPlayerId: str | None = None
@@ -149,6 +156,7 @@ PlayerInboundPacket = Annotated[
     PlayerHandshakePacket
     | PlayersUpdatePacket
     | TabPlayersUpdatePacket
+    | TabPlayersPatchPacket
     | PlayersPatchPacket
     | EntitiesUpdatePacket
     | EntitiesPatchPacket

@@ -5,7 +5,7 @@ import math
 import time
 import tomllib
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import WebSocket
 from pydantic import ValidationError
@@ -293,44 +293,131 @@ class ServerState:
             and self.get_player_room(source_id) == normalized_room
         }
 
-    def upsert_tab_player_report(self, submit_player_id: str, tab_players: list, current_time: float) -> dict:
-        normalized_entries: list[dict] = []
+    def _normalize_tab_report_key(self, key_value: Any) -> str | None:
+        if key_value is None:
+            return None
+        if isinstance(key_value, str):
+            text = key_value.strip()
+        else:
+            text = str(key_value).strip()
+        return text or None
+
+    def _build_tab_player_entry(self, item: dict[str, Any]) -> dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+
+        entry_uuid = self._normalize_tab_uuid(item.get("uuid") or item.get("playerUUID") or item.get("id"))
+        entry_name = self._normalize_tab_name(item.get("name") or item.get("playerName"))
+        entry_display_name = self._normalize_tab_name(item.get("displayName"))
+        entry_prefixed_name = self._normalize_tab_name(item.get("prefixedName") or item.get("teamDisplayName"))
+
+        if entry_uuid is None and entry_name is None and entry_display_name is None and entry_prefixed_name is None:
+            return None
+
+        return {
+            "uuid": entry_uuid,
+            "name": entry_name,
+            "displayName": entry_display_name,
+            "prefixedName": entry_prefixed_name,
+        }
+
+    def _build_tab_player_report_key(self, entry: dict[str, Any]) -> str | None:
+        if not isinstance(entry, dict):
+            return None
+        entry_uuid = entry.get("uuid")
+        if isinstance(entry_uuid, str) and entry_uuid:
+            return entry_uuid
+        entry_name = entry.get("name")
+        if isinstance(entry_name, str) and entry_name:
+            return f"name:{entry_name.lower()}"
+        entry_display_name = entry.get("displayName")
+        if isinstance(entry_display_name, str) and entry_display_name:
+            return f"display:{entry_display_name}"
+        entry_prefixed_name = entry.get("prefixedName")
+        if isinstance(entry_prefixed_name, str) and entry_prefixed_name:
+            return f"prefix:{entry_prefixed_name}"
+        return None
+
+    def _build_tab_identity_keys(self, submit_player_id: str, players_by_key: dict[str, dict[str, Any]]) -> list[str]:
         identity_keys: set[str] = set()
         if isinstance(submit_player_id, str) and submit_player_id.strip():
             identity_keys.add(f"uuid:{submit_player_id.strip().lower()}")
 
-        if isinstance(tab_players, list):
-            for item in tab_players:
-                if not isinstance(item, dict):
-                    continue
+        for entry in players_by_key.values():
+            if not isinstance(entry, dict):
+                continue
+            entry_uuid = entry.get("uuid")
+            entry_name = entry.get("name")
+            if isinstance(entry_uuid, str) and entry_uuid:
+                identity_keys.add(f"uuid:{entry_uuid}")
+            if isinstance(entry_name, str) and entry_name:
+                identity_keys.add(f"name:{entry_name.lower()}")
 
-                entry_uuid = self._normalize_tab_uuid(item.get("uuid") or item.get("playerUUID") or item.get("id"))
-                entry_name = self._normalize_tab_name(item.get("name") or item.get("playerName"))
-                entry_display_name = self._normalize_tab_name(item.get("displayName"))
-                entry_prefixed_name = self._normalize_tab_name(item.get("prefixedName") or item.get("teamDisplayName"))
+        return sorted(identity_keys)
 
-                if entry_uuid is None and entry_name is None and entry_display_name is None and entry_prefixed_name is None:
-                    continue
-
-                entry = {
-                    "uuid": entry_uuid,
-                    "name": entry_name,
-                    "displayName": entry_display_name,
-                    "prefixedName": entry_prefixed_name,
-                }
-                normalized_entries.append(entry)
-
-                if entry_uuid:
-                    identity_keys.add(f"uuid:{entry_uuid}")
-                if entry_name:
-                    identity_keys.add(f"name:{entry_name.lower()}")
-
-        report = {
+    def _build_tab_player_report(self, submit_player_id: str, players_by_key: dict[str, dict[str, Any]], current_time: float) -> dict:
+        sanitized_players_by_key = {
+            key: dict(value)
+            for key, value in players_by_key.items()
+            if isinstance(key, str) and key and isinstance(value, dict)
+        }
+        return {
             "timestamp": float(current_time),
             "submitPlayerId": submit_player_id,
-            "players": normalized_entries,
-            "identityKeys": sorted(identity_keys),
+            "players": list(sanitized_players_by_key.values()),
+            "playersByKey": sanitized_players_by_key,
+            "identityKeys": self._build_tab_identity_keys(submit_player_id, sanitized_players_by_key),
         }
+
+    def upsert_tab_player_report(self, submit_player_id: str, tab_players: list, current_time: float) -> dict:
+        players_by_key: dict[str, dict[str, Any]] = {}
+        if isinstance(tab_players, list):
+            for item in tab_players:
+                entry = self._build_tab_player_entry(item)
+                if entry is None:
+                    continue
+                entry_key = self._build_tab_player_report_key(entry)
+                if entry_key is None:
+                    continue
+                players_by_key[entry_key] = entry
+
+        report = self._build_tab_player_report(submit_player_id, players_by_key, current_time)
+        self.tab_player_reports[submit_player_id] = report
+        return report
+
+    def patch_tab_player_report(
+        self,
+        submit_player_id: str,
+        upsert: dict[str, dict[str, Any]],
+        delete: list[str],
+        current_time: float,
+    ) -> dict:
+        existing_report = self.tab_player_reports.get(submit_player_id)
+        existing_players_by_key = existing_report.get("playersByKey") if isinstance(existing_report, dict) else {}
+        players_by_key: dict[str, dict[str, Any]] = {
+            key: dict(value)
+            for key, value in existing_players_by_key.items()
+            if isinstance(key, str) and key and isinstance(value, dict)
+        }
+
+        if isinstance(upsert, dict):
+            for raw_key, item in upsert.items():
+                entry = self._build_tab_player_entry(item)
+                if entry is None:
+                    continue
+                entry_key = self._normalize_tab_report_key(raw_key) or self._build_tab_player_report_key(entry)
+                if entry_key is None:
+                    continue
+                players_by_key[entry_key] = entry
+
+        if isinstance(delete, list):
+            for raw_key in delete:
+                entry_key = self._normalize_tab_report_key(raw_key)
+                if entry_key is None:
+                    continue
+                players_by_key.pop(entry_key, None)
+
+        report = self._build_tab_player_report(submit_player_id, players_by_key, current_time)
         self.tab_player_reports[submit_player_id] = report
         return report
 

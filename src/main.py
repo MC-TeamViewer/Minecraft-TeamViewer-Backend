@@ -586,6 +586,18 @@ async def websocket_endpoint(websocket: WebSocket):
                     await broadcaster.broadcast_admin_updates()
                 continue
 
+            if packet.type == "tab_players_patch":
+                if isinstance(submit_player_id, str) and submit_player_id:
+                    current_time = time.time()
+                    state.patch_tab_player_report(
+                        submit_player_id,
+                        packet.upsert,
+                        packet.delete,
+                        current_time,
+                    )
+                    await broadcaster.broadcast_admin_updates()
+                continue
+
             if packet.type == "players_patch":
                 # 玩家增量：基于该来源已有快照做 merge 后再校验。
                 current_time = time.time()

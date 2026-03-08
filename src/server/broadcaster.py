@@ -114,14 +114,48 @@ class Broadcaster:
         scope_patch = self._compute_scope_patch_for_scopes(old_state, new_state, self._admin_sync_scopes)
 
         meta_patch = {}
-        if old_state.get("tabState") != new_state.get("tabState"):
-            meta_patch["tabState"] = new_state.get("tabState")
+        tab_state_patch = self._compute_tab_state_patch(old_state.get("tabState"), new_state.get("tabState"))
+        if tab_state_patch:
+            meta_patch["tabStatePatch"] = tab_state_patch
         if old_state.get("connections") != new_state.get("connections"):
             meta_patch["connections"] = new_state.get("connections", [])
             meta_patch["connections_count"] = new_state.get("connections_count", 0)
 
         scope_patch["meta"] = meta_patch
         return scope_patch
+
+    @staticmethod
+    def _compute_tab_state_patch(old_tab_state: dict | None, new_tab_state: dict | None) -> dict:
+        old_state = old_tab_state if isinstance(old_tab_state, dict) else {}
+        new_state = new_tab_state if isinstance(new_tab_state, dict) else {}
+
+        old_reports = old_state.get("reports") if isinstance(old_state.get("reports"), dict) else {}
+        new_reports = new_state.get("reports") if isinstance(new_state.get("reports"), dict) else {}
+
+        upsert_reports = {
+            source_id: report
+            for source_id, report in new_reports.items()
+            if old_reports.get(source_id) != report
+        }
+        delete_reports = [
+            source_id
+            for source_id in old_reports.keys()
+            if source_id not in new_reports
+        ]
+
+        patch: dict[str, object] = {}
+        if old_state.get("enabled") != new_state.get("enabled"):
+            patch["enabled"] = bool(new_state.get("enabled", False))
+        if old_state.get("roomCode") != new_state.get("roomCode"):
+            patch["roomCode"] = new_state.get("roomCode")
+        if old_state.get("groups") != new_state.get("groups"):
+            patch["groups"] = new_state.get("groups", [])
+        if upsert_reports:
+            patch["upsertReports"] = upsert_reports
+        if delete_reports:
+            patch["deleteReports"] = delete_reports
+
+        return patch
 
     @staticmethod
     def _compact_scope_state(node_scope_state: dict, scopes: tuple[str, ...]) -> dict:

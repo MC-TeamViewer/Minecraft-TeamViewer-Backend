@@ -17,6 +17,7 @@ UUID_LIST_KEYS = {
     "targetEntityIds",
     "players",
     "delete",
+    "deleteReports",
     "connections",
     "members",
     "waypointIds",
@@ -28,6 +29,7 @@ UUID_KEYED_MAP_FIELDS = {
     "waypoints",
     "playerMarks",
     "reports",
+    "upsertReports",
     "sourceToGroup",
     "upsert",
 }
@@ -111,7 +113,7 @@ def normalize_inbound_uuid_fields(payload: Any, key_name: str | None = None) -> 
                 converted = []
                 for item in raw_value:
                     uuid_text = _canonical_uuid_text(item)
-                    converted.append(uuid_text if uuid_text is not None else item)
+                    converted.append(uuid_text if uuid_text is not None else normalize_inbound_uuid_fields(item, key_text))
                 normalized[key] = converted
                 continue
 
@@ -140,7 +142,7 @@ def normalize_outbound_uuid_fields(payload: Any, key_name: str | None = None) ->
                 converted = []
                 for item in raw_value:
                     raw_uuid = _uuid_bytes(item)
-                    converted.append(raw_uuid if raw_uuid is not None else item)
+                    converted.append(raw_uuid if raw_uuid is not None else normalize_outbound_uuid_fields(item, key_text))
                 normalized[out_key] = converted
                 continue
 
