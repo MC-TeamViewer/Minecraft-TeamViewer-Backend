@@ -121,6 +121,12 @@ class StateKeepalivePacket(PacketModel):
     entities: list[str] = Field(default_factory=list)
 
 
+class SourceStateClearPacket(PacketModel):
+    type: Literal["source_state_clear"]
+    submitPlayerId: str | None = None
+    scopes: list[str] = Field(default_factory=list)
+
+
 class WaypointsUpdatePacket(PacketModel):
     type: Literal["waypoints_update"]
     submitPlayerId: str | None = None
@@ -161,6 +167,7 @@ PlayerInboundPacket = Annotated[
     | EntitiesUpdatePacket
     | EntitiesPatchPacket
     | StateKeepalivePacket
+    | SourceStateClearPacket
     | WaypointsUpdatePacket
     | WaypointsDeletePacket
     | WaypointsEntityDeathCancelPacket

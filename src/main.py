@@ -27,6 +27,7 @@ from server.protocol import (
     PingPacket,
     PongPacket,
     ResyncRequestPacket,
+    SourceStateClearPacket,
     WaypointsDeletePacket,
 )
 from server.state import ServerState
@@ -571,6 +572,16 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                 continue
 
+            if isinstance(packet, SourceStateClearPacket):
+                state.clear_source_state(submit_player_id, packet.scopes)
+                await broadcaster.broadcast_admin_updates()
+                logger.info(
+                    "Cleared source state for submitPlayerId=%s scopes=%s",
+                    submit_player_id,
+                    packet.scopes or ["players", "entities", "tab_players", "waypoints"],
+                )
+                continue
+
             if packet.type == "players_update":
                 # 玩家全量：语义为“该来源本轮玩家状态完整快照”。
                 current_time = time.time()
@@ -854,6 +865,7 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         if submit_player_id:
             state.remove_connection(submit_player_id)
+            await broadcaster.broadcast_admin_updates()
             logger.info("Client %s disconnected", submit_player_id)
 
 

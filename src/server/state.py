@@ -1336,16 +1336,23 @@ class ServerState:
         last_sent = float(self._last_refresh_request_ts.get(source_id, 0.0))
         return (current_time - last_sent) >= self.REFRESH_REQUEST_COOLDOWN_SEC
 
-    def remove_connection(self, player_id: str) -> None:
-        """连接断开时，移除该来源在所有上报池中的数据。"""
-        if player_id in self.connections:
-            del self.connections[player_id]
-        if player_id in self.connection_caps:
-            del self.connection_caps[player_id]
-        if player_id in self.connection_rooms:
-            del self.connection_rooms[player_id]
-        if player_id in self.tab_player_reports:
-            del self.tab_player_reports[player_id]
+    def clear_source_state(self, player_id: str, scopes: Optional[list[str]] = None) -> None:
+        if not isinstance(player_id, str) or not player_id:
+            return
+
+        requested_scopes = set()
+        if isinstance(scopes, list):
+            for raw_scope in scopes:
+                if not isinstance(raw_scope, str):
+                    continue
+                scope = raw_scope.strip().lower()
+                if scope == "tab":
+                    scope = "tab_players"
+                if scope in {"players", "entities", "tab_players", "waypoints"}:
+                    requested_scopes.add(scope)
+
+        if not requested_scopes:
+            requested_scopes = {"players", "entities", "tab_players", "waypoints"}
 
         def remove_source_reports(report_map: Dict[str, Dict[str, dict]]) -> None:
             for object_id in list(report_map.keys()):
@@ -1358,6 +1365,21 @@ class ServerState:
                 if not source_bucket:
                     del report_map[object_id]
 
-        remove_source_reports(self.player_reports)
-        remove_source_reports(self.entity_reports)
-        remove_source_reports(self.waypoint_reports)
+        if "tab_players" in requested_scopes and player_id in self.tab_player_reports:
+            del self.tab_player_reports[player_id]
+        if "players" in requested_scopes:
+            remove_source_reports(self.player_reports)
+        if "entities" in requested_scopes:
+            remove_source_reports(self.entity_reports)
+        if "waypoints" in requested_scopes:
+            remove_source_reports(self.waypoint_reports)
+
+    def remove_connection(self, player_id: str) -> None:
+        """连接断开时，移除该来源在所有上报池中的数据。"""
+        if player_id in self.connections:
+            del self.connections[player_id]
+        if player_id in self.connection_caps:
+            del self.connection_caps[player_id]
+        if player_id in self.connection_rooms:
+            del self.connection_rooms[player_id]
+        self.clear_source_state(player_id)
