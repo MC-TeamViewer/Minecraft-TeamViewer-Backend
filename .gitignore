@@ -13,3 +13,7 @@
 .idea/
 .vscode/
 **/__pycache__
+
+# Docker
+Dockerfile.*
+*.dockerfile
