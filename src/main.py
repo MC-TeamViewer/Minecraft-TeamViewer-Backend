@@ -460,6 +460,7 @@ async def admin_ws(websocket: WebSocket):
 
 
 @app.websocket("/playeresp")
+@app.websocket("/mc-client")
 async def websocket_endpoint(websocket: WebSocket):
     """
     玩家数据主通道。
