@@ -32,6 +32,7 @@ class ServerState:
     ENTITY_TIMEOUT = 300
     WAYPOINT_TIMEOUT = 60
     BATTLE_CHUNK_TIMEOUT = 120
+    BATTLE_CHUNK_CACHE_RETENTION_SEC = 7200
     # 多来源切换阈值：仅当候选来源显著更新（领先该阈值秒）才切换来源，减少抖动。
     SOURCE_SWITCH_THRESHOLD_SEC = 0.35
     # 超时清理日志输出节流：避免高频刷屏。
@@ -56,9 +57,11 @@ class ServerState:
     TAB_REPORT_TIMEOUT_SEC = 45
     DEFAULT_ROOM_CODE = "default"
     ADMIN_TACTICAL_SOURCE_PREFIX = "__admin_tactical__:"
+    BATTLE_CHUNK_CACHE_SOURCE_PREFIX = "__battle_chunk_cache__:"
 
     # 服务端配置文件（TOML）路径。
     CONFIG_FILE_NAME = "server_state_config.toml"
+    BATTLE_CHUNK_SYMBOL_CONFIG_FILE_NAME = "battle_chunk_symbol_config.toml"
 
     def __init__(self) -> None:
         # 已仲裁后的最终视图，供广播层直接下发。
@@ -66,6 +69,7 @@ class ServerState:
         self.entities: Dict[str, dict] = {}
         self.waypoints: Dict[str, dict] = {}
         self.battle_chunks: Dict[str, dict] = {}
+        self.battle_chunk_cache: Dict[str, dict] = {}
 
         # 原始上报池：object_id -> source_id -> state_node。
         self.player_reports: Dict[str, Dict[str, dict]] = {}
@@ -101,6 +105,8 @@ class ServerState:
         # 2) 全部从 server_state_config.toml 读取；
         # 3) 未配置时回退到类默认值。
         config = self._load_file_config()
+        battle_chunk_symbol_config = self._load_battle_chunk_symbol_config()
+        self.battle_chunk_marker_type_by_symbol = self._parse_battle_chunk_symbol_config(battle_chunk_symbol_config)
 
         timeout_cfg = config.get("timeouts", {}) if isinstance(config.get("timeouts"), dict) else {}
         self.PLAYER_TIMEOUT = self._coerce_int(timeout_cfg.get("playerTimeoutSec"), self.PLAYER_TIMEOUT, 1, 3600)
@@ -111,6 +117,12 @@ class ServerState:
             self.BATTLE_CHUNK_TIMEOUT,
             5,
             86400,
+        )
+        self.BATTLE_CHUNK_CACHE_RETENTION_SEC = self._coerce_int(
+            timeout_cfg.get("battleChunkCacheRetentionSec"),
+            self.BATTLE_CHUNK_CACHE_RETENTION_SEC,
+            60,
+            604800,
         )
 
         timeout_log_cfg = config.get("timeoutLog", {}) if isinstance(config.get("timeoutLog"), dict) else {}
@@ -167,11 +179,16 @@ class ServerState:
         logger.info(
             "ServerState timeout config "
             f"player={self.PLAYER_TIMEOUT}s entity={self.ENTITY_TIMEOUT}s "
-            f"waypoint={self.WAYPOINT_TIMEOUT}s battleChunk={self.BATTLE_CHUNK_TIMEOUT}s"
+            f"waypoint={self.WAYPOINT_TIMEOUT}s battleChunk={self.BATTLE_CHUNK_TIMEOUT}s "
+            f"battleChunkCache={self.BATTLE_CHUNK_CACHE_RETENTION_SEC}s"
         )
         logger.info(
             "ServerState same-server filter config "
             f"enabled={self.same_server_filter_enabled} tabReportTimeout={self.TAB_REPORT_TIMEOUT_SEC}s"
+        )
+        logger.info(
+            "Battle chunk symbol config loaded markers=%s",
+            self.battle_chunk_marker_type_by_symbol,
         )
 
     @classmethod
@@ -179,11 +196,15 @@ class ServerState:
         return Path(__file__).resolve().parent / cls.CONFIG_FILE_NAME
 
     @classmethod
-    def _load_file_config(cls) -> dict:
-        path = cls._config_file_path()
+    def _battle_chunk_symbol_config_file_path(cls) -> Path:
+        return Path(__file__).resolve().parent / cls.BATTLE_CHUNK_SYMBOL_CONFIG_FILE_NAME
+
+    @classmethod
+    def _load_toml_file(cls, path: Path, label: str) -> dict:
         if not path.exists():
             logger.warning(
-                "Config file not found, fallback to defaults: %s",
+                "%s file not found, fallback to defaults: %s",
+                label,
                 path,
             )
             return {}
@@ -194,11 +215,38 @@ class ServerState:
             return data if isinstance(data, dict) else {}
         except Exception as exc:
             logger.warning(
-                "Failed to load config file %s, fallback to defaults: %s",
+                "Failed to load %s file %s, fallback to defaults: %s",
+                label,
                 path,
                 exc,
             )
             return {}
+
+    @classmethod
+    def _load_file_config(cls) -> dict:
+        return cls._load_toml_file(cls._config_file_path(), "Config")
+
+    @classmethod
+    def _load_battle_chunk_symbol_config(cls) -> dict:
+        return cls._load_toml_file(cls._battle_chunk_symbol_config_file_path(), "Battle chunk symbol config")
+
+    @staticmethod
+    def _parse_battle_chunk_symbol_config(config: dict) -> Dict[str, str]:
+        markers = config.get("markers") if isinstance(config, dict) else None
+        if not isinstance(markers, dict):
+            return {}
+
+        parsed: Dict[str, str] = {}
+        for marker_type, symbols in markers.items():
+            normalized_marker_type = str(marker_type or "").strip()
+            if not normalized_marker_type or not isinstance(symbols, list):
+                continue
+            for raw_symbol in symbols:
+                symbol = str(raw_symbol or "").strip()
+                if not symbol:
+                    continue
+                parsed[symbol] = normalized_marker_type
+        return parsed
 
     @staticmethod
     def _coerce_int(value, default: int, min_value: int, max_value: int) -> int:
@@ -294,6 +342,24 @@ class ServerState:
         if isinstance(room_code, str) and room_code.strip():
             return room_code
         return self.DEFAULT_ROOM_CODE
+
+    def resolve_battle_chunk_marker_type(self, symbol_value) -> Optional[str]:
+        symbol = str(symbol_value or "").strip()
+        if not symbol:
+            return None
+        marker_type = self.battle_chunk_marker_type_by_symbol.get(symbol)
+        if not isinstance(marker_type, str) or not marker_type.strip():
+            return None
+        return marker_type
+
+    def apply_battle_chunk_symbol_rules(self, payload: dict) -> dict:
+        normalized = dict(payload) if isinstance(payload, dict) else {}
+        marker_type = self.resolve_battle_chunk_marker_type(normalized.get("symbol"))
+        if marker_type is None:
+            normalized.pop("markerType", None)
+            return normalized
+        normalized["markerType"] = marker_type
+        return normalized
 
     def get_active_sources_in_room(self, room_code: str) -> set[str]:
         normalized_room = self.normalize_room_code(room_code)
@@ -621,6 +687,24 @@ class ServerState:
         return cls.normalize_room_code(room)
 
     @classmethod
+    def build_battle_chunk_cache_source_id(cls, room_code: str) -> str:
+        normalized_room = cls.normalize_room_code(room_code)
+        return f"{cls.BATTLE_CHUNK_CACHE_SOURCE_PREFIX}{normalized_room}"
+
+    @classmethod
+    def is_battle_chunk_cache_source_id(cls, source_id: Optional[str]) -> bool:
+        return isinstance(source_id, str) and source_id.startswith(cls.BATTLE_CHUNK_CACHE_SOURCE_PREFIX)
+
+    @classmethod
+    def parse_battle_chunk_cache_room_code(cls, source_id: Optional[str]) -> Optional[str]:
+        if not cls.is_battle_chunk_cache_source_id(source_id):
+            return None
+        if not isinstance(source_id, str):
+            return None
+        room = source_id[len(cls.BATTLE_CHUNK_CACHE_SOURCE_PREFIX):]
+        return cls.normalize_room_code(room)
+
+    @classmethod
     def filter_waypoint_state_by_sources_and_room(
         cls,
         state_map: Dict[str, dict],
@@ -665,12 +749,20 @@ class ServerState:
             if not isinstance(node, dict):
                 continue
             source_id = node.get("submitPlayerId")
-            if not isinstance(source_id, str) or not source_id or source_id not in allowed_sources:
-                continue
 
             data = node.get("data") if isinstance(node.get("data"), dict) else {}
             data_room = cls.normalize_room_code(data.get("roomCode")) if isinstance(data, dict) else cls.DEFAULT_ROOM_CODE
             if data_room != normalized_room:
+                continue
+
+            if cls.is_battle_chunk_cache_source_id(source_id):
+                cache_room = cls.parse_battle_chunk_cache_room_code(source_id)
+                if cache_room != normalized_room:
+                    continue
+                filtered[object_id] = node
+                continue
+
+            if not isinstance(source_id, str) or not source_id or source_id not in allowed_sources:
                 continue
             filtered[object_id] = node
 
@@ -1029,6 +1121,52 @@ class ServerState:
             return 0.0
         return float(value)
 
+    def prune_battle_chunk_cache(self, current_time: Optional[float] = None) -> int:
+        now = time.time() if current_time is None else float(current_time)
+        before_count = len(self.battle_chunk_cache)
+        for chunk_id in list(self.battle_chunk_cache.keys()):
+            node = self.battle_chunk_cache.get(chunk_id)
+            if not isinstance(node, dict):
+                del self.battle_chunk_cache[chunk_id]
+                continue
+            age_seconds = now - self.node_timestamp(node)
+            if age_seconds > self.BATTLE_CHUNK_CACHE_RETENTION_SEC:
+                del self.battle_chunk_cache[chunk_id]
+        return before_count - len(self.battle_chunk_cache)
+
+    def update_battle_chunk_cache(self, active_battle_chunks: Dict[str, dict], current_time: Optional[float] = None) -> None:
+        now = time.time() if current_time is None else float(current_time)
+        self.prune_battle_chunk_cache(now)
+
+        for chunk_id, node in active_battle_chunks.items():
+            if not isinstance(node, dict):
+                continue
+
+            data = node.get("data")
+            if not isinstance(data, dict):
+                continue
+
+            room_code = self.normalize_room_code(data.get("roomCode"))
+            cached_data = dict(data)
+            cached_data["roomCode"] = room_code
+            self.battle_chunk_cache[chunk_id] = self.build_state_node(
+                self.build_battle_chunk_cache_source_id(room_code),
+                now,
+                cached_data,
+            )
+
+    def build_effective_battle_chunk_state(self, active_battle_chunks: Dict[str, dict], current_time: Optional[float] = None) -> Dict[str, dict]:
+        now = time.time() if current_time is None else float(current_time)
+        self.update_battle_chunk_cache(active_battle_chunks, now)
+
+        effective = {
+            chunk_id: node
+            for chunk_id, node in self.battle_chunk_cache.items()
+            if isinstance(node, dict)
+        }
+        effective.update(active_battle_chunks)
+        return effective
+
     @classmethod
     def resolve_report_map(
         cls,
@@ -1122,6 +1260,7 @@ class ServerState:
 
     def refresh_resolved_states(self) -> dict:
         """刷新最终视图并返回相对于上一帧的 patch。"""
+        current_time = time.time()
         old_players = dict(self.players)
         old_entities = dict(self.entities)
         old_waypoints = dict(self.waypoints)
@@ -1145,12 +1284,13 @@ class ServerState:
             self.SOURCE_SWITCH_THRESHOLD_SEC,
             prefer_object_id_source=False,
         )
-        self.battle_chunks = self.resolve_report_map(
+        active_battle_chunks = self.resolve_report_map(
             self.battle_chunk_reports,
             self.battle_chunk_selected_sources,
             self.SOURCE_SWITCH_THRESHOLD_SEC,
             prefer_object_id_source=False,
         )
+        self.battle_chunks = self.build_effective_battle_chunk_state(active_battle_chunks, current_time)
 
         return {
             "players": self.compute_scope_patch(old_players, self.players),
@@ -1237,6 +1377,7 @@ class ServerState:
             "entities": 0,
             "waypoints": 0,
             "battleChunks": 0,
+            "battleChunkCache": 0,
         }
         removed_samples = []
 
@@ -1306,18 +1447,21 @@ class ServerState:
         cleanup_report_map("entities", self.entity_reports, lambda node: self.ENTITY_TIMEOUT)
         cleanup_report_map("waypoints", self.waypoint_reports, effective_waypoint_timeout)
         cleanup_report_map("battleChunks", self.battle_chunk_reports, lambda node: self.BATTLE_CHUNK_TIMEOUT)
+        removed_summary["battleChunkCache"] = self.prune_battle_chunk_cache(current_time)
 
         total_removed = (
             removed_summary["players"]
             + removed_summary["entities"]
             + removed_summary["waypoints"]
             + removed_summary["battleChunks"]
+            + removed_summary["battleChunkCache"]
         )
         if total_removed > 0 and (current_time - self._last_timeout_log_ts) >= self.TIMEOUT_LOG_INTERVAL_SEC:
             logger.debug(
                 "Timeout cleanup removed sources "
                 f"players={removed_summary['players']} entities={removed_summary['entities']} "
                 f"waypoints={removed_summary['waypoints']} battleChunks={removed_summary['battleChunks']} "
+                f"battleChunkCache={removed_summary['battleChunkCache']} "
                 f"total={total_removed}"
             )
             for sample in removed_samples:

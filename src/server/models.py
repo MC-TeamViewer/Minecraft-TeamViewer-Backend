@@ -76,6 +76,7 @@ class BattleChunkData(BaseModel):
     chunkZ: int = Field(default=..., description="区块Z坐标", json_schema_extra={"reliableTransport": True})
     dimension: str = Field(default=..., description="维度ID", json_schema_extra={"reliableTransport": True})
     symbol: Optional[str] = Field(default=None, description="记分版字符", json_schema_extra={"reliableTransport": True})
+    markerType: Optional[str] = Field(default=None, description="符号语义类型", json_schema_extra={"reliableTransport": True})
     colorRaw: str = Field(default=..., description="原始颜色值", json_schema_extra={"reliableTransport": True})
     colorNote: Optional[str] = Field(default=None, description="颜色备注", json_schema_extra={"reliableTransport": True})
     observedAt: int = Field(default=..., description="客户端观测时间(ms)", json_schema_extra={"reliableTransport": True})

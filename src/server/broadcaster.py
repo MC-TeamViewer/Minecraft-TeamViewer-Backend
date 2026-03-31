@@ -376,6 +376,7 @@ class Broadcaster:
                 source_id,
                 players=payload.get("players", []),
                 entities=payload.get("entities", []),
+                battle_chunks=[],
                 reason="expiry_soon",
                 current_time=current_time,
                 bypass_cooldown=False,
@@ -386,6 +387,7 @@ class Broadcaster:
         source_id: str,
         players: list,
         entities: list,
+        battle_chunks: list | None,
         reason: str,
         current_time: float | None = None,
         bypass_cooldown: bool = False,
@@ -395,7 +397,8 @@ class Broadcaster:
 
         players = [item for item in players if isinstance(item, str) and item]
         entities = [item for item in entities if isinstance(item, str) and item]
-        if not players and not entities:
+        battle_chunks = [item for item in (battle_chunks or []) if isinstance(item, str) and item]
+        if not players and not entities and not battle_chunks:
             return
 
         now = time.time() if current_time is None else current_time
@@ -414,13 +417,15 @@ class Broadcaster:
             serverTime=now,
             players=players,
             entities=entities,
+            battleChunks=battle_chunks,
         )
         try:
             await ws.send_bytes(self._encode_message(message))
             self.state.mark_refresh_request_sent(source_id, now)
             logger.debug(
                 "Sent refresh_req "
-                f"source={source_id} players={len(players)} entities={len(entities)} reason={reason}"
+                f"source={source_id} players={len(players)} entities={len(entities)} "
+                f"battleChunks={len(battle_chunks)} reason={reason}"
             )
         except Exception as e:
             logger.warning(

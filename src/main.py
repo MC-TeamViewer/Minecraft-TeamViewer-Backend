@@ -685,6 +685,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         submit_player_id,
                         players=missing_baseline_players,
                         entities=[],
+                        battle_chunks=[],
                         reason="missing_baseline_patch",
                         bypass_cooldown=False,
                     )
@@ -757,6 +758,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         submit_player_id,
                         players=[],
                         entities=missing_baseline_entities,
+                        battle_chunks=[],
                         reason="missing_baseline_patch",
                         bypass_cooldown=False,
                     )
@@ -810,18 +812,22 @@ async def websocket_endpoint(websocket: WebSocket):
                 current_time = time.time()
                 upsert = packet.upsert
                 delete = packet.delete
+                missing_baseline_chunks = []
 
                 for chunk_id, chunk_data in upsert.items():
                     source_key = submit_player_id if isinstance(submit_player_id, str) else ""
                     existing_node = state.battle_chunk_reports.get(chunk_id, {}).get(source_key)
                     try:
                         normalized = state.merge_patch_and_validate(BattleChunkData, existing_node, chunk_data)
+                        normalized = state.apply_battle_chunk_symbol_rules(normalized)
                         node = state.build_state_node(submit_player_id, current_time, normalized)
                         state.upsert_report(state.battle_chunk_reports, chunk_id, submit_player_id, node)
                     except ValidationError as e:
                         missing_fields = state.missing_fields_from_validation_error(e)
                         existing_data = existing_node.get("data") if isinstance(existing_node, dict) else None
                         existing_keys = sorted(existing_data.keys()) if isinstance(existing_data, dict) else []
+                        if not isinstance(existing_data, dict):
+                            missing_baseline_chunks.append(chunk_id)
                         logger.warning(
                             "Battle chunk patch validation failed "
                             f"chunkId={chunk_id} submitPlayerId={submit_player_id} sourceKey={source_key!r} "
@@ -842,6 +848,16 @@ async def websocket_endpoint(websocket: WebSocket):
                         if not isinstance(chunk_id, str):
                             continue
                         state.delete_report(state.battle_chunk_reports, chunk_id, submit_player_id)
+
+                if missing_baseline_chunks and isinstance(submit_player_id, str) and submit_player_id:
+                    await broadcaster.send_refresh_request_to_source(
+                        submit_player_id,
+                        players=[],
+                        entities=[],
+                        battle_chunks=missing_baseline_chunks,
+                        reason="missing_baseline_patch",
+                        bypass_cooldown=False,
+                    )
 
                 continue
 
@@ -966,11 +982,17 @@ async def snapshot(roomCode: str | None = None):
         selected_sources,
         selected_room,
     )
+    selected_battle_chunks = state.filter_battle_chunk_state_by_sources_and_room(
+        state.battle_chunks,
+        selected_sources,
+        selected_room,
+    )
 
     room_digests = {
         "players": state.state_digest(selected_players),
         "entities": state.state_digest(selected_entities),
         "waypoints": state.state_digest(selected_waypoints),
+        "battleChunks": state.state_digest(selected_battle_chunks),
     }
 
     return JSONResponse({
@@ -978,6 +1000,7 @@ async def snapshot(roomCode: str | None = None):
         "players": dict(state.players),
         "entities": dict(state.entities),
         "waypoints": dict(state.waypoints),
+        "battleChunks": dict(state.battle_chunks),
         "playerMarks": dict(state.player_marks),
         "tabState": state.build_admin_tab_snapshot(selected_room),
         "connections": list(state.connections.keys()),
@@ -993,6 +1016,7 @@ async def snapshot(roomCode: str | None = None):
             "players": dict(selected_players),
             "entities": dict(selected_entities),
             "waypoints": dict(selected_waypoints),
+            "battleChunks": dict(selected_battle_chunks),
             "tabState": state.build_admin_tab_snapshot(selected_room),
             "digests": room_digests,
         },

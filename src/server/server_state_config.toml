@@ -8,6 +8,10 @@ playerTimeoutSec = 120
 entityTimeoutSec = 300
 # 路标对象基础超时时间（秒）；路标可被 payload.ttlSeconds 覆盖
 waypointTimeoutSec = 60
+# 战局区块活跃来源超时时间（秒）
+battleChunkTimeoutSec = 120
+# 战局区块服务端缓存保留时间（秒）
+battleChunkCacheRetentionSec = 7200
 
 [timeoutLog]
 # 超时清理日志最小输出间隔（秒）

@@ -345,6 +345,7 @@ class RefreshRequestOutboundPacket(OutboundPacket):
     serverTime: float
     players: list[str]
     entities: list[str]
+    battleChunks: list[str] = Field(default_factory=list)
 
 
 class ReportRateHintPacket(OutboundPacket):
