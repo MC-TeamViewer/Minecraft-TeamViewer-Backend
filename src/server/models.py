@@ -80,7 +80,27 @@ class BattleChunkData(BaseModel):
     colorRaw: str = Field(default=..., description="原始颜色值", json_schema_extra={"reliableTransport": True})
     colorNote: Optional[str] = Field(default=None, description="颜色备注", json_schema_extra={"reliableTransport": True})
     observedAt: int = Field(default=..., description="客户端观测时间(ms)", json_schema_extra={"reliableTransport": True})
+    positionSampledAt: Optional[int] = Field(default=None, description="用于对齐的本地位置采样时间(ms)", json_schema_extra={"reliableTransport": True})
+    alignmentSource: Optional[str] = Field(default=None, description="绝对定位对齐来源", json_schema_extra={"reliableTransport": True})
     reporterId: Optional[str] = Field(default=None, description="上报玩家UUID", json_schema_extra={"reliableTransport": True})
     roomCode: Optional[str] = Field(default=None, description="房间号", json_schema_extra={"reliableTransport": True})
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class BattleMapObservationCandidate(BaseModel):
+    baseChunkX: int = Field(default=..., description="候选基准区块X")
+    baseChunkZ: int = Field(default=..., description="候选基准区块Z")
+    positionSampledAt: int = Field(default=..., description="本地位置采样时间(ms)")
+    source: str = Field(default=..., description="候选来源")
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class BattleMapObservationCell(BaseModel):
+    relChunkX: int = Field(default=..., description="相对基准区块X偏移")
+    relChunkZ: int = Field(default=..., description="相对基准区块Z偏移")
+    symbol: Optional[str] = Field(default=None, description="记分版字符")
+    colorRaw: str = Field(default=..., description="原始颜色值")
 
     model_config = ConfigDict(extra="ignore")

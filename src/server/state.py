@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 from fastapi import WebSocket
 from pydantic import ValidationError
 
+from .models import BattleChunkData
 
 logger = logging.getLogger("teamviewrelay.state")
 
@@ -95,6 +96,7 @@ class ServerState:
         self.entity_selected_sources: Dict[str, str] = {}
         self.waypoint_selected_sources: Dict[str, str] = {}
         self.battle_chunk_selected_sources: Dict[str, str] = {}
+        self.battle_map_reporter_state: Dict[str, dict] = {}
 
         self.broadcast_hz = float(self.DEFAULT_BROADCAST_HZ)
         self._last_timeout_log_ts = 0.0
@@ -360,6 +362,13 @@ class ServerState:
             return normalized
         normalized["markerType"] = marker_type
         return normalized
+
+    @staticmethod
+    def normalize_battle_map_candidate_source(value) -> Optional[str]:
+        text = str(value or "").strip()
+        if text in {"history_primary", "history_boundary_alternative"}:
+            return text
+        return None
 
     def get_active_sources_in_room(self, room_code: str) -> set[str]:
         normalized_room = self.normalize_room_code(room_code)
@@ -703,6 +712,275 @@ class ServerState:
             return None
         room = source_id[len(cls.BATTLE_CHUNK_CACHE_SOURCE_PREFIX):]
         return cls.normalize_room_code(room)
+
+    @classmethod
+    def build_battle_chunk_id(cls, room_code: str, dimension: str, chunk_x: int, chunk_z: int) -> str:
+        safe_room_code = cls.normalize_room_code(room_code)
+        safe_dimension = str(dimension or "").strip() or "minecraft:overworld"
+        return f"{safe_room_code}|{safe_dimension}|{int(chunk_x)}|{int(chunk_z)}"
+
+    def build_battle_map_observation_hash(
+        self,
+        dimension: str,
+        map_size: int,
+        anchor_row: int,
+        anchor_col: int,
+        snapshot_observed_at: int,
+        candidates: list[dict],
+        cells: list[dict],
+    ) -> str:
+        raw = self.canonical_value({
+            "dimension": dimension,
+            "mapSize": map_size,
+            "anchorRow": anchor_row,
+            "anchorCol": anchor_col,
+            "snapshotObservedAt": snapshot_observed_at,
+            "candidates": candidates,
+            "cells": cells,
+        })
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+    def _battle_map_reference_nodes(self, room_code: str, dimension: str) -> Dict[str, dict]:
+        reference = self.filter_battle_chunk_state_by_sources_and_room(
+            self.battle_chunks,
+            self.get_active_sources_in_room(room_code),
+            room_code,
+        )
+        return {
+            chunk_id: node
+            for chunk_id, node in reference.items()
+            if isinstance(node, dict)
+            and isinstance(node.get("data"), dict)
+            and str(node["data"].get("dimension") or "").strip() == dimension
+        }
+
+    def _project_battle_map_cells(
+        self,
+        room_code: str,
+        dimension: str,
+        base_chunk_x: int,
+        base_chunk_z: int,
+        cells: list[dict],
+    ) -> dict[str, dict]:
+        projected: dict[str, dict] = {}
+        for cell in cells:
+            if not isinstance(cell, dict):
+                continue
+            rel_chunk_x = cell.get("relChunkX")
+            rel_chunk_z = cell.get("relChunkZ")
+            if not isinstance(rel_chunk_x, int) or not isinstance(rel_chunk_z, int):
+                continue
+            absolute_chunk_x = base_chunk_x + rel_chunk_x
+            absolute_chunk_z = base_chunk_z + rel_chunk_z
+            chunk_id = self.build_battle_chunk_id(room_code, dimension, absolute_chunk_x, absolute_chunk_z)
+            projected[chunk_id] = {
+                "chunkX": absolute_chunk_x,
+                "chunkZ": absolute_chunk_z,
+                "symbol": cell.get("symbol"),
+                "colorRaw": str(cell.get("colorRaw") or "").strip() or "#FFFFFF",
+            }
+        return projected
+
+    def choose_battle_map_candidate(
+        self,
+        submit_player_id: str,
+        room_code: str,
+        dimension: str,
+        snapshot_observed_at: int,
+        candidates: list[dict],
+        cells: list[dict],
+    ) -> tuple[Optional[dict], str]:
+        if len(candidates) == 1:
+            return candidates[0], "single_candidate"
+
+        reporter_state = self.battle_map_reporter_state.get(submit_player_id, {})
+        previous_dimension = str(reporter_state.get("lastAcceptedDimension") or "").strip()
+        previous_snapshot_at = reporter_state.get("lastSnapshotObservedAt")
+        previous_base_x = reporter_state.get("lastAcceptedBaseChunkX")
+        previous_base_z = reporter_state.get("lastAcceptedBaseChunkZ")
+        age_delta_ms = snapshot_observed_at - previous_snapshot_at if isinstance(previous_snapshot_at, int) else None
+        if (
+            previous_dimension == dimension
+            and isinstance(previous_snapshot_at, int)
+            and isinstance(age_delta_ms, int)
+            and 0 <= age_delta_ms <= 10_000
+            and isinstance(previous_base_x, int)
+            and isinstance(previous_base_z, int)
+        ):
+            matched_candidates = [
+                candidate
+                for candidate in candidates
+                if abs(candidate["baseChunkX"] - previous_base_x) + abs(candidate["baseChunkZ"] - previous_base_z) <= 1
+            ]
+            if len(matched_candidates) == 1:
+                return matched_candidates[0], "previous_base_match"
+
+        reference_nodes = self._battle_map_reference_nodes(room_code, dimension)
+        scores: list[tuple[int, dict]] = []
+        for candidate in candidates:
+            projected = self._project_battle_map_cells(
+                room_code,
+                dimension,
+                candidate["baseChunkX"],
+                candidate["baseChunkZ"],
+                cells,
+            )
+            score = 0
+            for chunk_id, cell in projected.items():
+                existing_node = reference_nodes.get(chunk_id)
+                existing_data = existing_node.get("data") if isinstance(existing_node, dict) else None
+                if not isinstance(existing_data, dict):
+                    continue
+                if existing_data.get("symbol") == cell["symbol"] and existing_data.get("colorRaw") == cell["colorRaw"]:
+                    score += 1
+            scores.append((score, candidate))
+
+        if not scores:
+            return None, "no_candidate"
+
+        best_score = max(score for score, _ in scores)
+        best_candidates = [candidate for score, candidate in scores if score == best_score]
+        if len(best_candidates) == 1:
+            return best_candidates[0], "overlap_score"
+
+        if best_score == 0 and not reference_nodes:
+            return candidates[0], "bootstrap_primary"
+
+        return None, "ambiguous"
+
+    def apply_battle_map_observation(
+        self,
+        submit_player_id: str,
+        room_code: str,
+        dimension: str,
+        map_size: int,
+        anchor_row: int,
+        anchor_col: int,
+        snapshot_observed_at: int,
+        parsed_at: int,
+        candidates: list[dict],
+        cells: list[dict],
+        current_time: Optional[float] = None,
+    ) -> dict:
+        now = time.time() if current_time is None else float(current_time)
+        normalized_room = self.normalize_room_code(room_code)
+        normalized_dimension = str(dimension or "").strip() or "minecraft:overworld"
+
+        normalized_candidates: list[dict] = []
+        seen_candidate_keys: set[tuple[int, int, str]] = set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            source = self.normalize_battle_map_candidate_source(candidate.get("source"))
+            base_chunk_x = candidate.get("baseChunkX")
+            base_chunk_z = candidate.get("baseChunkZ")
+            position_sampled_at = candidate.get("positionSampledAt")
+            if source is None:
+                continue
+            if not isinstance(base_chunk_x, int) or not isinstance(base_chunk_z, int) or not isinstance(position_sampled_at, int):
+                continue
+            key = (base_chunk_x, base_chunk_z, source)
+            if key in seen_candidate_keys:
+                continue
+            seen_candidate_keys.add(key)
+            normalized_candidates.append({
+                "baseChunkX": base_chunk_x,
+                "baseChunkZ": base_chunk_z,
+                "positionSampledAt": position_sampled_at,
+                "source": source,
+            })
+
+        normalized_cells: list[dict] = []
+        for cell in cells:
+            if not isinstance(cell, dict):
+                continue
+            rel_chunk_x = cell.get("relChunkX")
+            rel_chunk_z = cell.get("relChunkZ")
+            color_raw = str(cell.get("colorRaw") or "").strip()
+            if not isinstance(rel_chunk_x, int) or not isinstance(rel_chunk_z, int) or not color_raw:
+                continue
+            normalized_cells.append({
+                "relChunkX": rel_chunk_x,
+                "relChunkZ": rel_chunk_z,
+                "symbol": cell.get("symbol"),
+                "colorRaw": color_raw,
+            })
+
+        if not normalized_candidates or not normalized_cells:
+            return {"accepted": False, "reason": "empty_observation", "upserted": 0}
+
+        observation_hash = self.build_battle_map_observation_hash(
+            normalized_dimension,
+            int(map_size),
+            int(anchor_row),
+            int(anchor_col),
+            int(snapshot_observed_at),
+            normalized_candidates,
+            normalized_cells,
+        )
+        reporter_state = self.battle_map_reporter_state.get(submit_player_id, {})
+        last_snapshot_observed_at = reporter_state.get("lastSnapshotObservedAt")
+        last_observation_hash = reporter_state.get("lastObservationHash")
+        if (
+            isinstance(last_snapshot_observed_at, int)
+            and isinstance(last_observation_hash, str)
+            and last_observation_hash == observation_hash
+            and int(snapshot_observed_at) <= last_snapshot_observed_at
+        ):
+            return {"accepted": False, "reason": "duplicate_observation", "upserted": 0}
+
+        chosen_candidate, decision_reason = self.choose_battle_map_candidate(
+            submit_player_id,
+            normalized_room,
+            normalized_dimension,
+            int(snapshot_observed_at),
+            normalized_candidates,
+            normalized_cells,
+        )
+        if chosen_candidate is None:
+            return {"accepted": False, "reason": decision_reason, "upserted": 0}
+
+        projected = self._project_battle_map_cells(
+            normalized_room,
+            normalized_dimension,
+            chosen_candidate["baseChunkX"],
+            chosen_candidate["baseChunkZ"],
+            normalized_cells,
+        )
+        upserted = 0
+        for chunk_id, cell in projected.items():
+            payload = {
+                "chunkX": cell["chunkX"],
+                "chunkZ": cell["chunkZ"],
+                "dimension": normalized_dimension,
+                "symbol": cell["symbol"],
+                "colorRaw": cell["colorRaw"],
+                "colorNote": None,
+                "observedAt": int(snapshot_observed_at),
+                "positionSampledAt": chosen_candidate["positionSampledAt"],
+                "alignmentSource": chosen_candidate["source"],
+                "reporterId": submit_player_id,
+                "roomCode": normalized_room,
+            }
+            normalized_payload = BattleChunkData(**payload).model_dump()
+            normalized_payload = self.apply_battle_chunk_symbol_rules(normalized_payload)
+            node = self.build_state_node(submit_player_id, now, normalized_payload)
+            self.upsert_report(self.battle_chunk_reports, chunk_id, submit_player_id, node)
+            upserted += 1
+
+        self.battle_map_reporter_state[submit_player_id] = {
+            "lastAcceptedBaseChunkX": chosen_candidate["baseChunkX"],
+            "lastAcceptedBaseChunkZ": chosen_candidate["baseChunkZ"],
+            "lastAcceptedDimension": normalized_dimension,
+            "lastSnapshotObservedAt": int(snapshot_observed_at),
+            "lastObservationHash": observation_hash,
+            "lastParsedAt": int(parsed_at),
+        }
+        return {
+            "accepted": True,
+            "reason": decision_reason,
+            "upserted": upserted,
+        }
 
     @classmethod
     def filter_waypoint_state_by_sources_and_room(
@@ -1584,6 +1862,7 @@ class ServerState:
             remove_source_reports(self.waypoint_reports)
         if "battle_chunks" in requested_scopes:
             remove_source_reports(self.battle_chunk_reports)
+            self.battle_map_reporter_state.pop(player_id, None)
 
     def remove_connection(self, player_id: str) -> None:
         """连接断开时，移除该来源在所有上报池中的数据。"""

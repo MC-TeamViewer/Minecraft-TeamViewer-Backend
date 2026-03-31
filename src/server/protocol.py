@@ -5,7 +5,14 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from .models import BattleChunkData, EntityData, PlayerData, WaypointData
+from .models import (
+    BattleChunkData,
+    BattleMapObservationCandidate,
+    BattleMapObservationCell,
+    EntityData,
+    PlayerData,
+    WaypointData,
+)
 
 
 class PacketModel(BaseModel):
@@ -145,17 +152,17 @@ class WaypointsEntityDeathCancelPacket(PacketModel):
     targetEntityIds: list[str] = Field(default_factory=list)
 
 
-class BattleChunksPatchPacket(PacketModel):
-    type: Literal["battle_chunks_patch"]
+class BattleMapObservationPacket(PacketModel):
+    type: Literal["battle_map_observation"]
     submitPlayerId: str | None = None
-    upsert: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    delete: list[str] = Field(default_factory=list)
-
-
-class BattleChunksKeepalivePacket(PacketModel):
-    type: Literal["battle_chunks_keepalive"]
-    submitPlayerId: str | None = None
-    chunkIds: list[str] = Field(default_factory=list)
+    dimension: str
+    mapSize: int
+    anchorRow: int
+    anchorCol: int
+    snapshotObservedAt: int
+    parsedAt: int
+    candidates: list[BattleMapObservationCandidate] = Field(default_factory=list)
+    cells: list[BattleMapObservationCell] = Field(default_factory=list)
 
 
 AdminInboundPacket = Annotated[
@@ -184,8 +191,7 @@ PlayerInboundPacket = Annotated[
     | WaypointsUpdatePacket
     | WaypointsDeletePacket
     | WaypointsEntityDeathCancelPacket
-    | BattleChunksPatchPacket
-    | BattleChunksKeepalivePacket
+    | BattleMapObservationPacket
     | ResyncRequestPacket,
     Field(discriminator="type"),
 ]

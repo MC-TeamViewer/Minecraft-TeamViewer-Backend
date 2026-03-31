@@ -34,8 +34,8 @@ from server.state import ServerState
 
 
 
-NETWORK_PROTOCOL_VERSION = "0.5.1" # 服务器使用的协议版本
-SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.5.0" # 服务器兼容的最低协议版本
+NETWORK_PROTOCOL_VERSION = "0.6.0" # 服务器使用的协议版本
+SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.6.0" # 服务器兼容的最低协议版本
 SERVER_PROGRAM_VERSION = "team-view-relay-server-dev"
 
 
@@ -582,21 +582,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                 continue
 
-            if packet.type == "battle_chunks_keepalive":
-                current_time = time.time()
-                touched_chunks = state.touch_reports(
-                    state.battle_chunk_reports,
-                    packet.chunkIds,
-                    submit_player_id,
-                    current_time,
-                )
-                if touched_chunks:
-                    logger.debug(
-                        "Applied battle_chunks_keepalive "
-                        f"submitPlayerId={submit_player_id} chunks={touched_chunks}/{len(packet.chunkIds)}"
-                    )
-                continue
-
             if isinstance(packet, SourceStateClearPacket):
                 state.clear_source_state(submit_player_id, packet.scopes)
                 await broadcaster.broadcast_admin_updates()
@@ -808,55 +793,26 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 continue
 
-            if packet.type == "battle_chunks_patch":
+            if packet.type == "battle_map_observation":
                 current_time = time.time()
-                upsert = packet.upsert
-                delete = packet.delete
-                missing_baseline_chunks = []
-
-                for chunk_id, chunk_data in upsert.items():
-                    source_key = submit_player_id if isinstance(submit_player_id, str) else ""
-                    existing_node = state.battle_chunk_reports.get(chunk_id, {}).get(source_key)
-                    try:
-                        normalized = state.merge_patch_and_validate(BattleChunkData, existing_node, chunk_data)
-                        normalized = state.apply_battle_chunk_symbol_rules(normalized)
-                        node = state.build_state_node(submit_player_id, current_time, normalized)
-                        state.upsert_report(state.battle_chunk_reports, chunk_id, submit_player_id, node)
-                    except ValidationError as e:
-                        missing_fields = state.missing_fields_from_validation_error(e)
-                        existing_data = existing_node.get("data") if isinstance(existing_node, dict) else None
-                        existing_keys = sorted(existing_data.keys()) if isinstance(existing_data, dict) else []
-                        if not isinstance(existing_data, dict):
-                            missing_baseline_chunks.append(chunk_id)
-                        logger.warning(
-                            "Battle chunk patch validation failed "
-                            f"chunkId={chunk_id} submitPlayerId={submit_player_id} sourceKey={source_key!r} "
-                            f"hasExistingSnapshot={bool(isinstance(existing_data, dict))} "
-                            f"missingFields={missing_fields or '[]'} "
-                            f"existingKeys={existing_keys} payload={state.payload_preview(chunk_data)} "
-                            f"errors={state.payload_preview(e.errors(), 480)}"
-                        )
-                    except Exception as e:
-                        logger.exception(
-                            "Unexpected error validating battle chunk patch "
-                            f"chunkId={chunk_id} submitPlayerId={submit_player_id} "
-                            f"payload={state.payload_preview(chunk_data)}: {e}"
-                        )
-
-                if isinstance(delete, list):
-                    for chunk_id in delete:
-                        if not isinstance(chunk_id, str):
-                            continue
-                        state.delete_report(state.battle_chunk_reports, chunk_id, submit_player_id)
-
-                if missing_baseline_chunks and isinstance(submit_player_id, str) and submit_player_id:
-                    await broadcaster.send_refresh_request_to_source(
+                result = state.apply_battle_map_observation(
+                    submit_player_id=submit_player_id,
+                    room_code=state.get_player_room(submit_player_id),
+                    dimension=packet.dimension,
+                    map_size=packet.mapSize,
+                    anchor_row=packet.anchorRow,
+                    anchor_col=packet.anchorCol,
+                    snapshot_observed_at=packet.snapshotObservedAt,
+                    parsed_at=packet.parsedAt,
+                    candidates=[candidate.model_dump() for candidate in packet.candidates],
+                    cells=[cell.model_dump() for cell in packet.cells],
+                    current_time=current_time,
+                )
+                if not result.get("accepted"):
+                    logger.debug(
+                        "Ignored battle_map_observation submitPlayerId=%s reason=%s",
                         submit_player_id,
-                        players=[],
-                        entities=[],
-                        battle_chunks=missing_baseline_chunks,
-                        reason="missing_baseline_patch",
-                        bypass_cooldown=False,
+                        result.get("reason"),
                     )
 
                 continue
