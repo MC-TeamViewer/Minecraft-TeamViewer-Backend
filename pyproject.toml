@@ -1,5 +1,5 @@
 [project]
-name = "TeamViewer-web-server"
+name = "team-view-relay-web-server"
 version = "0.5.2"
 description = "一个用于共享团队视野的服务端网页代码"
 readme = "README.md"

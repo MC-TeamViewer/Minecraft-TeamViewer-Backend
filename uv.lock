@@ -401,7 +401,7 @@ wheels = [
 ]
 
 [[package]]
-name = "teamviewer-web-server"
+name = "team-view-relay-web-server"
 version = "0.5.2"
 source = { virtual = "." }
 dependencies = [

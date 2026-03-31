@@ -1,6 +1,6 @@
-# backend-server
+# TeamViewRelay Backend
 
-Minecraft TeamViewer 的后端聚合服务，基于 FastAPI + WebSocket。
+TeamViewRelay 的后端聚合服务，基于 FastAPI + WebSocket。
 
 ## 功能
 
@@ -45,7 +45,7 @@ uv run main.py
 
 当前服务端协议常量位于 `src/main.py`：
 
-- `NETWORK_PROTOCOL_VERSION = 0.5.0`
+- `NETWORK_PROTOCOL_VERSION = 0.5.1`
 - `SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = 0.5.0`
 
 详细字段与报文结构见仓库根目录文档：`docs/PLAYER_ESP_NETWORK_PROTOCOL.md`

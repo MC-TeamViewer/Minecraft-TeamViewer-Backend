@@ -6,7 +6,7 @@ from .protocol import DigestPacket, PatchPacket, RefreshRequestOutboundPacket, R
 from .state import ServerState
 
 
-logger = logging.getLogger("teamviewer.broadcaster")
+logger = logging.getLogger("teamviewrelay.broadcaster")
 
 
 class Broadcaster:

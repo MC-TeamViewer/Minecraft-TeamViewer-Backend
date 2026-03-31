@@ -11,7 +11,7 @@ from fastapi import WebSocket
 from pydantic import ValidationError
 
 
-logger = logging.getLogger("teamviewer.state")
+logger = logging.getLogger("teamviewrelay.state")
 
 
 class ServerState:
