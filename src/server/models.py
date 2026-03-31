@@ -68,3 +68,18 @@ class WaypointData(BaseModel):
     deletableBy: Optional[str] = Field(default="everyone", description="删除权限控制：everyone(任何人可删除)|owner(仅创建者可删除)", json_schema_extra={"reliableTransport": True})
 
     model_config = ConfigDict(extra="ignore")
+
+
+class BattleChunkData(BaseModel):
+    """战局区块地图上报模型。"""
+    chunkX: int = Field(default=..., description="区块X坐标", json_schema_extra={"reliableTransport": True})
+    chunkZ: int = Field(default=..., description="区块Z坐标", json_schema_extra={"reliableTransport": True})
+    dimension: str = Field(default=..., description="维度ID", json_schema_extra={"reliableTransport": True})
+    symbol: Optional[str] = Field(default=None, description="记分版字符", json_schema_extra={"reliableTransport": True})
+    colorRaw: str = Field(default=..., description="原始颜色值", json_schema_extra={"reliableTransport": True})
+    colorNote: Optional[str] = Field(default=None, description="颜色备注", json_schema_extra={"reliableTransport": True})
+    observedAt: int = Field(default=..., description="客户端观测时间(ms)", json_schema_extra={"reliableTransport": True})
+    reporterId: Optional[str] = Field(default=None, description="上报玩家UUID", json_schema_extra={"reliableTransport": True})
+    roomCode: Optional[str] = Field(default=None, description="房间号", json_schema_extra={"reliableTransport": True})
+
+    model_config = ConfigDict(extra="ignore")

@@ -31,6 +31,7 @@ class ServerState:
     PLAYER_TIMEOUT = 120
     ENTITY_TIMEOUT = 300
     WAYPOINT_TIMEOUT = 60
+    BATTLE_CHUNK_TIMEOUT = 120
     # 多来源切换阈值：仅当候选来源显著更新（领先该阈值秒）才切换来源，减少抖动。
     SOURCE_SWITCH_THRESHOLD_SEC = 0.35
     # 超时清理日志输出节流：避免高频刷屏。
@@ -64,11 +65,13 @@ class ServerState:
         self.players: Dict[str, dict] = {}
         self.entities: Dict[str, dict] = {}
         self.waypoints: Dict[str, dict] = {}
+        self.battle_chunks: Dict[str, dict] = {}
 
         # 原始上报池：object_id -> source_id -> state_node。
         self.player_reports: Dict[str, Dict[str, dict]] = {}
         self.entity_reports: Dict[str, Dict[str, dict]] = {}
         self.waypoint_reports: Dict[str, Dict[str, dict]] = {}
+        self.battle_chunk_reports: Dict[str, Dict[str, dict]] = {}
 
         # 连接与能力信息。
         self.connections: Dict[str, WebSocket] = {}
@@ -87,6 +90,7 @@ class ServerState:
         self.player_selected_sources: Dict[str, str] = {}
         self.entity_selected_sources: Dict[str, str] = {}
         self.waypoint_selected_sources: Dict[str, str] = {}
+        self.battle_chunk_selected_sources: Dict[str, str] = {}
 
         self.broadcast_hz = float(self.DEFAULT_BROADCAST_HZ)
         self._last_timeout_log_ts = 0.0
@@ -102,6 +106,12 @@ class ServerState:
         self.PLAYER_TIMEOUT = self._coerce_int(timeout_cfg.get("playerTimeoutSec"), self.PLAYER_TIMEOUT, 1, 3600)
         self.ENTITY_TIMEOUT = self._coerce_int(timeout_cfg.get("entityTimeoutSec"), self.ENTITY_TIMEOUT, 1, 3600)
         self.WAYPOINT_TIMEOUT = self._coerce_int(timeout_cfg.get("waypointTimeoutSec"), self.WAYPOINT_TIMEOUT, 5, 86400)
+        self.BATTLE_CHUNK_TIMEOUT = self._coerce_int(
+            timeout_cfg.get("battleChunkTimeoutSec"),
+            self.BATTLE_CHUNK_TIMEOUT,
+            5,
+            86400,
+        )
 
         timeout_log_cfg = config.get("timeoutLog", {}) if isinstance(config.get("timeoutLog"), dict) else {}
         self.TIMEOUT_LOG_INTERVAL_SEC = self._coerce_float(
@@ -156,7 +166,8 @@ class ServerState:
 
         logger.info(
             "ServerState timeout config "
-            f"player={self.PLAYER_TIMEOUT}s entity={self.ENTITY_TIMEOUT}s waypoint={self.WAYPOINT_TIMEOUT}s"
+            f"player={self.PLAYER_TIMEOUT}s entity={self.ENTITY_TIMEOUT}s "
+            f"waypoint={self.WAYPOINT_TIMEOUT}s battleChunk={self.BATTLE_CHUNK_TIMEOUT}s"
         )
         logger.info(
             "ServerState same-server filter config "
@@ -640,6 +651,31 @@ class ServerState:
 
         return filtered
 
+    @classmethod
+    def filter_battle_chunk_state_by_sources_and_room(
+        cls,
+        state_map: Dict[str, dict],
+        allowed_sources: set[str],
+        room_code: str,
+    ) -> Dict[str, dict]:
+        normalized_room = cls.normalize_room_code(room_code)
+        filtered: Dict[str, dict] = {}
+
+        for object_id, node in state_map.items():
+            if not isinstance(node, dict):
+                continue
+            source_id = node.get("submitPlayerId")
+            if not isinstance(source_id, str) or not source_id or source_id not in allowed_sources:
+                continue
+
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            data_room = cls.normalize_room_code(data.get("roomCode")) if isinstance(data, dict) else cls.DEFAULT_ROOM_CODE
+            if data_room != normalized_room:
+                continue
+            filtered[object_id] = node
+
+        return filtered
+
     def build_admin_tab_snapshot(self, room_code: Optional[str] = None) -> dict:
         self.cleanup_tab_reports()
         normalized_room = self.normalize_room_code(room_code)
@@ -839,11 +875,12 @@ class ServerState:
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
     def build_digests(self) -> dict:
-        """构建三类对象摘要，用于客户端一致性校验。"""
+        """构建对象摘要，用于客户端一致性校验。"""
         return {
             "players": self.state_digest(self.players),
             "entities": self.state_digest(self.entities),
             "waypoints": self.state_digest(self.waypoints),
+            "battleChunks": self.state_digest(self.battle_chunks),
         }
 
     @staticmethod
@@ -852,18 +889,19 @@ class ServerState:
             "players": {"upsert": {}, "delete": []},
             "entities": {"upsert": {}, "delete": []},
             "waypoints": {"upsert": {}, "delete": []},
+            "battleChunks": {"upsert": {}, "delete": []},
         }
 
     @staticmethod
     def has_patch_changes(patch: dict) -> bool:
-        for scope in ("players", "entities", "waypoints"):
+        for scope in ("players", "entities", "waypoints", "battleChunks"):
             if patch[scope]["upsert"] or patch[scope]["delete"]:
                 return True
         return False
 
     @staticmethod
     def merge_patch(base: dict, extra: dict) -> None:
-        for scope in ("players", "entities", "waypoints"):
+        for scope in ("players", "entities", "waypoints", "battleChunks"):
             base[scope]["upsert"].update(extra[scope]["upsert"])
             base[scope]["delete"].extend(extra[scope]["delete"])
 
@@ -1087,6 +1125,7 @@ class ServerState:
         old_players = dict(self.players)
         old_entities = dict(self.entities)
         old_waypoints = dict(self.waypoints)
+        old_battle_chunks = dict(self.battle_chunks)
 
         self.players = self.resolve_report_map(
             self.player_reports,
@@ -1106,11 +1145,18 @@ class ServerState:
             self.SOURCE_SWITCH_THRESHOLD_SEC,
             prefer_object_id_source=False,
         )
+        self.battle_chunks = self.resolve_report_map(
+            self.battle_chunk_reports,
+            self.battle_chunk_selected_sources,
+            self.SOURCE_SWITCH_THRESHOLD_SEC,
+            prefer_object_id_source=False,
+        )
 
         return {
             "players": self.compute_scope_patch(old_players, self.players),
             "entities": self.compute_scope_patch(old_entities, self.entities),
             "waypoints": self.compute_scope_patch(old_waypoints, self.waypoints),
+            "battleChunks": self.compute_scope_patch(old_battle_chunks, self.battle_chunks),
         }
 
     @staticmethod
@@ -1190,6 +1236,7 @@ class ServerState:
             "players": 0,
             "entities": 0,
             "waypoints": 0,
+            "battleChunks": 0,
         }
         removed_samples = []
 
@@ -1258,13 +1305,20 @@ class ServerState:
         cleanup_report_map("players", self.player_reports, lambda node: self.PLAYER_TIMEOUT)
         cleanup_report_map("entities", self.entity_reports, lambda node: self.ENTITY_TIMEOUT)
         cleanup_report_map("waypoints", self.waypoint_reports, effective_waypoint_timeout)
+        cleanup_report_map("battleChunks", self.battle_chunk_reports, lambda node: self.BATTLE_CHUNK_TIMEOUT)
 
-        total_removed = removed_summary["players"] + removed_summary["entities"] + removed_summary["waypoints"]
+        total_removed = (
+            removed_summary["players"]
+            + removed_summary["entities"]
+            + removed_summary["waypoints"]
+            + removed_summary["battleChunks"]
+        )
         if total_removed > 0 and (current_time - self._last_timeout_log_ts) >= self.TIMEOUT_LOG_INTERVAL_SEC:
             logger.debug(
                 "Timeout cleanup removed sources "
                 f"players={removed_summary['players']} entities={removed_summary['entities']} "
-                f"waypoints={removed_summary['waypoints']} total={total_removed}"
+                f"waypoints={removed_summary['waypoints']} battleChunks={removed_summary['battleChunks']} "
+                f"total={total_removed}"
             )
             for sample in removed_samples:
                 logger.debug("  - %s", sample)
@@ -1359,11 +1413,11 @@ class ServerState:
                 scope = raw_scope.strip().lower()
                 if scope == "tab":
                     scope = "tab_players"
-                if scope in {"players", "entities", "tab_players", "waypoints"}:
+                if scope in {"players", "entities", "tab_players", "waypoints", "battle_chunks"}:
                     requested_scopes.add(scope)
 
         if not requested_scopes:
-            requested_scopes = {"players", "entities", "tab_players", "waypoints"}
+            requested_scopes = {"players", "entities", "tab_players", "waypoints", "battle_chunks"}
 
         def remove_source_reports(report_map: Dict[str, Dict[str, dict]]) -> None:
             for object_id in list(report_map.keys()):
@@ -1384,6 +1438,8 @@ class ServerState:
             remove_source_reports(self.entity_reports)
         if "waypoints" in requested_scopes:
             remove_source_reports(self.waypoint_reports)
+        if "battle_chunks" in requested_scopes:
+            remove_source_reports(self.battle_chunk_reports)
 
     def remove_connection(self, player_id: str) -> None:
         """连接断开时，移除该来源在所有上报池中的数据。"""

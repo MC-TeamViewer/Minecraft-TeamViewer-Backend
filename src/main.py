@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from server.broadcaster import Broadcaster
 from server.codec import MsgpackMessageCodec
-from server.models import EntityData, PlayerData, WaypointData
+from server.models import BattleChunkData, EntityData, PlayerData, WaypointData
 from server.protocol import (
     AdminAckPacket,
     CommandPlayerMarkClearAllPacket,
@@ -34,8 +34,8 @@ from server.state import ServerState
 
 
 
-NETWORK_PROTOCOL_VERSION = "0.5.0" # 服务器使用的协议版本
-SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.5.0" # 服务器兼容的最低协议版本
+NETWORK_PROTOCOL_VERSION = "0.6.0" # 服务器使用的协议版本
+SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.6.0" # 服务器兼容的最低协议版本
 SERVER_PROGRAM_VERSION = "teamviewer-server-dev"
 
 
@@ -112,6 +112,7 @@ async def reject_handshake(
             broadcastHz=state.broadcast_hz,
             playerTimeoutSec=state.PLAYER_TIMEOUT,
             entityTimeoutSec=state.ENTITY_TIMEOUT,
+            battleChunkTimeoutSec=state.BATTLE_CHUNK_TIMEOUT,
         ),
     )
     close_reason = reason if len(reason) <= 120 else reason[:120]
@@ -246,6 +247,7 @@ async def admin_ws(websocket: WebSocket):
                         broadcastHz=state.broadcast_hz,
                         playerTimeoutSec=state.PLAYER_TIMEOUT,
                         entityTimeoutSec=state.ENTITY_TIMEOUT,
+                        battleChunkTimeoutSec=state.BATTLE_CHUNK_TIMEOUT,
                     ),
                 )
                 await broadcaster.send_admin_snapshot_full(admin_id)
@@ -542,6 +544,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "reportIntervalTicks": negotiated_ticks,
                         "playerTimeoutSec": state.PLAYER_TIMEOUT,
                         "entityTimeoutSec": state.ENTITY_TIMEOUT,
+                        "battleChunkTimeoutSec": state.BATTLE_CHUNK_TIMEOUT,
                     }
                     await send_packet(websocket, HandshakeAckPacket(**ack))
                     await broadcaster.send_snapshot_full_to_player(submit_player_id)
@@ -576,6 +579,21 @@ async def websocket_endpoint(websocket: WebSocket):
                         "Applied state_keepalive "
                         f"submitPlayerId={submit_player_id} players={touched_players}/{len(packet.players)} "
                         f"entities={touched_entities}/{len(packet.entities)}"
+                    )
+                continue
+
+            if packet.type == "battle_chunks_keepalive":
+                current_time = time.time()
+                touched_chunks = state.touch_reports(
+                    state.battle_chunk_reports,
+                    packet.chunkIds,
+                    submit_player_id,
+                    current_time,
+                )
+                if touched_chunks:
+                    logger.debug(
+                        "Applied battle_chunks_keepalive "
+                        f"submitPlayerId={submit_player_id} chunks={touched_chunks}/{len(packet.chunkIds)}"
                     )
                 continue
 
@@ -785,6 +803,45 @@ async def websocket_endpoint(websocket: WebSocket):
                         state.upsert_report(state.waypoint_reports, waypoint_id, submit_player_id, node)
                     except Exception as e:
                         logger.warning("Error validating waypoint data for %s: %s", waypoint_id, e)
+
+                continue
+
+            if packet.type == "battle_chunks_patch":
+                current_time = time.time()
+                upsert = packet.upsert
+                delete = packet.delete
+
+                for chunk_id, chunk_data in upsert.items():
+                    source_key = submit_player_id if isinstance(submit_player_id, str) else ""
+                    existing_node = state.battle_chunk_reports.get(chunk_id, {}).get(source_key)
+                    try:
+                        normalized = state.merge_patch_and_validate(BattleChunkData, existing_node, chunk_data)
+                        node = state.build_state_node(submit_player_id, current_time, normalized)
+                        state.upsert_report(state.battle_chunk_reports, chunk_id, submit_player_id, node)
+                    except ValidationError as e:
+                        missing_fields = state.missing_fields_from_validation_error(e)
+                        existing_data = existing_node.get("data") if isinstance(existing_node, dict) else None
+                        existing_keys = sorted(existing_data.keys()) if isinstance(existing_data, dict) else []
+                        logger.warning(
+                            "Battle chunk patch validation failed "
+                            f"chunkId={chunk_id} submitPlayerId={submit_player_id} sourceKey={source_key!r} "
+                            f"hasExistingSnapshot={bool(isinstance(existing_data, dict))} "
+                            f"missingFields={missing_fields or '[]'} "
+                            f"existingKeys={existing_keys} payload={state.payload_preview(chunk_data)} "
+                            f"errors={state.payload_preview(e.errors(), 480)}"
+                        )
+                    except Exception as e:
+                        logger.exception(
+                            "Unexpected error validating battle chunk patch "
+                            f"chunkId={chunk_id} submitPlayerId={submit_player_id} "
+                            f"payload={state.payload_preview(chunk_data)}: {e}"
+                        )
+
+                if isinstance(delete, list):
+                    for chunk_id in delete:
+                        if not isinstance(chunk_id, str):
+                            continue
+                        state.delete_report(state.battle_chunk_reports, chunk_id, submit_player_id)
 
                 continue
 

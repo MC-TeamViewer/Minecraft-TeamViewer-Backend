@@ -24,8 +24,8 @@ class Broadcaster:
         self._codec = MsgpackMessageCodec()
         self._admin_last_states: dict[str, dict] = {}
         self._last_player_report_hints: dict[str, int] = {}
-        self._player_sync_scopes = ("players", "entities", "waypoints")
-        self._admin_sync_scopes = ("players", "entities", "waypoints", "playerMarks")
+        self._player_sync_scopes = ("players", "entities", "waypoints", "battleChunks")
+        self._admin_sync_scopes = ("players", "entities", "waypoints", "battleChunks", "playerMarks")
 
     def _encode_message(self, packet) -> bytes:
         return self._codec.encode(packet)
@@ -74,10 +74,16 @@ class Broadcaster:
             allowed_sources,
             normalized_room,
         )
+        room_battle_chunks = self.state.filter_battle_chunk_state_by_sources_and_room(
+            self.state.battle_chunks,
+            allowed_sources,
+            normalized_room,
+        )
         return {
             "players": self._snapshot_scope_from_state_map(room_players),
             "entities": self._snapshot_scope_from_state_map(room_entities),
             "waypoints": self._snapshot_scope_from_state_map(room_waypoints),
+            "battleChunks": self._snapshot_scope_from_state_map(room_battle_chunks),
             "playerMarks": dict(self.state.player_marks),
             "tabState": self.state.build_admin_tab_snapshot(normalized_room),
             "roomCode": normalized_room,
@@ -196,10 +202,16 @@ class Broadcaster:
             allowed_sources,
             player_room,
         )
+        visible_battle_chunks = self.state.filter_battle_chunk_state_by_sources_and_room(
+            self.state.battle_chunks,
+            allowed_sources,
+            player_room,
+        )
         return {
             "players": visible_players,
             "entities": visible_entities,
             "waypoints": visible_waypoints,
+            "battleChunks": visible_battle_chunks,
         }
 
     async def send_snapshot_full_to_player(self, player_id: str) -> None:
@@ -232,6 +244,7 @@ class Broadcaster:
                 "players": self.state.state_digest(visible_state["players"]),
                 "entities": self.state.state_digest(visible_state["entities"]),
                 "waypoints": self.state.state_digest(visible_state["waypoints"]),
+                "battleChunks": self.state.state_digest(visible_state["battleChunks"]),
             },
         )
         await ws.send_bytes(self._encode_message(message))
@@ -312,6 +325,7 @@ class Broadcaster:
                             "players": self.state.players,
                             "entities": self.state.entities,
                             "waypoints": self.state.waypoints,
+                            "battleChunks": self.state.battle_chunks,
                         },
                         self._player_sync_scopes,
                     )
@@ -323,6 +337,7 @@ class Broadcaster:
                         "players": changes["players"],
                         "entities": changes["entities"],
                         "waypoints": changes["waypoints"],
+                        "battleChunks": changes["battleChunks"],
                     }
                     patch_msg = self._build_patch_message(patch_state)
                     await ws.send_bytes(self._encode_message(patch_msg))

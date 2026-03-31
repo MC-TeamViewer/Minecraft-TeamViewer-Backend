@@ -5,7 +5,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from .models import EntityData, PlayerData, WaypointData
+from .models import BattleChunkData, EntityData, PlayerData, WaypointData
 
 
 class PacketModel(BaseModel):
@@ -145,6 +145,19 @@ class WaypointsEntityDeathCancelPacket(PacketModel):
     targetEntityIds: list[str] = Field(default_factory=list)
 
 
+class BattleChunksPatchPacket(PacketModel):
+    type: Literal["battle_chunks_patch"]
+    submitPlayerId: str | None = None
+    upsert: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    delete: list[str] = Field(default_factory=list)
+
+
+class BattleChunksKeepalivePacket(PacketModel):
+    type: Literal["battle_chunks_keepalive"]
+    submitPlayerId: str | None = None
+    chunkIds: list[str] = Field(default_factory=list)
+
+
 AdminInboundPacket = Annotated[
     HandshakePacket
     | PingPacket
@@ -171,6 +184,8 @@ PlayerInboundPacket = Annotated[
     | WaypointsUpdatePacket
     | WaypointsDeletePacket
     | WaypointsEntityDeathCancelPacket
+    | BattleChunksPatchPacket
+    | BattleChunksKeepalivePacket
     | ResyncRequestPacket,
     Field(discriminator="type"),
 ]
@@ -271,6 +286,7 @@ class HandshakeAckPacket(OutboundPacket):
     reportIntervalTicks: int | None = None
     playerTimeoutSec: int | None = None
     entityTimeoutSec: int | None = None
+    battleChunkTimeoutSec: int | None = None
 
 
 class AdminAckPacket(OutboundPacket):
@@ -298,6 +314,7 @@ class SnapshotFullPacket(OutboundPacket):
     players: dict[str, Any] = Field(default_factory=dict)
     entities: dict[str, Any] = Field(default_factory=dict)
     waypoints: dict[str, Any] = Field(default_factory=dict)
+    battleChunks: dict[str, Any] = Field(default_factory=dict)
     playerMarks: dict[str, Any] | None = None
     tabState: dict[str, Any] | None = None
     roomCode: str | None = None
@@ -312,6 +329,7 @@ class PatchPacket(OutboundPacket):
     players: dict[str, Any] | None = None
     entities: dict[str, Any] | None = None
     waypoints: dict[str, Any] | None = None
+    battleChunks: dict[str, Any] | None = None
     playerMarks: dict[str, Any] | None = None
     meta: dict[str, Any] | None = None
 
@@ -334,4 +352,3 @@ class ReportRateHintPacket(OutboundPacket):
     reportIntervalTicks: int
     broadcastHz: float
     reason: str | None = None
-
