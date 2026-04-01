@@ -363,6 +363,16 @@ class ServerState:
         normalized["markerType"] = marker_type
         return normalized
 
+    def normalize_battle_chunk_node(self, node: dict) -> dict:
+        if not isinstance(node, dict):
+            return node
+        data = node.get("data")
+        if not isinstance(data, dict):
+            return node
+        normalized = dict(node)
+        normalized["data"] = self.apply_battle_chunk_symbol_rules(data)
+        return normalized
+
     @staticmethod
     def normalize_battle_map_candidate_source(value) -> Optional[str]:
         text = str(value or "").strip()
@@ -947,6 +957,18 @@ class ServerState:
             chosen_candidate["baseChunkZ"],
             normalized_cells,
         )
+        previous_projected_chunk_ids = set()
+        if isinstance(reporter_state.get("lastProjectedChunkIds"), list):
+            previous_projected_chunk_ids = {
+                str(chunk_id)
+                for chunk_id in reporter_state.get("lastProjectedChunkIds", [])
+                if isinstance(chunk_id, str) and chunk_id
+            }
+        current_projected_chunk_ids = set(projected.keys())
+        stale_chunk_ids = previous_projected_chunk_ids - current_projected_chunk_ids
+        for stale_chunk_id in stale_chunk_ids:
+            self.delete_report(self.battle_chunk_reports, stale_chunk_id, submit_player_id)
+
         upserted = 0
         for chunk_id, cell in projected.items():
             payload = {
@@ -975,6 +997,7 @@ class ServerState:
             "lastSnapshotObservedAt": int(snapshot_observed_at),
             "lastObservationHash": observation_hash,
             "lastParsedAt": int(parsed_at),
+            "lastProjectedChunkIds": sorted(current_projected_chunk_ids),
         }
         return {
             "accepted": True,
@@ -1425,7 +1448,7 @@ class ServerState:
                 continue
 
             room_code = self.normalize_room_code(data.get("roomCode"))
-            cached_data = dict(data)
+            cached_data = self.apply_battle_chunk_symbol_rules(data)
             cached_data["roomCode"] = room_code
             self.battle_chunk_cache[chunk_id] = self.build_state_node(
                 self.build_battle_chunk_cache_source_id(room_code),
@@ -1438,11 +1461,15 @@ class ServerState:
         self.update_battle_chunk_cache(active_battle_chunks, now)
 
         effective = {
-            chunk_id: node
+            chunk_id: self.normalize_battle_chunk_node(node)
             for chunk_id, node in self.battle_chunk_cache.items()
             if isinstance(node, dict)
         }
-        effective.update(active_battle_chunks)
+        effective.update({
+            chunk_id: self.normalize_battle_chunk_node(node)
+            for chunk_id, node in active_battle_chunks.items()
+            if isinstance(node, dict)
+        })
         return effective
 
     @classmethod
