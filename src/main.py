@@ -34,8 +34,8 @@ from server.state import ServerState
 
 
 
-NETWORK_PROTOCOL_VERSION = "0.6.0" # 服务器使用的协议版本
-SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.6.0" # 服务器兼容的最低协议版本
+NETWORK_PROTOCOL_VERSION = "0.5.1" # 服务器使用的协议版本
+SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.5.0" # 服务器兼容的最低协议版本
 SERVER_PROGRAM_VERSION = "team-view-relay-server-dev"
 
 
