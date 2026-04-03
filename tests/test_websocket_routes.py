@@ -114,7 +114,7 @@ async def test_adminws_alias_accepts_web_map_handshake_and_logs_deprecation(
 ) -> None:
     with caplog.at_level(logging.WARNING, logger="teamviewrelay.main"):
         async with websockets.connect(f"{live_server}/adminws") as websocket:
-            await websocket.send(build_handshake(channel="admin"))
+            await websocket.send(build_handshake(channel="web_map"))
 
             handshake_ack = decode_packet(await asyncio.wait_for(websocket.recv(), timeout=5.0))
             snapshot_full = decode_packet(await asyncio.wait_for(websocket.recv(), timeout=5.0))

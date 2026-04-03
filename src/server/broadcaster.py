@@ -185,7 +185,7 @@ class Broadcaster:
         view_state = self._build_web_map_view_state(web_map_room)
         message = self._build_full_message(
             view_state,
-            channel="admin",
+            channel="web_map",
             extra={"server_time": time.time()},
         )
 
@@ -250,7 +250,7 @@ class Broadcaster:
         await ws.send_bytes(self._encode_message(message))
 
     async def broadcast_web_map_updates(self, force_full: bool = False) -> None:
-        """向管理端广播增量（必要时全量）。"""
+        """向网页地图观察端广播增量（必要时全量）。"""
         if not self.state.web_map_connections:
             self._web_map_last_states = {}
             return
@@ -264,7 +264,7 @@ class Broadcaster:
                 if force_full or previous_state is None:
                     message = self._build_full_message(
                         current_state,
-                        channel="admin",
+                        channel="web_map",
                         extra={"server_time": time.time()},
                     )
                     await ws.send_bytes(self._encode_message(message))
@@ -273,7 +273,7 @@ class Broadcaster:
                     if self._has_web_map_patch_changes(patch_state):
                         message = self._build_patch_message(
                             patch_state,
-                            channel="admin",
+                            channel="web_map",
                             extra={"server_time": time.time()},
                         )
                         await ws.send_bytes(self._encode_message(message))

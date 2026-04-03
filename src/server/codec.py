@@ -17,28 +17,13 @@ class MessageCodec(Protocol):
 
 
 _PAYLOAD_TO_TYPE: dict[str, str] = {
-    "handshake_request": "handshake",
+    "player_handshake_request": "handshake",
+    "web_map_handshake_request": "handshake",
+    "admin_handshake_request": "handshake",
     "ping": "ping",
     "resync_request": "resync_req",
-    "command_player_mark_set": "command_player_mark_set",
-    "command_player_mark_clear": "command_player_mark_clear",
-    "command_player_mark_clear_all": "command_player_mark_clear_all",
-    "command_same_server_filter_set": "command_same_server_filter_set",
-    "command_tactical_waypoint_set": "command_tactical_waypoint_set",
-    "players_update": "players_update",
-    "tab_players_update": "tab_players_update",
-    "tab_players_patch": "tab_players_patch",
-    "players_patch": "players_patch",
-    "entities_update": "entities_update",
-    "entities_patch": "entities_patch",
-    "state_keepalive": "state_keepalive",
-    "source_state_clear": "source_state_clear",
-    "waypoints_update": "waypoints_update",
-    "waypoints_delete": "waypoints_delete",
-    "waypoints_entity_death_cancel": "waypoints_entity_death_cancel",
-    "battle_map_observation": "battle_map_observation",
     "handshake_ack": "handshake_ack",
-    "admin_ack": "admin_ack",
+    "web_map_ack": "web_map_ack",
     "pong": "pong",
     "snapshot_full": "snapshot_full",
     "patch": "patch",
@@ -47,42 +32,49 @@ _PAYLOAD_TO_TYPE: dict[str, str] = {
     "report_rate_hint": "report_rate_hint",
 }
 
-_TYPE_TO_PAYLOAD = {value: key for key, value in _PAYLOAD_TO_TYPE.items()}
+_TYPE_TO_PAYLOAD: dict[str, str] = {
+    "ping": "ping",
+    "resync_req": "resync_request",
+    "handshake_ack": "handshake_ack",
+    "web_map_ack": "web_map_ack",
+    "pong": "pong",
+    "snapshot_full": "snapshot_full",
+    "patch": "patch",
+    "digest": "digest",
+    "refresh_req": "refresh_request",
+    "report_rate_hint": "report_rate_hint",
+}
 
-_TYPE_TO_MESSAGE: dict[str, type[Message]] = {
-    "handshake": teamviewer_pb2.HandshakeRequest,
+_PAYLOAD_TO_MESSAGE: dict[str, type[Message]] = {
+    "player_handshake_request": teamviewer_pb2.PlayerHandshakeRequest,
+    "web_map_handshake_request": teamviewer_pb2.WebMapHandshakeRequest,
+    "admin_handshake_request": teamviewer_pb2.AdminHandshakeRequest,
     "ping": teamviewer_pb2.Ping,
-    "resync_req": teamviewer_pb2.ResyncRequest,
-    "command_player_mark_set": teamviewer_pb2.CommandPlayerMarkSet,
-    "command_player_mark_clear": teamviewer_pb2.CommandPlayerMarkClear,
-    "command_player_mark_clear_all": teamviewer_pb2.CommandPlayerMarkClearAll,
-    "command_same_server_filter_set": teamviewer_pb2.CommandSameServerFilterSet,
-    "command_tactical_waypoint_set": teamviewer_pb2.CommandTacticalWaypointSet,
-    "players_update": teamviewer_pb2.PlayersUpdate,
-    "tab_players_update": teamviewer_pb2.TabPlayersUpdate,
-    "tab_players_patch": teamviewer_pb2.TabPlayersPatch,
-    "players_patch": teamviewer_pb2.PlayersPatch,
-    "entities_update": teamviewer_pb2.EntitiesUpdate,
-    "entities_patch": teamviewer_pb2.EntitiesPatch,
-    "state_keepalive": teamviewer_pb2.StateKeepalive,
-    "source_state_clear": teamviewer_pb2.SourceStateClear,
-    "waypoints_update": teamviewer_pb2.WaypointsUpdate,
-    "waypoints_delete": teamviewer_pb2.WaypointsDelete,
-    "waypoints_entity_death_cancel": teamviewer_pb2.WaypointsEntityDeathCancel,
-    "battle_map_observation": teamviewer_pb2.BattleMapObservation,
+    "resync_request": teamviewer_pb2.ResyncRequest,
     "handshake_ack": teamviewer_pb2.HandshakeAck,
-    "admin_ack": teamviewer_pb2.AdminAck,
+    "web_map_ack": teamviewer_pb2.WebMapAck,
     "pong": teamviewer_pb2.Pong,
     "snapshot_full": teamviewer_pb2.SnapshotFull,
     "patch": teamviewer_pb2.Patch,
     "digest": teamviewer_pb2.Digest,
-    "refresh_req": teamviewer_pb2.RefreshRequest,
+    "refresh_request": teamviewer_pb2.RefreshRequest,
     "report_rate_hint": teamviewer_pb2.ReportRateHint,
 }
 
 _WIRE_CHANNEL_TO_NAME: dict[int, str] = {
     teamviewer_pb2.WIRE_CHANNEL_PLAYER: "player",
+    teamviewer_pb2.WIRE_CHANNEL_WEB_MAP: "web_map",
     teamviewer_pb2.WIRE_CHANNEL_ADMIN: "admin",
+}
+
+_WEB_MAP_COMMAND_TO_TYPE: dict[str, str] = {
+    "resync_request": "resync_req",
+    "set_player_mark": "command_player_mark_set",
+    "clear_player_mark": "command_player_mark_clear",
+    "clear_all_player_marks": "command_player_mark_clear_all",
+    "set_same_server_filter": "command_same_server_filter_set",
+    "set_tactical_waypoint": "command_tactical_waypoint_set",
+    "delete_waypoints": "waypoints_delete",
 }
 
 
@@ -107,7 +99,6 @@ def _message_to_value(value: Any) -> Any:
 
 def _battle_map_observation_to_plain_dict(message: Message) -> dict[str, Any]:
     return {
-        "submitPlayerId": message.submit_player_id,
         "dimension": message.dimension,
         "mapSize": message.map_size,
         "anchorRow": message.anchor_row,
@@ -148,7 +139,7 @@ def _message_to_plain_dict(message: Message) -> dict[str, Any]:
             output[key] = enum_value.name if enum_value is not None else int(value)
             continue
 
-        if field.label == FieldDescriptor.LABEL_REPEATED:
+        if field.is_repeated:
             if field.message_type is not None and field.message_type.GetOptions().map_entry:
                 mapped: dict[str, Any] = {}
                 for map_key in value:
@@ -190,7 +181,7 @@ def _remap_message_value(value: Any, field: FieldDescriptor) -> Any:
     if message_type is None:
         return value
 
-    if field.label == FieldDescriptor.LABEL_REPEATED:
+    if field.is_repeated:
         if message_type.GetOptions().map_entry:
             if not isinstance(value, dict):
                 return value
@@ -245,6 +236,97 @@ def _remap_message_dict(data: dict[str, Any], descriptor) -> dict[str, Any]:
 
 
 def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
+    if payload_name in {"player_handshake_request", "web_map_handshake_request", "admin_handshake_request"}:
+        data = _message_to_plain_dict(payload)
+        data["type"] = "handshake"
+        return data
+
+    if payload_name == "web_map_command":
+        command_name = payload.WhichOneof("command")
+        if not command_name:
+            raise PacketDecodeError("invalid_payload", "web_map_command must contain a command")
+        command_payload = getattr(payload, command_name)
+        data = _message_to_plain_dict(command_payload)
+        data["type"] = _WEB_MAP_COMMAND_TO_TYPE.get(command_name, command_name)
+        return data
+
+    if payload_name == "player_report_bundle":
+        data = _message_to_plain_dict(payload)
+        bundle: dict[str, Any] = {
+            "type": "player_report_bundle",
+            "submitPlayerId": data.get("submitPlayerId"),
+        }
+
+        players_replace = data.get("playersReplace")
+        if isinstance(players_replace, dict):
+            bundle["playersReplace"] = players_replace.get("players", {})
+
+        players_patch = data.get("playersPatch")
+        if isinstance(players_patch, dict):
+            bundle["playersPatch"] = {
+                "upsert": _patch_upserts_to_map(players_patch.get("upsert", [])),
+                "delete": list(players_patch.get("delete", [])),
+            }
+
+        entities_replace = data.get("entitiesReplace")
+        if isinstance(entities_replace, dict):
+            bundle["entitiesReplace"] = entities_replace.get("entities", {})
+
+        entities_patch = data.get("entitiesPatch")
+        if isinstance(entities_patch, dict):
+            bundle["entitiesPatch"] = {
+                "upsert": _patch_upserts_to_map(entities_patch.get("upsert", [])),
+                "delete": list(entities_patch.get("delete", [])),
+            }
+
+        waypoints_replace = data.get("waypointsReplace")
+        if isinstance(waypoints_replace, dict):
+            bundle["waypointsReplace"] = waypoints_replace.get("waypoints", {})
+
+        waypoints_patch = data.get("waypointsPatch")
+        if isinstance(waypoints_patch, dict):
+            bundle["waypointsPatch"] = {
+                "upsert": _patch_upserts_to_map(waypoints_patch.get("upsert", [])),
+                "delete": list(waypoints_patch.get("delete", [])),
+            }
+
+        tab_players_replace = data.get("tabPlayersReplace")
+        if isinstance(tab_players_replace, dict):
+            bundle["tabPlayersReplace"] = list(tab_players_replace.get("tabPlayers", []))
+
+        tab_players_patch = data.get("tabPlayersPatch")
+        if isinstance(tab_players_patch, dict):
+            bundle["tabPlayersPatch"] = {
+                "upsert": _patch_upserts_to_map(tab_players_patch.get("upsert", [])),
+                "delete": list(tab_players_patch.get("delete", [])),
+            }
+
+        for key in (
+            "battleMapObservation",
+            "stateKeepalive",
+            "sourceStateClear",
+            "waypointsDelete",
+            "waypointsEntityDeathCancel",
+        ):
+            value = data.get(key)
+            if value is not None:
+                if not isinstance(value, dict):
+                    bundle[key] = value
+                    continue
+                if key == "battleMapObservation":
+                    value["type"] = "battle_map_observation"
+                elif key == "stateKeepalive":
+                    value["type"] = "state_keepalive"
+                elif key == "sourceStateClear":
+                    value["type"] = "source_state_clear"
+                elif key == "waypointsDelete":
+                    value["type"] = "waypoints_delete"
+                elif key == "waypointsEntityDeathCancel":
+                    value["type"] = "waypoints_entity_death_cancel"
+                bundle[key] = value
+
+        return bundle
+
     packet_type = _PAYLOAD_TO_TYPE.get(payload_name, payload_name)
     data = _message_to_plain_dict(payload)
     data["type"] = packet_type
@@ -335,7 +417,7 @@ def _convert_digest_body(body: dict[str, Any]) -> dict[str, Any]:
     return dict(hashes) if isinstance(hashes, dict) else {}
 
 
-def _convert_admin_ack_body(body: dict[str, Any]) -> dict[str, Any]:
+def _convert_web_map_ack_body(body: dict[str, Any]) -> dict[str, Any]:
     proto_body: dict[str, Any] = {
         "ok": bool(body.get("ok")),
     }
@@ -378,12 +460,34 @@ def _convert_admin_ack_body(body: dict[str, Any]) -> dict[str, Any]:
 
 
 def _convert_outbound_body(packet_type: str, body: dict[str, Any]) -> tuple[str, int, dict[str, Any]]:
+    if packet_type == "handshake":
+        channel_name = str(body.get("channel") or "").strip().lower()
+        if channel_name == "web_map":
+            return "web_map_handshake_request", teamviewer_pb2.WIRE_CHANNEL_WEB_MAP, {
+                key: value
+                for key, value in body.items()
+                if key not in {"type", "channel", "submitPlayerId"}
+            }
+        if channel_name == "admin":
+            return "admin_handshake_request", teamviewer_pb2.WIRE_CHANNEL_ADMIN, {
+                key: value
+                for key, value in body.items()
+                if key not in {"type", "channel", "submitPlayerId"}
+            }
+        return "player_handshake_request", teamviewer_pb2.WIRE_CHANNEL_PLAYER, {
+            key: value
+            for key, value in body.items()
+            if key not in {"type", "channel"}
+        }
+
     payload_name = _TYPE_TO_PAYLOAD.get(packet_type)
     if payload_name is None:
         raise PacketDecodeError("unsupported_packet_type", packet_type)
 
     channel_name = str(body.get("channel") or "").strip().lower()
-    if packet_type == "admin_ack" or channel_name == "admin":
+    if packet_type == "web_map_ack" or channel_name == "web_map":
+        channel = teamviewer_pb2.WIRE_CHANNEL_WEB_MAP
+    elif channel_name == "admin":
         channel = teamviewer_pb2.WIRE_CHANNEL_ADMIN
     else:
         channel = teamviewer_pb2.WIRE_CHANNEL_PLAYER
@@ -394,8 +498,8 @@ def _convert_outbound_body(packet_type: str, body: dict[str, Any]) -> tuple[str,
         return payload_name, channel, _convert_snapshot_body(body)
     if packet_type == "digest":
         return payload_name, channel, _convert_digest_body(body)
-    if packet_type == "admin_ack":
-        return payload_name, channel, _convert_admin_ack_body(body)
+    if packet_type == "web_map_ack":
+        return payload_name, channel, _convert_web_map_ack_body(body)
 
     proto_body = {
         key: value
@@ -444,9 +548,9 @@ class ProtobufMessageCodec:
             raise PacketDecodeError("invalid_payload", "packet type is required")
 
         payload_name, channel, proto_body = _convert_outbound_body(packet_type, body)
-        payload_cls = _TYPE_TO_MESSAGE.get(packet_type)
+        payload_cls = _PAYLOAD_TO_MESSAGE.get(payload_name)
         if payload_cls is None:
-            raise PacketDecodeError("unsupported_packet_type", packet_type)
+            raise PacketDecodeError("unsupported_packet_type", payload_name)
 
         message = payload_cls()
         try:

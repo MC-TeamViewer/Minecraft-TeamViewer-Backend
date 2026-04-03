@@ -137,6 +137,13 @@ class WaypointsUpdatePacket(PacketModel):
     waypoints: dict[str, WaypointData] = Field(default_factory=dict)
 
 
+class WaypointsPatchPacket(PacketModel):
+    type: Literal["waypoints_patch"]
+    submitPlayerId: str | None = None
+    upsert: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    delete: list[str] = Field(default_factory=list)
+
+
 class WaypointsDeletePacket(PacketModel):
     type: Literal["waypoints_delete"]
     submitPlayerId: str | None = None
@@ -162,6 +169,29 @@ class BattleMapObservationPacket(PacketModel):
     cells: list[BattleMapObservationCell] = Field(default_factory=list)
 
 
+class ScopePatchPacket(PacketModel):
+    upsert: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    delete: list[str] = Field(default_factory=list)
+
+
+class PlayerReportBundlePacket(PacketModel):
+    type: Literal["player_report_bundle"]
+    submitPlayerId: str | None = None
+    playersReplace: dict[str, PlayerData] = Field(default_factory=dict)
+    playersPatch: ScopePatchPacket | None = None
+    entitiesReplace: dict[str, EntityData] = Field(default_factory=dict)
+    entitiesPatch: ScopePatchPacket | None = None
+    waypointsReplace: dict[str, WaypointData] = Field(default_factory=dict)
+    waypointsPatch: ScopePatchPacket | None = None
+    tabPlayersReplace: list[dict[str, Any]] = Field(default_factory=list)
+    tabPlayersPatch: ScopePatchPacket | None = None
+    battleMapObservation: BattleMapObservationPacket | None = None
+    stateKeepalive: StateKeepalivePacket | None = None
+    sourceStateClear: SourceStateClearPacket | None = None
+    waypointsDelete: WaypointsDeletePacket | None = None
+    waypointsEntityDeathCancel: WaypointsEntityDeathCancelPacket | None = None
+
+
 WebMapInboundPacket = Annotated[
     HandshakePacket
     | PingPacket
@@ -182,6 +212,7 @@ AdminInboundPacket = Annotated[
 
 PlayerInboundPacket = Annotated[
     PlayerHandshakePacket
+    | PlayerReportBundlePacket
     | PlayersUpdatePacket
     | TabPlayersUpdatePacket
     | TabPlayersPatchPacket
@@ -191,6 +222,7 @@ PlayerInboundPacket = Annotated[
     | StateKeepalivePacket
     | SourceStateClearPacket
     | WaypointsUpdatePacket
+    | WaypointsPatchPacket
     | WaypointsDeletePacket
     | WaypointsEntityDeathCancelPacket
     | BattleMapObservationPacket
@@ -290,8 +322,8 @@ class HandshakeAckPacket(OutboundPacket):
     battleChunkTimeoutSec: int | None = None
 
 
-class AdminAckPacket(OutboundPacket):
-    type: Literal["admin_ack"] = "admin_ack"
+class WebMapAckPacket(OutboundPacket):
+    type: Literal["web_map_ack"] = "web_map_ack"
     ok: bool
     action: str | None = None
     error: str | None = None
@@ -302,6 +334,9 @@ class AdminAckPacket(OutboundPacket):
     waypointId: str | None = None
     waypoint: dict[str, Any] | None = None
     command: str | None = None
+
+
+AdminAckPacket = WebMapAckPacket
 
 
 class PongPacket(OutboundPacket):

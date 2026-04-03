@@ -1,0 +1,12 @@
+version: v2
+
+plugins:
+  - remote: buf.build/protocolbuffers/python
+    out: src/server/proto_generated
+  - remote: buf.build/protocolbuffers/java
+    out: ../Minecraft_TeamViewer/common/src/main/java
+  - remote: buf.build/bufbuild/es
+    out: ../Minecraft-TeamViewer-Web-Script/src/network/proto
+    opt:
+      - target=ts
+      - import_extension=none

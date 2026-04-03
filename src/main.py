@@ -14,22 +14,34 @@ from server.broadcaster import Broadcaster
 from server.codec import ProtobufMessageCodec
 from server.models import BattleChunkData, EntityData, PlayerData, WaypointData
 from server.protocol import (
-    AdminAckPacket,
+    BattleMapObservationPacket,
     CommandPlayerMarkClearAllPacket,
     CommandPlayerMarkClearPacket,
     CommandPlayerMarkSetPacket,
     CommandSameServerFilterSetPacket,
     CommandTacticalWaypointSetPacket,
+    EntitiesPatchPacket,
+    EntitiesUpdatePacket,
     HandshakeAckPacket,
     HandshakeHelpers,
     HandshakePacket,
     PacketDecodeError,
     PacketParsers,
     PingPacket,
+    PlayerReportBundlePacket,
     PongPacket,
+    PlayersPatchPacket,
+    PlayersUpdatePacket,
     ResyncRequestPacket,
     SourceStateClearPacket,
+    StateKeepalivePacket,
+    TabPlayersPatchPacket,
+    TabPlayersUpdatePacket,
     WaypointsDeletePacket,
+    WaypointsEntityDeathCancelPacket,
+    WaypointsPatchPacket,
+    WaypointsUpdatePacket,
+    WebMapAckPacket,
 )
 from server.state import ServerState
 
@@ -212,6 +224,125 @@ def normalize_waypoint_color_to_int(color_value, fallback: int = 0xEF4444) -> in
     except ValueError:
         return fallback
 
+
+def expand_player_packets(packet) -> list:
+    if not isinstance(packet, PlayerReportBundlePacket):
+        return [packet]
+
+    submit_player_id = packet.submitPlayerId
+    expanded: list = []
+
+    if packet.playersReplace:
+        expanded.append(
+            PlayersUpdatePacket(
+                type="players_update",
+                submitPlayerId=submit_player_id,
+                players=packet.playersReplace,
+            )
+        )
+    if packet.playersPatch is not None and (packet.playersPatch.upsert or packet.playersPatch.delete):
+        expanded.append(
+            PlayersPatchPacket(
+                type="players_patch",
+                submitPlayerId=submit_player_id,
+                upsert=packet.playersPatch.upsert,
+                delete=packet.playersPatch.delete,
+            )
+        )
+    if packet.entitiesReplace:
+        expanded.append(
+            EntitiesUpdatePacket(
+                type="entities_update",
+                submitPlayerId=submit_player_id,
+                entities=packet.entitiesReplace,
+            )
+        )
+    if packet.entitiesPatch is not None and (packet.entitiesPatch.upsert or packet.entitiesPatch.delete):
+        expanded.append(
+            EntitiesPatchPacket(
+                type="entities_patch",
+                submitPlayerId=submit_player_id,
+                upsert=packet.entitiesPatch.upsert,
+                delete=packet.entitiesPatch.delete,
+            )
+        )
+    if packet.waypointsReplace:
+        expanded.append(
+            WaypointsUpdatePacket(
+                type="waypoints_update",
+                submitPlayerId=submit_player_id,
+                waypoints=packet.waypointsReplace,
+            )
+        )
+    if packet.waypointsPatch is not None and (packet.waypointsPatch.upsert or packet.waypointsPatch.delete):
+        expanded.append(
+            WaypointsPatchPacket(
+                type="waypoints_patch",
+                submitPlayerId=submit_player_id,
+                upsert=packet.waypointsPatch.upsert,
+                delete=packet.waypointsPatch.delete,
+            )
+        )
+    if packet.tabPlayersReplace:
+        expanded.append(
+            TabPlayersUpdatePacket(
+                type="tab_players_update",
+                submitPlayerId=submit_player_id,
+                tabPlayers=packet.tabPlayersReplace,
+            )
+        )
+    if packet.tabPlayersPatch is not None and (packet.tabPlayersPatch.upsert or packet.tabPlayersPatch.delete):
+        expanded.append(
+            TabPlayersPatchPacket(
+                type="tab_players_patch",
+                submitPlayerId=submit_player_id,
+                upsert=packet.tabPlayersPatch.upsert,
+                delete=packet.tabPlayersPatch.delete,
+            )
+        )
+    if packet.battleMapObservation is not None:
+        expanded.append(
+            BattleMapObservationPacket(
+                type="battle_map_observation",
+                submitPlayerId=submit_player_id,
+                **packet.battleMapObservation.model_dump(exclude={"type", "submitPlayerId"}, exclude_none=True),
+            )
+        )
+    if packet.stateKeepalive is not None:
+        expanded.append(
+            StateKeepalivePacket(
+                type="state_keepalive",
+                submitPlayerId=submit_player_id,
+                **packet.stateKeepalive.model_dump(exclude={"type", "submitPlayerId"}, exclude_none=True),
+            )
+        )
+    if packet.sourceStateClear is not None:
+        expanded.append(
+            SourceStateClearPacket(
+                type="source_state_clear",
+                submitPlayerId=submit_player_id,
+                **packet.sourceStateClear.model_dump(exclude={"type", "submitPlayerId"}, exclude_none=True),
+            )
+        )
+    if packet.waypointsDelete is not None:
+        expanded.append(
+            WaypointsDeletePacket(
+                type="waypoints_delete",
+                submitPlayerId=submit_player_id,
+                **packet.waypointsDelete.model_dump(exclude={"type", "submitPlayerId"}, exclude_none=True),
+            )
+        )
+    if packet.waypointsEntityDeathCancel is not None:
+        expanded.append(
+            WaypointsEntityDeathCancelPacket(
+                type="waypoints_entity_death_cancel",
+                submitPlayerId=submit_player_id,
+                **packet.waypointsEntityDeathCancel.model_dump(exclude={"type", "submitPlayerId"}, exclude_none=True),
+            )
+        )
+
+    return expanded
+
 # 进程级单例：承载内存态与广播能力。
 state = ServerState()
 broadcaster = Broadcaster(state)
@@ -273,12 +404,12 @@ async def web_map_ws(websocket: WebSocket):
         while True:
             try:
                 payload = await receive_payload(websocket, allow_legacy_handshake=not handshake_completed)
-                require_wire_channel(payload, "admin", "/web-map/ws")
+                require_wire_channel(payload, "web_map", "/web-map/ws")
             except PacketDecodeError as exc:
                 if not handshake_completed and exc.code == "channel_mismatch":
-                    await reject_handshake(websocket, exc.detail, state.DEFAULT_ROOM_CODE, channel="admin")
+                    await reject_handshake(websocket, exc.detail, state.DEFAULT_ROOM_CODE, channel="web_map")
                     return
-                await send_packet(websocket, AdminAckPacket(ok=False, error=exc.code))
+                await send_packet(websocket, WebMapAckPacket(ok=False, error=exc.code))
                 continue
 
             try:
@@ -287,7 +418,7 @@ async def web_map_ws(websocket: WebSocket):
                 msg_type = str(payload.get("type") or "").strip()
                 await send_packet(
                     websocket,
-                    AdminAckPacket(ok=False, error="unsupported_command", command=msg_type or None),
+                    WebMapAckPacket(ok=False, error="unsupported_command", command=msg_type or None),
                 )
                 continue
 
@@ -305,7 +436,7 @@ async def web_map_ws(websocket: WebSocket):
                         HandshakeHelpers.protocol_version(packet),
                         legacy_room,
                     )
-                    await reject_handshake(websocket, legacy_reason, legacy_room, channel="admin", send_ack=False)
+                    await reject_handshake(websocket, legacy_reason, legacy_room, channel="web_map", send_ack=False)
                     return
                 
                 client_protocol = HandshakeHelpers.protocol_version(packet)
@@ -319,7 +450,7 @@ async def web_map_ws(websocket: WebSocket):
                         web_map_room,
                         rejection_reason,
                     )
-                    await reject_handshake(websocket, rejection_reason, web_map_room, channel="admin")
+                    await reject_handshake(websocket, rejection_reason, web_map_room, channel="web_map")
                     return
 
                 logger.info(
@@ -343,17 +474,17 @@ async def web_map_ws(websocket: WebSocket):
                         entityTimeoutSec=state.ENTITY_TIMEOUT,
                         battleChunkTimeoutSec=state.BATTLE_CHUNK_TIMEOUT,
                     ),
-                    channel="admin",
+                    channel="web_map",
                 )
                 await broadcaster.send_web_map_snapshot_full(web_map_id)
                 continue
 
             if not handshake_completed:
-                await send_packet(websocket, AdminAckPacket(ok=False, error="handshake_required"))
+                await send_packet(websocket, WebMapAckPacket(ok=False, error="handshake_required"))
                 continue
 
             if isinstance(packet, PingPacket):
-                await send_packet(websocket, PongPacket(serverTime=time.time()), channel="admin")
+                await send_packet(websocket, PongPacket(serverTime=time.time()), channel="web_map")
                 continue
 
             if isinstance(packet, ResyncRequestPacket):
@@ -371,12 +502,12 @@ async def web_map_ws(websocket: WebSocket):
                 )
 
                 if updated_mark is None:
-                    await send_packet(websocket, AdminAckPacket(ok=False, error="invalid_player_id"))
+                    await send_packet(websocket, WebMapAckPacket(ok=False, error="invalid_player_id"))
                     continue
 
                 await send_packet(
                     websocket,
-                    AdminAckPacket(
+                    WebMapAckPacket(
                         ok=True,
                         action="command_player_mark_set",
                         playerId=str(target_player_id).strip() if isinstance(target_player_id, str) else None,
@@ -390,7 +521,7 @@ async def web_map_ws(websocket: WebSocket):
                 removed = state.clear_player_mark(target_player_id)
                 await send_packet(
                     websocket,
-                    AdminAckPacket(
+                    WebMapAckPacket(
                         ok=bool(removed),
                         action="command_player_mark_clear",
                         playerId=target_player_id,
@@ -405,7 +536,7 @@ async def web_map_ws(websocket: WebSocket):
                 removed_count = state.clear_all_player_marks()
                 await send_packet(
                     websocket,
-                    AdminAckPacket(
+                    WebMapAckPacket(
                         ok=True,
                         action="command_player_mark_clear_all",
                         removedCount=removed_count,
@@ -417,7 +548,7 @@ async def web_map_ws(websocket: WebSocket):
                 state.same_server_filter_enabled = bool(packet.enabled)
                 await send_packet(
                     websocket,
-                    AdminAckPacket(
+                    WebMapAckPacket(
                         ok=True,
                         action="command_same_server_filter_set",
                         enabled=state.same_server_filter_enabled,
@@ -479,7 +610,7 @@ async def web_map_ws(websocket: WebSocket):
                 try:
                     validated = WaypointData(**waypoint_payload)
                 except ValidationError:
-                    await send_packet(websocket, AdminAckPacket(ok=False, error="invalid_tactical_waypoint_payload"))
+                    await send_packet(websocket, WebMapAckPacket(ok=False, error="invalid_tactical_waypoint_payload"))
                     continue
 
                 web_map_source_id = state.build_web_map_tactical_source_id(room_code)
@@ -488,7 +619,7 @@ async def web_map_ws(websocket: WebSocket):
 
                 await send_packet(
                     websocket,
-                    AdminAckPacket(
+                    WebMapAckPacket(
                         ok=True,
                         action="command_tactical_waypoint_set",
                         waypointId=waypoint_id,
@@ -535,7 +666,7 @@ async def web_map_ws(websocket: WebSocket):
 
                 await send_packet(
                     websocket,
-                    AdminAckPacket(
+                    WebMapAckPacket(
                         ok=bool(removed_ids),
                         action="waypoints_delete",
                         waypointIds=removed_ids,
@@ -544,7 +675,7 @@ async def web_map_ws(websocket: WebSocket):
                 )
                 continue
 
-            await send_packet(websocket, AdminAckPacket(ok=False, error="unsupported_command"))
+            await send_packet(websocket, WebMapAckPacket(ok=False, error="unsupported_command"))
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -715,354 +846,391 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.debug("Ignore player packet before handshake registration submitPlayerId=%s", submit_player_id)
                 continue
 
-            if (
-                packet.type not in {"tab_players_update", "tab_players_patch"}
-                and not isinstance(packet, SourceStateClearPacket)
-            ):
-                state.touch_tab_player_report(submit_player_id, time.time())
+            for packet in expand_player_packets(packet):
+                if (
+                    packet.type not in {"tab_players_update", "tab_players_patch"}
+                    and not isinstance(packet, SourceStateClearPacket)
+                ):
+                    state.touch_tab_player_report(submit_player_id, time.time())
 
-            if packet.type == "state_keepalive":
-                current_time = time.time()
-                touched_players = state.touch_reports(
-                    state.player_reports,
-                    packet.players,
-                    submit_player_id,
-                    current_time,
-                )
-                touched_entities = state.touch_reports(
-                    state.entity_reports,
-                    packet.entities,
-                    submit_player_id,
-                    current_time,
-                )
-                if touched_players or touched_entities:
-                    logger.debug(
-                        "Applied state_keepalive "
-                        f"submitPlayerId={submit_player_id} players={touched_players}/{len(packet.players)} "
-                        f"entities={touched_entities}/{len(packet.entities)}"
-                    )
-                continue
-
-            if isinstance(packet, SourceStateClearPacket):
-                state.clear_source_state(submit_player_id, packet.scopes)
-                await broadcaster.broadcast_web_map_updates()
-                logger.info(
-                    "Cleared source state for submitPlayerId=%s scopes=%s",
-                    submit_player_id,
-                    packet.scopes or ["players", "entities", "tab_players", "waypoints"],
-                )
-                continue
-
-            if packet.type == "players_update":
-                # 玩家全量：语义为“该来源本轮玩家状态完整快照”。
-                current_time = time.time()
-                for pid, player_data in packet.players.items():
-                    try:
-                        normalized = player_data.model_dump()
-                        node = state.build_state_node(submit_player_id, current_time, normalized)
-                        state.upsert_report(state.player_reports, pid, submit_player_id, node)
-                    except Exception as e:
-                        logger.warning("Error validating player data for %s: %s", pid, e)
-
-                continue
-
-            if packet.type == "tab_players_update":
-                if isinstance(submit_player_id, str) and submit_player_id:
+                if packet.type == "state_keepalive":
                     current_time = time.time()
-                    tab_players = packet.tabPlayers
-                    state.upsert_tab_player_report(submit_player_id, tab_players, current_time)
-                    await broadcaster.broadcast_web_map_updates()
-                continue
-
-            if packet.type == "tab_players_patch":
-                if isinstance(submit_player_id, str) and submit_player_id:
-                    current_time = time.time()
-                    state.patch_tab_player_report(
+                    touched_players = state.touch_reports(
+                        state.player_reports,
+                        packet.players,
                         submit_player_id,
-                        packet.upsert,
-                        packet.delete,
                         current_time,
                     )
-                    await broadcaster.broadcast_web_map_updates()
-                continue
-
-            if packet.type == "players_patch":
-                # 玩家增量：基于该来源已有快照做 merge 后再校验。
-                current_time = time.time()
-                upsert = packet.upsert
-                delete = packet.delete
-                missing_baseline_players = []
-
-                for pid, player_data in upsert.items():
-                    source_key = submit_player_id if isinstance(submit_player_id, str) else ""
-                    existing_node = state.player_reports.get(pid, {}).get(source_key)
-                    try:
-                        normalized = state.merge_patch_and_validate(PlayerData, existing_node, player_data)
-                        node = state.build_state_node(submit_player_id, current_time, normalized)
-                        state.upsert_report(state.player_reports, pid, submit_player_id, node)
-                    except ValidationError as e:
-                        missing_fields = state.missing_fields_from_validation_error(e)
-                        existing_data = existing_node.get("data") if isinstance(existing_node, dict) else None
-                        existing_keys = sorted(existing_data.keys()) if isinstance(existing_data, dict) else []
-                        if not isinstance(existing_data, dict):
-                            missing_baseline_players.append(pid)
-                        logger.warning(
-                            "Player patch validation failed "
-                            f"pid={pid} submitPlayerId={submit_player_id} sourceKey={source_key!r} "
-                            f"hasExistingSnapshot={bool(isinstance(existing_data, dict))} "
-                            f"missingFields={missing_fields or '[]'} "
-                            f"existingKeys={existing_keys} payload={state.payload_preview(player_data)} "
-                            f"errors={state.payload_preview(e.errors(), 480)}"
-                        )
-                    except Exception as e:
-                        logger.exception(
-                            "Unexpected error validating player patch "
-                            f"pid={pid} submitPlayerId={submit_player_id} payload={state.payload_preview(player_data)}: {e}"
-                        )
-
-                if isinstance(delete, list):
-                    for pid in delete:
-                        if not isinstance(pid, str):
-                            continue
-                        state.delete_report(state.player_reports, pid, submit_player_id)
-
-                if missing_baseline_players and isinstance(submit_player_id, str) and submit_player_id:
-                    await broadcaster.send_refresh_request_to_source(
+                    touched_entities = state.touch_reports(
+                        state.entity_reports,
+                        packet.entities,
                         submit_player_id,
-                        players=missing_baseline_players,
-                        entities=[],
-                        battle_chunks=[],
-                        reason="missing_baseline_patch",
-                        bypass_cooldown=False,
-                    )
-
-                continue
-
-            if packet.type == "entities_update":
-                # 实体全量：先清理该来源旧实体，再写入本轮实体列表。
-                current_time = time.time()
-                player_entities = packet.entities
-                source_key = submit_player_id if isinstance(submit_player_id, str) else ""
-                for entity_id in list(state.entity_reports.keys()):
-                    source_bucket = state.entity_reports.get(entity_id, {})
-                    if source_key in source_bucket:
-                        state.delete_report(state.entity_reports, entity_id, submit_player_id)
-
-                for entity_id, entity_data in player_entities.items():
-                    try:
-                        normalized = entity_data.model_dump()
-                        node = state.build_state_node(submit_player_id, current_time, normalized)
-                        state.upsert_report(state.entity_reports, entity_id, submit_player_id, node)
-                    except Exception as e:
-                        logger.warning("Error validating entity data for %s: %s", entity_id, e)
-
-                continue
-
-            if packet.type == "entities_patch":
-                # 实体增量：仅修改当前来源 bucket，不影响其他来源。
-                current_time = time.time()
-                upsert = packet.upsert
-                delete = packet.delete
-                missing_baseline_entities = []
-
-                for entity_id, entity_data in upsert.items():
-                    source_key = submit_player_id if isinstance(submit_player_id, str) else ""
-                    existing_node = state.entity_reports.get(entity_id, {}).get(source_key)
-                    try:
-                        normalized = state.merge_patch_and_validate(EntityData, existing_node, entity_data)
-                        node = state.build_state_node(submit_player_id, current_time, normalized)
-                        state.upsert_report(state.entity_reports, entity_id, submit_player_id, node)
-                    except ValidationError as e:
-                        missing_fields = state.missing_fields_from_validation_error(e)
-                        existing_data = existing_node.get("data") if isinstance(existing_node, dict) else None
-                        existing_keys = sorted(existing_data.keys()) if isinstance(existing_data, dict) else []
-                        if not isinstance(existing_data, dict):
-                            missing_baseline_entities.append(entity_id)
-                        logger.warning(
-                            "Entity patch validation failed "
-                            f"entityId={entity_id} submitPlayerId={submit_player_id} sourceKey={source_key!r} "
-                            f"hasExistingSnapshot={bool(isinstance(existing_data, dict))} "
-                            f"missingFields={missing_fields or '[]'} "
-                            f"existingKeys={existing_keys} payload={state.payload_preview(entity_data)} "
-                            f"errors={state.payload_preview(e.errors(), 480)}"
-                        )
-                    except Exception as e:
-                        logger.exception(
-                            "Unexpected error validating entity patch "
-                            f"entityId={entity_id} submitPlayerId={submit_player_id} "
-                            f"payload={state.payload_preview(entity_data)}: {e}"
-                        )
-
-                if isinstance(delete, list):
-                    for entity_id in delete:
-                        if not isinstance(entity_id, str):
-                            continue
-                        state.delete_report(state.entity_reports, entity_id, submit_player_id)
-
-                if missing_baseline_entities and isinstance(submit_player_id, str) and submit_player_id:
-                    await broadcaster.send_refresh_request_to_source(
-                        submit_player_id,
-                        players=[],
-                        entities=missing_baseline_entities,
-                        battle_chunks=[],
-                        reason="missing_baseline_patch",
-                        bypass_cooldown=False,
-                    )
-
-                continue
-
-            if packet.type == "waypoints_update":
-                # 路标上报：支持 quick 类型数量约束。
-                current_time = time.time()
-                player_waypoints = packet.waypoints
-                for waypoint_id, waypoint_data in player_waypoints.items():
-                    try:
-                        normalized = waypoint_data.model_dump()
-
-                        if normalized.get("waypointKind") == "quick":
-                            max_quick_marks = normalized.get("maxQuickMarks")
-                            if isinstance(max_quick_marks, (int, float)):
-                                max_quick_marks = max(1, min(int(max_quick_marks), 100))
-                            elif bool(normalized.get("replaceOldQuick")):
-                                max_quick_marks = 1
-                            else:
-                                max_quick_marks = None
-
-                            if max_quick_marks is not None:
-                                # 限流策略：超出上限时按最旧 quick 路标淘汰。
-                                old_quick_waypoints = [
-                                    (wid, source_bucket[submit_player_id])
-                                    for wid, source_bucket in list(state.waypoint_reports.items())
-                                    if wid != waypoint_id
-                                    and isinstance(source_bucket, dict)
-                                    and submit_player_id in source_bucket
-                                    and isinstance(source_bucket[submit_player_id], dict)
-                                    and isinstance(source_bucket[submit_player_id].get("data"), dict)
-                                    and source_bucket[submit_player_id]["data"].get("waypointKind") == "quick"
-                                ]
-
-                                remove_count = len(old_quick_waypoints) - max_quick_marks + 1
-                                if remove_count > 0:
-                                    old_quick_waypoints.sort(key=lambda item: state.node_timestamp(item[1]))
-                                    for old_id, _ in old_quick_waypoints[:remove_count]:
-                                        state.delete_report(state.waypoint_reports, old_id, submit_player_id)
-
-                        node = state.build_state_node(submit_player_id, current_time, normalized)
-                        state.upsert_report(state.waypoint_reports, waypoint_id, submit_player_id, node)
-                    except Exception as e:
-                        logger.warning("Error validating waypoint data for %s: %s", waypoint_id, e)
-
-                continue
-
-            if packet.type == "battle_map_observation":
-                current_time = time.time()
-                result = state.apply_battle_map_observation(
-                    submit_player_id=submit_player_id,
-                    room_code=state.get_player_room(submit_player_id),
-                    dimension=packet.dimension,
-                    map_size=packet.mapSize,
-                    anchor_row=packet.anchorRow,
-                    anchor_col=packet.anchorCol,
-                    snapshot_observed_at=packet.snapshotObservedAt,
-                    parsed_at=packet.parsedAt,
-                    candidates=[candidate.model_dump() for candidate in packet.candidates],
-                    cells=[cell.model_dump() for cell in packet.cells],
-                    current_time=current_time,
-                )
-                if not result.get("accepted"):
-                    logger.warning(
-                        "Ignored battle_map_observation submitPlayerId=%s reason=%s",
-                        submit_player_id,
-                        result.get("reason"),
-                    )
-                    
-                else:
-                    logger.debug(
-                        "Accepted battle_map_observation submitPlayerId=%s reason=%s upserted=%s currentTime=%s",
-                        submit_player_id,
-                        result.get("reason"),
-                        result.get("upserted"),
                         current_time,
                     )
+                    if touched_players or touched_entities:
+                        logger.debug(
+                            "Applied state_keepalive "
+                            f"submitPlayerId={submit_player_id} players={touched_players}/{len(packet.players)} "
+                            f"entities={touched_entities}/{len(packet.entities)}"
+                        )
+                    continue
 
-                continue
+                if isinstance(packet, SourceStateClearPacket):
+                    state.clear_source_state(submit_player_id, packet.scopes)
+                    await broadcaster.broadcast_web_map_updates()
+                    logger.info(
+                        "Cleared source state for submitPlayerId=%s scopes=%s",
+                        submit_player_id,
+                        packet.scopes or ["players", "entities", "tab_players", "waypoints"],
+                    )
+                    continue
 
-            if packet.type == "waypoints_delete":
-                # 路标删除：根据 deletableBy 权限控制删除逻辑。
-                waypoint_ids = packet.waypointIds
+                if packet.type == "players_update":
+                    # 玩家全量：语义为“该来源本轮玩家状态完整快照”。
+                    current_time = time.time()
+                    for pid, player_data in packet.players.items():
+                        try:
+                            normalized = player_data.model_dump()
+                            node = state.build_state_node(submit_player_id, current_time, normalized)
+                            state.upsert_report(state.player_reports, pid, submit_player_id, node)
+                        except Exception as e:
+                            logger.warning("Error validating player data for %s: %s", pid, e)
 
-                for waypoint_id in waypoint_ids:
-                    if not isinstance(waypoint_id, str):
-                        continue
-                    
-                    # 检查 waypoint 是否存在
-                    source_bucket = state.waypoint_reports.get(waypoint_id)
-                    if not isinstance(source_bucket, dict) or not source_bucket:
-                        continue
-                    
-                    # 获取第一个来源的节点数据来检查权限（假设同一 waypoint 的不同来源有相同的权限设置）
-                    first_node = next(iter(source_bucket.values()), None)
-                    if not isinstance(first_node, dict):
-                        continue
-                    
-                    waypoint_data = first_node.get("data", {})
-                    if not isinstance(waypoint_data, dict):
-                        continue
-                    
-                    # 检查删除权限：deletableBy="owner" 时仅创建者可删除
-                    deletable_by = waypoint_data.get("deletableBy", "everyone")
-                    if deletable_by == "owner":
-                        # 仅当提交者是创建者时才允许删除
-                        if submit_player_id not in source_bucket:
-                            logger.debug(
-                                "Waypoint delete denied: playerId=%s is not owner of waypoint=%s",
-                                submit_player_id,
-                                waypoint_id,
+                    continue
+
+                if packet.type == "tab_players_update":
+                    if isinstance(submit_player_id, str) and submit_player_id:
+                        current_time = time.time()
+                        tab_players = packet.tabPlayers
+                        state.upsert_tab_player_report(submit_player_id, tab_players, current_time)
+                        await broadcaster.broadcast_web_map_updates()
+                    continue
+
+                if packet.type == "tab_players_patch":
+                    if isinstance(submit_player_id, str) and submit_player_id:
+                        current_time = time.time()
+                        state.patch_tab_player_report(
+                            submit_player_id,
+                            packet.upsert,
+                            packet.delete,
+                            current_time,
+                        )
+                        await broadcaster.broadcast_web_map_updates()
+                    continue
+
+                if packet.type == "players_patch":
+                    # 玩家增量：基于该来源已有快照做 merge 后再校验。
+                    current_time = time.time()
+                    upsert = packet.upsert
+                    delete = packet.delete
+                    missing_baseline_players = []
+
+                    for pid, player_data in upsert.items():
+                        source_key = submit_player_id if isinstance(submit_player_id, str) else ""
+                        existing_node = state.player_reports.get(pid, {}).get(source_key)
+                        try:
+                            normalized = state.merge_patch_and_validate(PlayerData, existing_node, player_data)
+                            node = state.build_state_node(submit_player_id, current_time, normalized)
+                            state.upsert_report(state.player_reports, pid, submit_player_id, node)
+                        except ValidationError as e:
+                            missing_fields = state.missing_fields_from_validation_error(e)
+                            existing_data = existing_node.get("data") if isinstance(existing_node, dict) else None
+                            existing_keys = sorted(existing_data.keys()) if isinstance(existing_data, dict) else []
+                            if not isinstance(existing_data, dict):
+                                missing_baseline_players.append(pid)
+                            logger.warning(
+                                "Player patch validation failed "
+                                f"pid={pid} submitPlayerId={submit_player_id} sourceKey={source_key!r} "
+                                f"hasExistingSnapshot={bool(isinstance(existing_data, dict))} "
+                                f"missingFields={missing_fields or '[]'} "
+                                f"existingKeys={existing_keys} payload={state.payload_preview(player_data)} "
+                                f"errors={state.payload_preview(e.errors(), 480)}"
                             )
+                        except Exception as e:
+                            logger.exception(
+                                "Unexpected error validating player patch "
+                                f"pid={pid} submitPlayerId={submit_player_id} payload={state.payload_preview(player_data)}: {e}"
+                            )
+
+                    if isinstance(delete, list):
+                        for pid in delete:
+                            if not isinstance(pid, str):
+                                continue
+                            state.delete_report(state.player_reports, pid, submit_player_id)
+
+                    if missing_baseline_players and isinstance(submit_player_id, str) and submit_player_id:
+                        await broadcaster.send_refresh_request_to_source(
+                            submit_player_id,
+                            players=missing_baseline_players,
+                            entities=[],
+                            battle_chunks=[],
+                            reason="missing_baseline_patch",
+                            bypass_cooldown=False,
+                        )
+
+                    continue
+
+                if packet.type == "entities_update":
+                    # 实体全量：先清理该来源旧实体，再写入本轮实体列表。
+                    current_time = time.time()
+                    player_entities = packet.entities
+                    source_key = submit_player_id if isinstance(submit_player_id, str) else ""
+                    for entity_id in list(state.entity_reports.keys()):
+                        source_bucket = state.entity_reports.get(entity_id, {})
+                        if source_key in source_bucket:
+                            state.delete_report(state.entity_reports, entity_id, submit_player_id)
+
+                    for entity_id, entity_data in player_entities.items():
+                        try:
+                            normalized = entity_data.model_dump()
+                            node = state.build_state_node(submit_player_id, current_time, normalized)
+                            state.upsert_report(state.entity_reports, entity_id, submit_player_id, node)
+                        except Exception as e:
+                            logger.warning("Error validating entity data for %s: %s", entity_id, e)
+
+                    continue
+
+                if packet.type == "entities_patch":
+                    # 实体增量：仅修改当前来源 bucket，不影响其他来源。
+                    current_time = time.time()
+                    upsert = packet.upsert
+                    delete = packet.delete
+                    missing_baseline_entities = []
+
+                    for entity_id, entity_data in upsert.items():
+                        source_key = submit_player_id if isinstance(submit_player_id, str) else ""
+                        existing_node = state.entity_reports.get(entity_id, {}).get(source_key)
+                        try:
+                            normalized = state.merge_patch_and_validate(EntityData, existing_node, entity_data)
+                            node = state.build_state_node(submit_player_id, current_time, normalized)
+                            state.upsert_report(state.entity_reports, entity_id, submit_player_id, node)
+                        except ValidationError as e:
+                            missing_fields = state.missing_fields_from_validation_error(e)
+                            existing_data = existing_node.get("data") if isinstance(existing_node, dict) else None
+                            existing_keys = sorted(existing_data.keys()) if isinstance(existing_data, dict) else []
+                            if not isinstance(existing_data, dict):
+                                missing_baseline_entities.append(entity_id)
+                            logger.warning(
+                                "Entity patch validation failed "
+                                f"entityId={entity_id} submitPlayerId={submit_player_id} sourceKey={source_key!r} "
+                                f"hasExistingSnapshot={bool(isinstance(existing_data, dict))} "
+                                f"missingFields={missing_fields or '[]'} "
+                                f"existingKeys={existing_keys} payload={state.payload_preview(entity_data)} "
+                                f"errors={state.payload_preview(e.errors(), 480)}"
+                            )
+                        except Exception as e:
+                            logger.exception(
+                                "Unexpected error validating entity patch "
+                                f"entityId={entity_id} submitPlayerId={submit_player_id} "
+                                f"payload={state.payload_preview(entity_data)}: {e}"
+                            )
+
+                    if isinstance(delete, list):
+                        for entity_id in delete:
+                            if not isinstance(entity_id, str):
+                                continue
+                            state.delete_report(state.entity_reports, entity_id, submit_player_id)
+
+                    if missing_baseline_entities and isinstance(submit_player_id, str) and submit_player_id:
+                        await broadcaster.send_refresh_request_to_source(
+                            submit_player_id,
+                            players=[],
+                            entities=missing_baseline_entities,
+                            battle_chunks=[],
+                            reason="missing_baseline_patch",
+                            bypass_cooldown=False,
+                        )
+
+                    continue
+
+                if packet.type == "waypoints_patch":
+                    current_time = time.time()
+                    upsert = packet.upsert
+                    delete = packet.delete
+
+                    for waypoint_id, waypoint_data in upsert.items():
+                        source_key = submit_player_id if isinstance(submit_player_id, str) else ""
+                        existing_node = state.waypoint_reports.get(waypoint_id, {}).get(source_key)
+                        try:
+                            normalized = state.merge_patch_and_validate(WaypointData, existing_node, waypoint_data)
+                            node = state.build_state_node(submit_player_id, current_time, normalized)
+                            state.upsert_report(state.waypoint_reports, waypoint_id, submit_player_id, node)
+                        except ValidationError as e:
+                            existing_data = existing_node.get("data") if isinstance(existing_node, dict) else None
+                            logger.warning(
+                                "Waypoint patch validation failed "
+                                f"waypointId={waypoint_id} submitPlayerId={submit_player_id} "
+                                f"hasExistingSnapshot={bool(isinstance(existing_data, dict))} "
+                                f"payload={state.payload_preview(waypoint_data)} "
+                                f"errors={state.payload_preview(e.errors(), 480)}"
+                            )
+                        except Exception as e:
+                            logger.exception(
+                                "Unexpected error validating waypoint patch "
+                                f"waypointId={waypoint_id} submitPlayerId={submit_player_id} "
+                                f"payload={state.payload_preview(waypoint_data)}: {e}"
+                            )
+
+                    if isinstance(delete, list):
+                        for waypoint_id in delete:
+                            if not isinstance(waypoint_id, str):
+                                continue
+                            state.delete_report(state.waypoint_reports, waypoint_id, submit_player_id)
+
+                    continue
+
+                if packet.type == "waypoints_update":
+                # 路标上报：支持 quick 类型数量约束。
+                    current_time = time.time()
+                    player_waypoints = packet.waypoints
+                    for waypoint_id, waypoint_data in player_waypoints.items():
+                        try:
+                            normalized = waypoint_data.model_dump()
+
+                            if normalized.get("waypointKind") == "quick":
+                                max_quick_marks = normalized.get("maxQuickMarks")
+                                if isinstance(max_quick_marks, (int, float)):
+                                    max_quick_marks = max(1, min(int(max_quick_marks), 100))
+                                elif bool(normalized.get("replaceOldQuick")):
+                                    max_quick_marks = 1
+                                else:
+                                    max_quick_marks = None
+
+                                if max_quick_marks is not None:
+                                    # 限流策略：超出上限时按最旧 quick 路标淘汰。
+                                    old_quick_waypoints = [
+                                        (wid, source_bucket[submit_player_id])
+                                        for wid, source_bucket in list(state.waypoint_reports.items())
+                                        if wid != waypoint_id
+                                        and isinstance(source_bucket, dict)
+                                        and submit_player_id in source_bucket
+                                        and isinstance(source_bucket[submit_player_id], dict)
+                                        and isinstance(source_bucket[submit_player_id].get("data"), dict)
+                                        and source_bucket[submit_player_id]["data"].get("waypointKind") == "quick"
+                                    ]
+
+                                    remove_count = len(old_quick_waypoints) - max_quick_marks + 1
+                                    if remove_count > 0:
+                                        old_quick_waypoints.sort(key=lambda item: state.node_timestamp(item[1]))
+                                        for old_id, _ in old_quick_waypoints[:remove_count]:
+                                            state.delete_report(state.waypoint_reports, old_id, submit_player_id)
+
+                            node = state.build_state_node(submit_player_id, current_time, normalized)
+                            state.upsert_report(state.waypoint_reports, waypoint_id, submit_player_id, node)
+                        except Exception as e:
+                            logger.warning("Error validating waypoint data for %s: %s", waypoint_id, e)
+
+                    continue
+
+                if packet.type == "battle_map_observation":
+                    current_time = time.time()
+                    result = state.apply_battle_map_observation(
+                        submit_player_id=submit_player_id,
+                        room_code=state.get_player_room(submit_player_id),
+                        dimension=packet.dimension,
+                        map_size=packet.mapSize,
+                        anchor_row=packet.anchorRow,
+                        anchor_col=packet.anchorCol,
+                        snapshot_observed_at=packet.snapshotObservedAt,
+                        parsed_at=packet.parsedAt,
+                        candidates=[candidate.model_dump() for candidate in packet.candidates],
+                        cells=[cell.model_dump() for cell in packet.cells],
+                        current_time=current_time,
+                    )
+                    if not result.get("accepted"):
+                        logger.warning(
+                            "Ignored battle_map_observation submitPlayerId=%s reason=%s",
+                            submit_player_id,
+                            result.get("reason"),
+                        )
+
+                    else:
+                        logger.debug(
+                            "Accepted battle_map_observation submitPlayerId=%s reason=%s upserted=%s currentTime=%s",
+                            submit_player_id,
+                            result.get("reason"),
+                            result.get("upserted"),
+                            current_time,
+                        )
+
+                    continue
+
+                if packet.type == "waypoints_delete":
+                    # 路标删除：根据 deletableBy 权限控制删除逻辑。
+                    waypoint_ids = packet.waypointIds
+
+                    for waypoint_id in waypoint_ids:
+                        if not isinstance(waypoint_id, str):
                             continue
-                    
-                    # 执行删除：删除当前提交者的报告
-                    state.delete_report(state.waypoint_reports, waypoint_id, submit_player_id)
 
-                continue
-
-            if packet.type == "waypoints_entity_death_cancel":
-                # 实体死亡撤销：清理 targetEntityId 命中的 entity 类型路标。
-                target_entity_ids = packet.targetEntityIds
-
-                target_entity_id_set = {
-                    entity_id for entity_id in target_entity_ids
-                    if isinstance(entity_id, str) and entity_id.strip()
-                }
-
-                if target_entity_id_set:
-                    for waypoint_id in list(state.waypoint_reports.keys()):
+                        # 检查 waypoint 是否存在
                         source_bucket = state.waypoint_reports.get(waypoint_id)
-                        if not isinstance(source_bucket, dict):
+                        if not isinstance(source_bucket, dict) or not source_bucket:
                             continue
 
-                        for source_id in list(source_bucket.keys()):
-                            node = source_bucket.get(source_id)
-                            if not isinstance(node, dict):
-                                continue
-                            payload = node.get("data")
-                            if not isinstance(payload, dict):
-                                continue
-                            if payload.get("targetType") != "entity":
-                                continue
-                            if payload.get("targetEntityId") not in target_entity_id_set:
-                                continue
-                            state.delete_report(state.waypoint_reports, waypoint_id, source_id)
+                        # 获取第一个来源的节点数据来检查权限（假设同一 waypoint 的不同来源有相同的权限设置）
+                        first_node = next(iter(source_bucket.values()), None)
+                        if not isinstance(first_node, dict):
+                            continue
 
-                continue
+                        waypoint_data = first_node.get("data", {})
+                        if not isinstance(waypoint_data, dict):
+                            continue
 
-            if isinstance(packet, ResyncRequestPacket) and submit_player_id:
-                # 客户端主动请求全量重同步。
-                try:
-                    await broadcaster.send_snapshot_full_to_player(submit_player_id)
-                except Exception as e:
-                    logger.warning("Error sending snapshot_full to %s: %s", submit_player_id, e)
-                continue
+                        # 检查删除权限：deletableBy="owner" 时仅创建者可删除
+                        deletable_by = waypoint_data.get("deletableBy", "everyone")
+                        if deletable_by == "owner":
+                            # 仅当提交者是创建者时才允许删除
+                            if submit_player_id not in source_bucket:
+                                logger.debug(
+                                    "Waypoint delete denied: playerId=%s is not owner of waypoint=%s",
+                                    submit_player_id,
+                                    waypoint_id,
+                                )
+                                continue
+
+                        # 执行删除：删除当前提交者的报告
+                        state.delete_report(state.waypoint_reports, waypoint_id, submit_player_id)
+
+                    continue
+
+                if packet.type == "waypoints_entity_death_cancel":
+                    # 实体死亡撤销：清理 targetEntityId 命中的 entity 类型路标。
+                    target_entity_ids = packet.targetEntityIds
+
+                    target_entity_id_set = {
+                        entity_id for entity_id in target_entity_ids
+                        if isinstance(entity_id, str) and entity_id.strip()
+                    }
+
+                    if target_entity_id_set:
+                        for waypoint_id in list(state.waypoint_reports.keys()):
+                            source_bucket = state.waypoint_reports.get(waypoint_id)
+                            if not isinstance(source_bucket, dict):
+                                continue
+
+                            for source_id in list(source_bucket.keys()):
+                                node = source_bucket.get(source_id)
+                                if not isinstance(node, dict):
+                                    continue
+                                payload = node.get("data")
+                                if not isinstance(payload, dict):
+                                    continue
+                                if payload.get("targetType") != "entity":
+                                    continue
+                                if payload.get("targetEntityId") not in target_entity_id_set:
+                                    continue
+                                state.delete_report(state.waypoint_reports, waypoint_id, source_id)
+
+                    continue
+
+                if isinstance(packet, ResyncRequestPacket) and submit_player_id:
+                    # 客户端主动请求全量重同步。
+                    try:
+                        await broadcaster.send_snapshot_full_to_player(submit_player_id)
+                    except Exception as e:
+                        logger.warning("Error sending snapshot_full to %s: %s", submit_player_id, e)
+                    continue
 
     except WebSocketDisconnect:
         pass

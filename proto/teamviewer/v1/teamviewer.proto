@@ -31,7 +31,7 @@ message TabPlayerReport {
   repeated TabPlayerEntry players = 2;
 }
 
-message AdminTabState {
+message WebMapTabState {
   bool enabled = 1;
   string room_code = 2;
   map<string, TabPlayerReport> reports = 3;
@@ -213,17 +213,29 @@ message BattleMapObservationCell {
   string color_raw = 4;
 }
 
-message HandshakeRequest {
+message PlayerHandshakeRequest {
   string network_protocol_version = 1;
   string minimum_compatible_network_protocol_version = 2;
   string local_program_version = 3;
-  optional string program_version = 4;
+  string submit_player_id = 4;
   optional string room_code = 5;
-  optional string room_id = 6;
-  optional string submit_player_id = 7;
-  optional int32 preferred_report_interval_ticks = 8;
-  optional int32 min_report_interval_ticks = 9;
-  optional int32 max_report_interval_ticks = 10;
+  optional int32 preferred_report_interval_ticks = 6;
+  optional int32 min_report_interval_ticks = 7;
+  optional int32 max_report_interval_ticks = 8;
+}
+
+message WebMapHandshakeRequest {
+  string network_protocol_version = 1;
+  string minimum_compatible_network_protocol_version = 2;
+  string local_program_version = 3;
+  optional string room_code = 4;
+}
+
+message AdminHandshakeRequest {
+  string network_protocol_version = 1;
+  string minimum_compatible_network_protocol_version = 2;
+  string local_program_version = 3;
+  optional string room_code = 4;
 }
 
 message Ping {
@@ -231,7 +243,6 @@ message Ping {
 
 message ResyncRequest {
   optional string reason = 1;
-  optional string submit_player_id = 2;
 }
 
 message CommandPlayerMarkSet {
@@ -264,28 +275,10 @@ message CommandTacticalWaypointSet {
   optional int32 ttl_seconds = 8;
   optional string color = 9;
   optional string room_code = 10;
-  optional string room_id = 11;
 }
 
-message PlayersUpdate {
-  optional string submit_player_id = 1;
-  map<string, PlayerData> players = 2;
-}
-
-message TabPlayersUpdate {
-  optional string submit_player_id = 1;
-  repeated TabPlayerEntry tab_players = 2;
-}
-
-message TabPlayerUpsert {
-  string key = 1;
-  TabPlayerEntry data = 2;
-}
-
-message TabPlayersPatch {
-  optional string submit_player_id = 1;
-  repeated TabPlayerUpsert upsert = 2;
-  repeated string delete = 3;
+message PlayersReplace {
+  map<string, PlayerData> players = 1;
 }
 
 message PlayerUpsert {
@@ -293,15 +286,13 @@ message PlayerUpsert {
   PlayerDelta data = 2;
 }
 
-message PlayersPatch {
-  optional string submit_player_id = 1;
-  repeated PlayerUpsert upsert = 2;
-  repeated string delete = 3;
+message PlayerPatchScope {
+  repeated PlayerUpsert upsert = 1;
+  repeated string delete = 2;
 }
 
-message EntitiesUpdate {
-  optional string submit_player_id = 1;
-  map<string, EntityData> entities = 2;
+message EntitiesReplace {
+  map<string, EntityData> entities = 1;
 }
 
 message EntityUpsert {
@@ -309,26 +300,13 @@ message EntityUpsert {
   EntityDelta data = 2;
 }
 
-message EntitiesPatch {
-  optional string submit_player_id = 1;
-  repeated EntityUpsert upsert = 2;
-  repeated string delete = 3;
+message EntityPatchScope {
+  repeated EntityUpsert upsert = 1;
+  repeated string delete = 2;
 }
 
-message StateKeepalive {
-  optional string submit_player_id = 1;
-  repeated string players = 2;
-  repeated string entities = 3;
-}
-
-message SourceStateClear {
-  optional string submit_player_id = 1;
-  repeated string scopes = 2;
-}
-
-message WaypointsUpdate {
-  optional string submit_player_id = 1;
-  map<string, WaypointData> waypoints = 2;
+message WaypointsReplace {
+  map<string, WaypointData> waypoints = 1;
 }
 
 message WaypointUpsert {
@@ -336,31 +314,68 @@ message WaypointUpsert {
   WaypointDelta data = 2;
 }
 
-message WaypointsPatchScope {
+message WaypointPatchScope {
   repeated WaypointUpsert upsert = 1;
   repeated string delete = 2;
 }
 
+message TabPlayersReplace {
+  repeated TabPlayerEntry tab_players = 1;
+}
+
+message TabPlayerUpsert {
+  string key = 1;
+  TabPlayerEntry data = 2;
+}
+
+message TabPlayersPatchScope {
+  repeated TabPlayerUpsert upsert = 1;
+  repeated string delete = 2;
+}
+
+message StateKeepalive {
+  repeated string players = 1;
+  repeated string entities = 2;
+}
+
+message SourceStateClear {
+  repeated string scopes = 1;
+}
+
 message WaypointsDelete {
-  optional string submit_player_id = 1;
-  repeated string waypoint_ids = 2;
+  repeated string waypoint_ids = 1;
 }
 
 message WaypointsEntityDeathCancel {
-  optional string submit_player_id = 1;
-  repeated string target_entity_ids = 2;
+  repeated string target_entity_ids = 1;
 }
 
 message BattleMapObservation {
-  optional string submit_player_id = 1;
-  string dimension = 2;
-  int32 map_size = 3;
-  int32 anchor_row = 4;
-  int32 anchor_col = 5;
-  int64 snapshot_observed_at = 6;
-  int64 parsed_at = 7;
-  repeated BattleMapObservationCandidate candidates = 8;
-  repeated BattleMapObservationCell cells = 9;
+  string dimension = 1;
+  int32 map_size = 2;
+  int32 anchor_row = 3;
+  int32 anchor_col = 4;
+  int64 snapshot_observed_at = 5;
+  int64 parsed_at = 6;
+  repeated BattleMapObservationCandidate candidates = 7;
+  repeated BattleMapObservationCell cells = 8;
+}
+
+message PlayerReportBundle {
+  string submit_player_id = 1;
+  optional PlayersReplace players_replace = 10;
+  optional PlayerPatchScope players_patch = 11;
+  optional EntitiesReplace entities_replace = 12;
+  optional EntityPatchScope entities_patch = 13;
+  optional WaypointsReplace waypoints_replace = 14;
+  optional WaypointPatchScope waypoints_patch = 15;
+  optional TabPlayersReplace tab_players_replace = 16;
+  optional TabPlayersPatchScope tab_players_patch = 17;
+  optional BattleMapObservation battle_map_observation = 18;
+  optional StateKeepalive state_keepalive = 19;
+  optional SourceStateClear source_state_clear = 20;
+  optional WaypointsDelete waypoints_delete = 21;
+  optional WaypointsEntityDeathCancel waypoints_entity_death_cancel = 22;
 }
 
 message HandshakeAck {
@@ -380,39 +395,39 @@ message HandshakeAck {
   optional int32 battle_chunk_timeout_sec = 14;
 }
 
-message PlayerMarkAckDetail {
+message WebMapPlayerMarkAckDetail {
   string player_id = 1;
   optional PlayerMark mark = 2;
 }
 
-message ClearAllPlayerMarksAckDetail {
+message WebMapClearAllPlayerMarksAckDetail {
   int32 removed_count = 1;
 }
 
-message SameServerFilterAckDetail {
+message WebMapSameServerFilterAckDetail {
   bool enabled = 1;
 }
 
-message TacticalWaypointAckDetail {
+message WebMapTacticalWaypointAckDetail {
   string waypoint_id = 1;
   WaypointData waypoint = 2;
 }
 
-message WaypointsDeleteAckDetail {
+message WebMapWaypointsDeleteAckDetail {
   repeated string waypoint_ids = 1;
 }
 
-message AdminAck {
+message WebMapAck {
   bool ok = 1;
   optional string action = 2;
   optional string error = 3;
   optional string command = 4;
   oneof detail {
-    PlayerMarkAckDetail player_mark = 10;
-    ClearAllPlayerMarksAckDetail clear_all_player_marks = 11;
-    SameServerFilterAckDetail same_server_filter = 12;
-    TacticalWaypointAckDetail tactical_waypoint = 13;
-    WaypointsDeleteAckDetail waypoints_delete = 14;
+    WebMapPlayerMarkAckDetail player_mark = 10;
+    WebMapClearAllPlayerMarksAckDetail clear_all_player_marks = 11;
+    WebMapSameServerFilterAckDetail same_server_filter = 12;
+    WebMapTacticalWaypointAckDetail tactical_waypoint = 13;
+    WebMapWaypointsDeleteAckDetail waypoints_delete = 14;
   }
 }
 
@@ -426,21 +441,11 @@ message SnapshotFull {
   map<string, WaypointData> waypoints = 3;
   map<string, BattleChunkData> battle_chunks = 4;
   map<string, PlayerMark> player_marks = 5;
-  optional AdminTabState tab_state = 6;
+  optional WebMapTabState tab_state = 6;
   optional string room_code = 7;
   repeated string connections = 8;
   optional int32 connections_count = 9;
   optional double server_time = 10;
-}
-
-message PlayerPatchScope {
-  repeated PlayerUpsert upsert = 1;
-  repeated string delete = 2;
-}
-
-message EntityPatchScope {
-  repeated EntityUpsert upsert = 1;
-  repeated string delete = 2;
 }
 
 message BattleChunkUpsert {
@@ -466,7 +471,7 @@ message PlayerMarkPatchScope {
 message Patch {
   optional PlayerPatchScope players = 1;
   optional EntityPatchScope entities = 2;
-  optional WaypointsPatchScope waypoints = 3;
+  optional WaypointPatchScope waypoints = 3;
   optional BattleChunkPatchScope battle_chunks = 4;
   optional PlayerMarkPatchScope player_marks = 5;
   optional TabStatePatch tab_state_patch = 6;
@@ -496,37 +501,37 @@ message ReportRateHint {
   optional string reason = 3;
 }
 
+message WebMapCommand {
+  oneof command {
+    ResyncRequest resync_request = 1;
+    CommandPlayerMarkSet set_player_mark = 2;
+    CommandPlayerMarkClear clear_player_mark = 3;
+    CommandPlayerMarkClearAll clear_all_player_marks = 4;
+    CommandSameServerFilterSet set_same_server_filter = 5;
+    CommandTacticalWaypointSet set_tactical_waypoint = 6;
+    WaypointsDelete delete_waypoints = 7;
+  }
+}
+
 enum WireChannel {
   WIRE_CHANNEL_UNSPECIFIED = 0;
   WIRE_CHANNEL_PLAYER = 1;
-  WIRE_CHANNEL_ADMIN = 2;
+  WIRE_CHANNEL_WEB_MAP = 2;
+  WIRE_CHANNEL_ADMIN = 3;
 }
 
 message WireEnvelope {
   WireChannel channel = 1;
   oneof payload {
-    HandshakeRequest handshake_request = 10;
-    Ping ping = 11;
-    ResyncRequest resync_request = 12;
-    CommandPlayerMarkSet command_player_mark_set = 13;
-    CommandPlayerMarkClear command_player_mark_clear = 14;
-    CommandPlayerMarkClearAll command_player_mark_clear_all = 15;
-    CommandSameServerFilterSet command_same_server_filter_set = 16;
-    CommandTacticalWaypointSet command_tactical_waypoint_set = 17;
-    PlayersUpdate players_update = 18;
-    TabPlayersUpdate tab_players_update = 19;
-    TabPlayersPatch tab_players_patch = 20;
-    PlayersPatch players_patch = 21;
-    EntitiesUpdate entities_update = 22;
-    EntitiesPatch entities_patch = 23;
-    StateKeepalive state_keepalive = 24;
-    SourceStateClear source_state_clear = 25;
-    WaypointsUpdate waypoints_update = 26;
-    WaypointsDelete waypoints_delete = 27;
-    WaypointsEntityDeathCancel waypoints_entity_death_cancel = 28;
-    BattleMapObservation battle_map_observation = 29;
+    PlayerHandshakeRequest player_handshake_request = 10;
+    WebMapHandshakeRequest web_map_handshake_request = 11;
+    AdminHandshakeRequest admin_handshake_request = 12;
+    Ping ping = 13;
+    ResyncRequest resync_request = 14;
+    WebMapCommand web_map_command = 15;
+    PlayerReportBundle player_report_bundle = 16;
     HandshakeAck handshake_ack = 30;
-    AdminAck admin_ack = 31;
+    WebMapAck web_map_ack = 31;
     Pong pong = 32;
     SnapshotFull snapshot_full = 33;
     Patch patch = 34;
