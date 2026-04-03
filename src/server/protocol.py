@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
@@ -13,6 +12,7 @@ from .models import (
     PlayerData,
     WaypointData,
 )
+from .versioning import parse_protocol_version, protocol_at_least
 
 
 class PacketModel(BaseModel):
@@ -24,9 +24,7 @@ class HandshakePacket(PacketModel):
     networkProtocolVersion: str | None = None
     minimumCompatibleNetworkProtocolVersion: str | None = None
     localProgramVersion: str | None = None
-    programVersion: str | None = None
     roomCode: str | None = None
-    roomId: str | None = None
     preferredReportIntervalTicks: int | None = None
     minReportIntervalTicks: int | None = None
     maxReportIntervalTicks: int | None = None
@@ -75,7 +73,6 @@ class CommandTacticalWaypointSetPacket(PacketModel):
     ttlSeconds: int | float | None = None
     color: str | int | None = None
     roomCode: str | None = None
-    roomId: str | None = None
 
 
 class PlayerHandshakePacket(HandshakePacket):
@@ -165,7 +162,7 @@ class BattleMapObservationPacket(PacketModel):
     cells: list[BattleMapObservationCell] = Field(default_factory=list)
 
 
-AdminInboundPacket = Annotated[
+WebMapInboundPacket = Annotated[
     HandshakePacket
     | PingPacket
     | ResyncRequestPacket
@@ -175,6 +172,11 @@ AdminInboundPacket = Annotated[
     | CommandSameServerFilterSetPacket
     | CommandTacticalWaypointSetPacket
     | WaypointsDeletePacket,
+    Field(discriminator="type"),
+]
+
+AdminInboundPacket = Annotated[
+    HandshakePacket,
     Field(discriminator="type"),
 ]
 
@@ -205,8 +207,16 @@ class PacketDecodeError(ValueError):
 
 
 class PacketParsers:
+    _web_map_adapter = TypeAdapter(WebMapInboundPacket)
     _admin_adapter = TypeAdapter(AdminInboundPacket)
     _player_adapter = TypeAdapter(PlayerInboundPacket)
+
+    @staticmethod
+    def parse_web_map(payload: dict[str, Any]) -> WebMapInboundPacket:
+        try:
+            return PacketParsers._web_map_adapter.validate_python(payload)
+        except Exception as exc:
+            raise PacketDecodeError("invalid_web_map_packet", str(exc)) from exc
 
     @staticmethod
     def parse_admin(payload: dict[str, Any]) -> AdminInboundPacket:
@@ -239,38 +249,23 @@ class HandshakeHelpers:
 
     @staticmethod
     def program_version(packet: HandshakePacket, fallback: str = "unknown") -> str:
-        raw = packet.localProgramVersion or packet.programVersion or fallback
+        raw = packet.localProgramVersion or fallback
         text = str(raw).strip()
         return text or fallback
 
     @staticmethod
     def room_code(packet: HandshakePacket, fallback: str = "default") -> str:
-        raw = packet.roomCode or packet.roomId or fallback
+        raw = packet.roomCode or fallback
         text = str(raw).strip()
         return text or fallback
 
     @staticmethod
     def parse_protocol_version(version: str | int | float | None) -> tuple[int, int, int]:
-        text = str(version or "").strip()
-        if not text:
-            return 0, 0, 0
-
-        core = text.split("-", 1)[0]
-        tokens = core.split(".") if "." in core else [core]
-        parsed: list[int] = []
-
-        for token in tokens[:3]:
-            match = re.match(r"^(\d+)", token.strip())
-            parsed.append(int(match.group(1)) if match else 0)
-
-        while len(parsed) < 3:
-            parsed.append(0)
-
-        return parsed[0], parsed[1], parsed[2]
+        return parse_protocol_version(version)
 
     @staticmethod
     def protocol_at_least(current: str | int | float | None, minimum: str | int | float | None) -> bool:
-        return HandshakeHelpers.parse_protocol_version(current) >= HandshakeHelpers.parse_protocol_version(minimum)
+        return protocol_at_least(current, minimum)
 
 
 class OutboundPacket(PacketModel):

@@ -5,12 +5,13 @@ import uuid
 import asyncio
 from contextlib import asynccontextmanager
 
+import msgpack
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from server.broadcaster import Broadcaster
-from server.codec import ProtobufMessageCodec, MsgpackMessageCodec
+from server.codec import ProtobufMessageCodec
 from server.models import BattleChunkData, EntityData, PlayerData, WaypointData
 from server.protocol import (
     AdminAckPacket,
@@ -55,7 +56,6 @@ configure_logging()
 logger = logging.getLogger("teamviewrelay.main")
 
 message_codec = ProtobufMessageCodec()
-msgpack_codec = MsgpackMessageCodec()  # 用于兼容旧版本客户端
 
 async def send_packet(websocket: WebSocket, packet, *, channel: str | None = None) -> None:
     if channel:
@@ -69,13 +69,29 @@ async def send_packet(websocket: WebSocket, packet, *, channel: str | None = Non
     await websocket.send_bytes(message_codec.encode(packet))
 
 
-async def send_msgpack_response(websocket: WebSocket, response_data: dict) -> None:
-    """使用 MessagePack 发送响应（用于兼容旧版本客户端）"""
-    packed = msgpack_codec.encode(response_data)
-    await websocket.send_bytes(packed)
+def _decode_legacy_messagepack_handshake(payload: bytes | bytearray | memoryview | str) -> dict | None:
+    if isinstance(payload, str):
+        return None
+
+    raw = payload.tobytes() if isinstance(payload, memoryview) else bytes(payload)
+    if not raw:
+        return None
+
+    try:
+        data = msgpack.unpackb(raw, raw=False)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    if data.get("type") != "handshake":
+        return None
+
+    data["_legacy_msgpack"] = True
+    return data
 
 
-async def receive_payload(websocket: WebSocket) -> dict:
+async def receive_payload(websocket: WebSocket, *, allow_legacy_handshake: bool = False) -> dict:
     message = await websocket.receive()
     if message.get("type") == "websocket.disconnect":
         raise WebSocketDisconnect(code=message.get("code", 1000))
@@ -86,40 +102,43 @@ async def receive_payload(websocket: WebSocket) -> dict:
     if payload is None:
         raise PacketDecodeError("invalid_payload", "payload must be bytes")
     
-    # 首先尝试使用 Protobuf 解析
     try:
         return message_codec.decode(payload)
     except PacketDecodeError as proto_error:
-        # Protobuf 解析失败，尝试使用 MessagePack 解析 (兼容旧版本)
-        try:
-            msgpack_data = msgpack_codec.decode(payload)
-            # 检查是否是握手包，如果是则直接拒绝
-            if msgpack_data.get("type") == "handshake":
-                logger.warning(
-                    "Detected legacy MessagePack handshake (clientProtocol=%s, programVersion=%s). "
-                    "This server version only supports Protobuf protocol (0.6.0+). "
-                    "Please upgrade your client."
-                    "现在的网络协议以更新到0.6.0+版本，原有交互协议MessagePack已弃用，换为ProtoBuf，0.6.0以下版本不再支持。",
-                    msgpack_data.get("networkProtocolVersion", "unknown"),
-                    msgpack_data.get("localProgramVersion", "unknown"),
-                )
-                # 返回一个特殊标记，让上层知道这是旧版本客户端
-                msgpack_data["_legacy_msgpack"] = True
-                return msgpack_data
-            
-            # 非握手包也拒绝解析
-            logger.warning(
-                "Received legacy MessagePack packet (type=%s). "
-                "This server version only supports Protobuf protocol (0.6.0+). "
-                "Please upgrade your client.",
-                msgpack_data.get("type", "unknown"),
-            )
-            msgpack_data["_legacy_msgpack"] = True
-            return msgpack_data
-            
-        except PacketDecodeError:
-            # 两种格式都解析失败，抛出错误
+        if not allow_legacy_handshake:
             raise proto_error
+
+        legacy_handshake = _decode_legacy_messagepack_handshake(payload)
+        if legacy_handshake is None:
+            raise proto_error
+
+        logger.warning(
+            "Detected legacy MessagePack handshake (clientProtocol=%s, programVersion=%s). "
+            "This server version only supports Protobuf protocol (0.6.0+). "
+            "Please upgrade your client.",
+            legacy_handshake.get("networkProtocolVersion", "unknown"),
+            legacy_handshake.get("localProgramVersion", "unknown"),
+        )
+        return legacy_handshake
+
+
+def require_wire_channel(payload: dict, expected_channel: str, route_path: str) -> None:
+    if payload.get("_legacy_msgpack"):
+        return
+
+    actual_channel = payload.get("_wire_channel")
+    if actual_channel is None:
+        return
+
+    actual_text = str(actual_channel).strip().lower()
+    expected_text = str(expected_channel).strip().lower()
+    if actual_text == expected_text:
+        return
+
+    raise PacketDecodeError(
+        "channel_mismatch",
+        f"channel_mismatch: route={route_path}, expected={expected_text}, actual={actual_text}",
+    )
 
 
 def resolve_handshake_rejection_reason(packet: HandshakePacket) -> str | None:
@@ -147,7 +166,7 @@ async def reject_handshake(
     room_code: str,
     *,
     channel: str = "player",
-    use_msgpack: bool = False,  # 是否使用 MessagePack 格式返回（兼容旧版本）
+    send_ack: bool = True,
 ) -> None:
     ack_packet = HandshakeAckPacket(
         ready=False,
@@ -164,10 +183,7 @@ async def reject_handshake(
         battleChunkTimeoutSec=state.BATTLE_CHUNK_TIMEOUT,
     )
     
-    if use_msgpack:
-        # 对于旧版本客户端，使用 MessagePack 格式返回
-        await send_msgpack_response(websocket, ack_packet.model_dump(exclude_none=True))
-    else:
+    if send_ack:
         await send_packet(websocket, ack_packet, channel=channel)
     
     close_reason = reason if len(reason) <= 120 else reason[:120]
@@ -244,22 +260,29 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+@app.websocket("/web-map/ws")
 @app.websocket("/adminws")
-async def admin_ws(websocket: WebSocket):
-    """管理端订阅通道：用于查看服务端实时快照。"""
+async def web_map_ws(websocket: WebSocket):
+    """网页地图订阅通道：用于查看服务端实时快照与发送观察端指令。"""
     await websocket.accept()
-    admin_id = str(id(websocket))
+    web_map_id = str(id(websocket))
+    if str(websocket.url.path) == "/adminws":
+        logger.warning("Deprecated websocket route /adminws used; migrate clients to /web-map/ws")
     handshake_completed = False
     try:
         while True:
             try:
-                payload = await receive_payload(websocket)
+                payload = await receive_payload(websocket, allow_legacy_handshake=not handshake_completed)
+                require_wire_channel(payload, "admin", "/web-map/ws")
             except PacketDecodeError as exc:
+                if not handshake_completed and exc.code == "channel_mismatch":
+                    await reject_handshake(websocket, exc.detail, state.DEFAULT_ROOM_CODE, channel="admin")
+                    return
                 await send_packet(websocket, AdminAckPacket(ok=False, error=exc.code))
                 continue
 
             try:
-                packet = PacketParsers.parse_admin(payload)
+                packet = PacketParsers.parse_web_map(payload)
             except PacketDecodeError:
                 msg_type = str(payload.get("type") or "").strip()
                 await send_packet(
@@ -269,46 +292,43 @@ async def admin_ws(websocket: WebSocket):
                 continue
 
             if isinstance(packet, HandshakePacket):
-                # 检查是否是旧版本 MessagePack 客户端
                 if payload.get("_legacy_msgpack"):
-                    legacy_room = state.set_admin_room(admin_id, HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE))
+                    legacy_room = state.set_web_map_room(web_map_id, HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE))
                     legacy_reason = (
                         "unsupported_protocol_version: "
                         "This server requires Protobuf protocol (0.6.0+). "
                         "MessagePack protocol (0.5.x and earlier) is no longer supported. "
                         "Please upgrade to the latest client version."
-                        "现在的网络协议已更新到0.6.0+版本，原有交互协议MessagePack已弃用，换为ProtoBuf，0.6.0以下版本不再支持。"
                     )
                     logger.warning(
-                        "Rejecting legacy MessagePack admin client (clientProtocol=%s, roomCode=%s)",
+                        "Rejecting legacy MessagePack web-map client (clientProtocol=%s, roomCode=%s)",
                         HandshakeHelpers.protocol_version(packet),
                         legacy_room,
                     )
-                    # 使用 MessagePack 格式返回拒绝响应，确保客户端能解析
-                    await reject_handshake(websocket, legacy_reason, legacy_room, channel="admin", use_msgpack=True)
+                    await reject_handshake(websocket, legacy_reason, legacy_room, channel="admin", send_ack=False)
                     return
                 
                 client_protocol = HandshakeHelpers.protocol_version(packet)
                 client_program_version = HandshakeHelpers.program_version(packet)
-                admin_room = state.set_admin_room(admin_id, HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE))
+                web_map_room = state.set_web_map_room(web_map_id, HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE))
                 rejection_reason = resolve_handshake_rejection_reason(packet)
                 if rejection_reason:
                     logger.warning(
-                        "Admin handshake rejected (clientProtocol=%s, roomCode=%s, reason=%s)",
+                        "Web-map handshake rejected (clientProtocol=%s, roomCode=%s, reason=%s)",
                         client_protocol,
-                        admin_room,
+                        web_map_room,
                         rejection_reason,
                     )
-                    await reject_handshake(websocket, rejection_reason, admin_room, channel="admin")
+                    await reject_handshake(websocket, rejection_reason, web_map_room, channel="admin")
                     return
 
                 logger.info(
-                    "Admin connected (clientProtocol=%s, clientProgramVersion=%s, roomCode=%s)",
+                    "Web-map connected (clientProtocol=%s, clientProgramVersion=%s, roomCode=%s)",
                     client_protocol,
                     client_program_version,
-                    admin_room,
+                    web_map_room,
                 )
-                state.admin_connections[admin_id] = websocket
+                state.web_map_connections[web_map_id] = websocket
                 handshake_completed = True
                 await send_packet(
                     websocket,
@@ -316,7 +336,7 @@ async def admin_ws(websocket: WebSocket):
                         networkProtocolVersion=NETWORK_PROTOCOL_VERSION,
                         minimumCompatibleNetworkProtocolVersion=SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION,
                         localProgramVersion=SERVER_PROGRAM_VERSION,
-                        roomCode=admin_room,
+                        roomCode=web_map_room,
                         deltaEnabled=True,
                         broadcastHz=state.broadcast_hz,
                         playerTimeoutSec=state.PLAYER_TIMEOUT,
@@ -325,7 +345,7 @@ async def admin_ws(websocket: WebSocket):
                     ),
                     channel="admin",
                 )
-                await broadcaster.send_admin_snapshot_full(admin_id)
+                await broadcaster.send_web_map_snapshot_full(web_map_id)
                 continue
 
             if not handshake_completed:
@@ -337,7 +357,7 @@ async def admin_ws(websocket: WebSocket):
                 continue
 
             if isinstance(packet, ResyncRequestPacket):
-                await broadcaster.send_admin_snapshot_full(admin_id)
+                await broadcaster.send_web_map_snapshot_full(web_map_id)
                 continue
 
             if isinstance(packet, CommandPlayerMarkSetPacket):
@@ -378,7 +398,7 @@ async def admin_ws(websocket: WebSocket):
                     ),
                 )
                 if removed:
-                    await broadcaster.broadcast_admin_updates()
+                    await broadcaster.broadcast_web_map_updates()
                 continue
 
             if isinstance(packet, CommandPlayerMarkClearAllPacket):
@@ -406,11 +426,11 @@ async def admin_ws(websocket: WebSocket):
                 continue
 
             if isinstance(packet, CommandTacticalWaypointSetPacket):
-                room_code = state.normalize_room_code(packet.roomCode or packet.roomId or state.get_admin_room(admin_id))
+                room_code = state.normalize_room_code(packet.roomCode or state.get_web_map_room(web_map_id))
                 waypoint_id_raw = packet.waypointId
                 waypoint_id = str(waypoint_id_raw).strip() if isinstance(waypoint_id_raw, str) and waypoint_id_raw.strip() else ""
                 if not waypoint_id:
-                    waypoint_id = f"admin_tactical:{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}"
+                    waypoint_id = f"web_map_tactical:{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}"
 
                 x = packet.x
                 z = packet.z
@@ -439,10 +459,10 @@ async def admin_ws(websocket: WebSocket):
                     "symbol": "T",
                     "color": normalize_waypoint_color_to_int(packet.color, 0xEF4444),
                     "ownerId": None,
-                    "ownerName": "Admin Tactical",
+                    "ownerName": "Web Map Tactical",
                     "createdAt": int(time.time() * 1000),
                     "ttlSeconds": ttl_seconds,
-                    "waypointKind": "admin_tactical",
+                    "waypointKind": "web_map_tactical",
                     "replaceOldQuick": False,
                     "maxQuickMarks": None,
                     "targetType": "block",
@@ -452,8 +472,8 @@ async def admin_ws(websocket: WebSocket):
                     "roomCode": room_code,
                     "permanent": permanent,
                     "tacticalType": tactical_type,
-                    "sourceType": "admin_tactical",
-                    "deletableBy": "owner",  # Admin waypoints can only be deleted by owner
+                    "sourceType": "web_map_tactical",
+                    "deletableBy": "owner",
                 }
 
                 try:
@@ -462,9 +482,9 @@ async def admin_ws(websocket: WebSocket):
                     await send_packet(websocket, AdminAckPacket(ok=False, error="invalid_tactical_waypoint_payload"))
                     continue
 
-                admin_source_id = state.build_admin_tactical_source_id(room_code)
-                node = state.build_state_node(admin_source_id, time.time(), validated.model_dump())
-                state.upsert_report(state.waypoint_reports, waypoint_id, admin_source_id, node)
+                web_map_source_id = state.build_web_map_tactical_source_id(room_code)
+                node = state.build_state_node(web_map_source_id, time.time(), validated.model_dump())
+                state.upsert_report(state.waypoint_reports, waypoint_id, web_map_source_id, node)
 
                 await send_packet(
                     websocket,
@@ -478,8 +498,8 @@ async def admin_ws(websocket: WebSocket):
                 continue
 
             if isinstance(packet, WaypointsDeletePacket):
-                room_code = state.normalize_room_code(state.get_admin_room(admin_id))
-                admin_source_id = state.build_admin_tactical_source_id(room_code)
+                room_code = state.normalize_room_code(state.get_web_map_room(web_map_id))
+                web_map_source_id = state.build_web_map_tactical_source_id(room_code)
                 removed_ids: list[str] = []
 
                 for waypoint_id in packet.waypointIds:
@@ -507,7 +527,7 @@ async def admin_ws(websocket: WebSocket):
                             removed_for_waypoint = state.delete_report(state.waypoint_reports, waypoint_id, source_id) or removed_for_waypoint
                             continue
 
-                        if deletable_by == "owner" and source_id == admin_source_id:
+                        if deletable_by == "owner" and source_id == web_map_source_id:
                             removed_for_waypoint = state.delete_report(state.waypoint_reports, waypoint_id, source_id) or removed_for_waypoint
 
                     if removed_for_waypoint:
@@ -528,12 +548,33 @@ async def admin_ws(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        logger.exception("Admin websocket error: %s", e)
+        logger.exception("Web-map websocket error: %s", e)
     finally:
-        if admin_id in state.admin_connections:
-            del state.admin_connections[admin_id]
-        if admin_id in state.admin_connection_rooms:
-            del state.admin_connection_rooms[admin_id]
+        if web_map_id in state.web_map_connections:
+            del state.web_map_connections[web_map_id]
+        if web_map_id in state.web_map_connection_rooms:
+            del state.web_map_connection_rooms[web_map_id]
+
+
+@app.websocket("/admin/ws")
+async def reserved_admin_ws(websocket: WebSocket):
+    """预留给未来真正后台管理能力的接口。"""
+    await websocket.accept()
+    try:
+        payload = await receive_payload(websocket, allow_legacy_handshake=False)
+        require_wire_channel(payload, "admin", "/admin/ws")
+        packet = PacketParsers.parse_admin(payload)
+        if isinstance(packet, HandshakePacket):
+            await reject_handshake(
+                websocket,
+                "admin_interface_reserved: /admin/ws is reserved for a future management interface",
+                HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE),
+                channel="admin",
+            )
+            return
+        await websocket.close(code=1008, reason="admin_interface_reserved")
+    except PacketDecodeError:
+        await websocket.close(code=1008, reason="admin_interface_reserved")
 
 
 @app.websocket("/playeresp")
@@ -554,9 +595,18 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             payload = None
             try:
-                payload = await receive_payload(websocket)
+                payload = await receive_payload(websocket, allow_legacy_handshake=submit_player_id is None)
+                require_wire_channel(payload, "player", "/mc-client")
                 packet = PacketParsers.parse_player(payload)
             except PacketDecodeError as e:
+                if submit_player_id is None and e.code == "channel_mismatch":
+                    await reject_handshake(
+                        websocket,
+                        e.detail,
+                        state.DEFAULT_ROOM_CODE,
+                        channel="player",
+                    )
+                    return
                 payload_type = None
                 if isinstance(payload, dict):
                     raw_type = payload.get("type")
@@ -589,13 +639,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     submit_player_id,
                     legacy_room,
                 )
-                # 使用 MessagePack 格式返回拒绝响应，确保客户端能解析
                 await reject_handshake(
                     websocket,
                     legacy_reason,
                     legacy_room,
                     channel="player",
-                    use_msgpack=True,
+                    send_ack=False,
                 )
                 return
             
@@ -696,7 +745,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if isinstance(packet, SourceStateClearPacket):
                 state.clear_source_state(submit_player_id, packet.scopes)
-                await broadcaster.broadcast_admin_updates()
+                await broadcaster.broadcast_web_map_updates()
                 logger.info(
                     "Cleared source state for submitPlayerId=%s scopes=%s",
                     submit_player_id,
@@ -722,7 +771,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     current_time = time.time()
                     tab_players = packet.tabPlayers
                     state.upsert_tab_player_report(submit_player_id, tab_players, current_time)
-                    await broadcaster.broadcast_admin_updates()
+                    await broadcaster.broadcast_web_map_updates()
                 continue
 
             if packet.type == "tab_players_patch":
@@ -734,7 +783,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         packet.delete,
                         current_time,
                     )
-                    await broadcaster.broadcast_admin_updates()
+                    await broadcaster.broadcast_web_map_updates()
                 continue
 
             if packet.type == "players_patch":
@@ -1022,7 +1071,7 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         if submit_player_id:
             state.remove_connection(submit_player_id)
-            await broadcaster.broadcast_admin_updates()
+            await broadcaster.broadcast_web_map_updates()
             logger.info("Client %s disconnected", submit_player_id)
 
 
@@ -1079,7 +1128,7 @@ async def snapshot(roomCode: str | None = None):
         "waypoints": dict(state.waypoints),
         "battleChunks": dict(state.battle_chunks),
         "playerMarks": dict(state.player_marks),
-        "tabState": state.build_admin_tab_snapshot(selected_room),
+        "tabState": state.build_web_map_tab_snapshot(selected_room),
         "connections": list(state.connections.keys()),
         "connections_count": len(state.connections),
         "activeRooms": active_rooms,
@@ -1094,7 +1143,7 @@ async def snapshot(roomCode: str | None = None):
             "entities": dict(selected_entities),
             "waypoints": dict(selected_waypoints),
             "battleChunks": dict(selected_battle_chunks),
-            "tabState": state.build_admin_tab_snapshot(selected_room),
+            "tabState": state.build_web_map_tab_snapshot(selected_room),
             "digests": room_digests,
         },
         "broadcastHz": state.broadcast_hz,

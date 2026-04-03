@@ -6,7 +6,8 @@ TeamViewRelay 的后端聚合服务，基于 FastAPI + WebSocket。
 
 - 接收客户端上报的玩家/实体/路标数据
 - 按 `roomCode` 分房广播
-- 提供 `adminws` 管理通道（状态快照、指令）
+- 提供 `/web-map/ws` 网页地图通道（状态快照、观察端指令）
+- 预留 `/admin/ws` 真后台管理通道（当前仅占位）
 - 支持增量同步（`snapshot_full` / `patch` / `digest`）
 
 ## 环境
@@ -26,7 +27,9 @@ uv run main.py
 ## 关键端点
 
 - 玩家 WS：`/playeresp`
-- 管理 WS：`/adminws`
+- 网页地图 WS：`/web-map/ws`
+- 兼容别名：`/adminws`（仅开发期保留，正式发布前移除）
+- 后台管理 WS：`/admin/ws`（当前仅占位）
 - 健康检查：`/health`
 - 快照调试：`/snapshot`
 

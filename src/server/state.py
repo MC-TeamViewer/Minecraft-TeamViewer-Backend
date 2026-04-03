@@ -11,6 +11,7 @@ from fastapi import WebSocket
 from pydantic import ValidationError
 
 from .models import BattleChunkData
+from .versioning import normalize_protocol_version, parse_protocol_version, protocol_at_least
 
 logger = logging.getLogger("teamviewrelay.state")
 
@@ -57,7 +58,7 @@ class ServerState:
     )
     TAB_REPORT_TIMEOUT_SEC = 45
     DEFAULT_ROOM_CODE = "default"
-    ADMIN_TACTICAL_SOURCE_PREFIX = "__admin_tactical__:"
+    WEB_MAP_TACTICAL_SOURCE_PREFIX = "__web_map_tactical__:"
     BATTLE_CHUNK_CACHE_SOURCE_PREFIX = "__battle_chunk_cache__:"
 
     # 服务端配置文件（TOML）路径。
@@ -82,8 +83,8 @@ class ServerState:
         self.connections: Dict[str, WebSocket] = {}
         self.connection_caps: Dict[str, dict] = {}
         self.connection_rooms: Dict[str, str] = {}
-        self.admin_connections: Dict[str, WebSocket] = {}
-        self.admin_connection_rooms: Dict[str, str] = {}
+        self.web_map_connections: Dict[str, WebSocket] = {}
+        self.web_map_connection_rooms: Dict[str, str] = {}
 
         # 管理端指挥态：用于玩家敌我/颜色标记。
         self.player_marks: Dict[str, dict] = {}
@@ -333,14 +334,14 @@ class ServerState:
             return room_code
         return self.DEFAULT_ROOM_CODE
 
-    def set_admin_room(self, admin_id: str, room_code) -> str:
+    def set_web_map_room(self, web_map_id: str, room_code) -> str:
         normalized = self.normalize_room_code(room_code)
-        if isinstance(admin_id, str) and admin_id:
-            self.admin_connection_rooms[admin_id] = normalized
+        if isinstance(web_map_id, str) and web_map_id:
+            self.web_map_connection_rooms[web_map_id] = normalized
         return normalized
 
-    def get_admin_room(self, admin_id: str) -> str:
-        room_code = self.admin_connection_rooms.get(admin_id)
+    def get_web_map_room(self, web_map_id: str) -> str:
+        room_code = self.web_map_connection_rooms.get(web_map_id)
         if isinstance(room_code, str) and room_code.strip():
             return room_code
         return self.DEFAULT_ROOM_CODE
@@ -688,21 +689,21 @@ class ServerState:
         return filtered
 
     @classmethod
-    def build_admin_tactical_source_id(cls, room_code: str) -> str:
+    def build_web_map_tactical_source_id(cls, room_code: str) -> str:
         normalized_room = cls.normalize_room_code(room_code)
-        return f"{cls.ADMIN_TACTICAL_SOURCE_PREFIX}{normalized_room}"
+        return f"{cls.WEB_MAP_TACTICAL_SOURCE_PREFIX}{normalized_room}"
 
     @classmethod
-    def is_admin_tactical_source_id(cls, source_id: Optional[str]) -> bool:
-        return isinstance(source_id, str) and source_id.startswith(cls.ADMIN_TACTICAL_SOURCE_PREFIX)
+    def is_web_map_tactical_source_id(cls, source_id: Optional[str]) -> bool:
+        return isinstance(source_id, str) and source_id.startswith(cls.WEB_MAP_TACTICAL_SOURCE_PREFIX)
 
     @classmethod
-    def parse_admin_tactical_room_code(cls, source_id: Optional[str]) -> Optional[str]:
-        if not cls.is_admin_tactical_source_id(source_id):
+    def parse_web_map_tactical_room_code(cls, source_id: Optional[str]) -> Optional[str]:
+        if not cls.is_web_map_tactical_source_id(source_id):
             return None
         if not isinstance(source_id, str):
             return None
-        room = source_id[len(cls.ADMIN_TACTICAL_SOURCE_PREFIX):]
+        room = source_id[len(cls.WEB_MAP_TACTICAL_SOURCE_PREFIX):]
         return cls.normalize_room_code(room)
 
     @classmethod
@@ -1023,13 +1024,13 @@ class ServerState:
                 filtered[object_id] = node
                 continue
 
-            if not cls.is_admin_tactical_source_id(source_id):
+            if not cls.is_web_map_tactical_source_id(source_id):
                 continue
 
             data = node.get("data") if isinstance(node.get("data"), dict) else {}
             data_room_raw = data.get("roomCode") if isinstance(data, dict) else None
             data_room = cls.normalize_room_code(data_room_raw) if isinstance(data_room_raw, str) and data_room_raw.strip() else None
-            source_room = cls.parse_admin_tactical_room_code(source_id)
+            source_room = cls.parse_web_map_tactical_room_code(source_id)
             final_room = data_room or source_room or normalized_room
             if final_room == normalized_room:
                 filtered[object_id] = node
@@ -1069,7 +1070,7 @@ class ServerState:
 
         return filtered
 
-    def build_admin_tab_snapshot(self, room_code: Optional[str] = None) -> dict:
+    def build_web_map_tab_snapshot(self, room_code: Optional[str] = None) -> dict:
         self.cleanup_tab_reports()
         normalized_room = self.normalize_room_code(room_code)
         room_sources = self.get_active_sources_in_room(normalized_room)
@@ -1090,6 +1091,29 @@ class ServerState:
             "reports": reports,
             "groups": grouping.get("groups", []),
         }
+
+    # Transitional aliases kept during the 0.6.0 refactor to avoid a flag day
+    # across every call site while the route and naming migration lands.
+    def set_admin_room(self, admin_id: str, room_code) -> str:
+        return self.set_web_map_room(admin_id, room_code)
+
+    def get_admin_room(self, admin_id: str) -> str:
+        return self.get_web_map_room(admin_id)
+
+    @classmethod
+    def build_admin_tactical_source_id(cls, room_code: str) -> str:
+        return cls.build_web_map_tactical_source_id(room_code)
+
+    @classmethod
+    def is_admin_tactical_source_id(cls, source_id: Optional[str]) -> bool:
+        return cls.is_web_map_tactical_source_id(source_id)
+
+    @classmethod
+    def parse_admin_tactical_room_code(cls, source_id: Optional[str]) -> Optional[str]:
+        return cls.parse_web_map_tactical_room_code(source_id)
+
+    def build_admin_tab_snapshot(self, room_code: Optional[str] = None) -> dict:
+        return self.build_web_map_tab_snapshot(room_code)
 
     @staticmethod
     def normalize_mark_color(color_value: Optional[str]) -> Optional[str]:
@@ -1606,34 +1630,15 @@ class ServerState:
 
     @staticmethod
     def _normalize_protocol_version(version) -> str:
-        text = str(version or "").strip()
-        return text or "0.0.0"
+        return normalize_protocol_version(version)
 
     @classmethod
     def _parse_protocol_version(cls, version) -> tuple[int, int, int]:
-        text = cls._normalize_protocol_version(version)
-        if "." not in text:
-            try:
-                parsed_num = int(text)
-                return 0, 0, max(parsed_num, 0)
-            except ValueError:
-                return 0, 0, 0
-
-        parts = text.split(".")
-        normalized_parts = []
-        for part in parts[:3]:
-            try:
-                normalized_parts.append(max(int(part), 0))
-            except ValueError:
-                normalized_parts.append(0)
-
-        while len(normalized_parts) < 3:
-            normalized_parts.append(0)
-        return tuple(normalized_parts)
+        return parse_protocol_version(version)
 
     @classmethod
     def _protocol_at_least(cls, current, minimum) -> bool:
-        return cls._parse_protocol_version(current) >= cls._parse_protocol_version(minimum)
+        return protocol_at_least(current, minimum)
 
     def mark_player_capability(
         self,

@@ -2,11 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-import msgpack
 from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.json_format import ParseDict
 from google.protobuf.message import Message
-from pydantic import BaseModel
 
 from .proto_generated.teamviewer.v1 import teamviewer_pb2
 from .protocol import PacketDecodeError
@@ -15,7 +13,7 @@ from .protocol import PacketDecodeError
 class MessageCodec(Protocol):
     def decode(self, payload: bytes | bytearray | memoryview | str) -> dict[str, Any]: ...
 
-    def encode(self, packet: BaseModel | dict[str, Any]) -> bytes: ...
+    def encode(self, packet: dict[str, Any] | Any) -> bytes: ...
 
 
 _PAYLOAD_TO_TYPE: dict[str, str] = {
@@ -80,6 +78,11 @@ _TYPE_TO_MESSAGE: dict[str, type[Message]] = {
     "digest": teamviewer_pb2.Digest,
     "refresh_req": teamviewer_pb2.RefreshRequest,
     "report_rate_hint": teamviewer_pb2.ReportRateHint,
+}
+
+_WIRE_CHANNEL_TO_NAME: dict[int, str] = {
+    teamviewer_pb2.WIRE_CHANNEL_PLAYER: "player",
+    teamviewer_pb2.WIRE_CHANNEL_ADMIN: "admin",
 }
 
 
@@ -254,6 +257,10 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
     return data
 
 
+def _decode_wire_channel(channel_value: int) -> str | None:
+    return _WIRE_CHANNEL_TO_NAME.get(int(channel_value))
+
+
 def _scope_patch_to_proto(scope: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(scope, dict):
         return None
@@ -398,36 +405,6 @@ def _convert_outbound_body(packet_type: str, body: dict[str, Any]) -> tuple[str,
     return payload_name, channel, proto_body
 
 
-class MsgpackMessageCodec:
-    """MessagePack 编解码器：用于兼容旧版本客户端 (0.5.x 及更早)。"""
-
-    def decode(self, payload: bytes | bytearray | memoryview | str) -> dict[str, Any]:
-        raw: bytes
-        if isinstance(payload, str):
-            raw = payload.encode("utf-8")
-        elif isinstance(payload, memoryview):
-            raw = payload.tobytes()
-        else:
-            raw = bytes(payload)
-
-        try:
-            data = msgpack.unpackb(raw, raw=False)
-        except Exception as exc:
-            raise PacketDecodeError("invalid_msgpack", str(exc)) from exc
-
-        if not isinstance(data, dict):
-            raise PacketDecodeError("invalid_payload", "payload must be an object")
-
-        return data
-
-    def encode(self, packet: BaseModel | dict[str, Any]) -> bytes:
-        if isinstance(packet, BaseModel):
-            body = packet.model_dump(exclude_none=True)
-        else:
-            body = packet
-        return msgpack.packb(body, use_bin_type=True)
-
-
 class ProtobufMessageCodec:
     def decode(self, payload: bytes | bytearray | memoryview | str) -> dict[str, Any]:
         if isinstance(payload, str):
@@ -450,10 +427,14 @@ class ProtobufMessageCodec:
             raise PacketDecodeError("invalid_payload", "payload must contain a message body")
 
         payload = getattr(envelope, payload_name)
-        return _decode_payload(payload_name, payload)
+        decoded = _decode_payload(payload_name, payload)
+        wire_channel = _decode_wire_channel(envelope.channel)
+        if wire_channel:
+            decoded["_wire_channel"] = wire_channel
+        return decoded
 
-    def encode(self, packet: BaseModel | dict[str, Any]) -> bytes:
-        if isinstance(packet, BaseModel):
+    def encode(self, packet: dict[str, Any] | Any) -> bytes:
+        if hasattr(packet, "model_dump"):
             body = packet.model_dump(exclude_none=True)
         else:
             body = dict(packet)

@@ -22,10 +22,10 @@ class Broadcaster:
     def __init__(self, state: ServerState) -> None:
         self.state = state
         self._codec = ProtobufMessageCodec()
-        self._admin_last_states: dict[str, dict] = {}
+        self._web_map_last_states: dict[str, dict] = {}
         self._last_player_report_hints: dict[str, int] = {}
         self._player_sync_scopes = ("players", "entities", "waypoints", "battleChunks")
-        self._admin_sync_scopes = ("players", "entities", "waypoints", "battleChunks", "playerMarks")
+        self._web_map_sync_scopes = ("players", "entities", "waypoints", "battleChunks", "playerMarks")
 
     def _encode_message(self, packet) -> bytes:
         return self._codec.encode(packet)
@@ -64,8 +64,8 @@ class Broadcaster:
             return {}
         return {object_id: node.get("data", {}) for object_id, node in state_map.items() if isinstance(node, dict)}
 
-    def _build_admin_view_state(self, admin_room: str | None = None) -> dict:
-        normalized_room = self.state.normalize_room_code(admin_room)
+    def _build_web_map_view_state(self, web_map_room: str | None = None) -> dict:
+        normalized_room = self.state.normalize_room_code(web_map_room)
         allowed_sources = self.state.get_active_sources_in_room(normalized_room)
         room_players = self.state.filter_state_map_by_sources(self.state.players, allowed_sources)
         room_entities = self.state.filter_state_map_by_sources(self.state.entities, allowed_sources)
@@ -85,7 +85,7 @@ class Broadcaster:
             "waypoints": self._snapshot_scope_from_state_map(room_waypoints),
             "battleChunks": self._snapshot_scope_from_state_map(room_battle_chunks),
             "playerMarks": dict(self.state.player_marks),
-            "tabState": self.state.build_admin_tab_snapshot(normalized_room),
+            "tabState": self.state.build_web_map_tab_snapshot(normalized_room),
             "roomCode": normalized_room,
             "connections": sorted(allowed_sources),
             "connections_count": len(allowed_sources),
@@ -118,8 +118,8 @@ class Broadcaster:
                 return True
         return False
 
-    def _compute_admin_patch(self, old_state: dict, new_state: dict) -> dict:
-        scope_patch = self._compute_scope_patch_for_scopes(old_state, new_state, self._admin_sync_scopes)
+    def _compute_web_map_patch(self, old_state: dict, new_state: dict) -> dict:
+        scope_patch = self._compute_scope_patch_for_scopes(old_state, new_state, self._web_map_sync_scopes)
 
         meta_patch = {}
         tab_state_patch = self._compute_tab_state_patch(old_state.get("tabState"), new_state.get("tabState"))
@@ -173,16 +173,16 @@ class Broadcaster:
             for scope in scopes
         }
 
-    def _has_admin_patch_changes(self, patch: dict) -> bool:
-        return self._has_scope_patch_changes(patch, self._admin_sync_scopes) or bool(patch.get("meta"))
+    def _has_web_map_patch_changes(self, patch: dict) -> bool:
+        return self._has_scope_patch_changes(patch, self._web_map_sync_scopes) or bool(patch.get("meta"))
 
-    async def send_admin_snapshot_full(self, admin_id: str) -> None:
-        ws = self.state.admin_connections.get(admin_id)
+    async def send_web_map_snapshot_full(self, web_map_id: str) -> None:
+        ws = self.state.web_map_connections.get(web_map_id)
         if ws is None:
             return
 
-        admin_room = self.state.get_admin_room(admin_id)
-        view_state = self._build_admin_view_state(admin_room)
+        web_map_room = self.state.get_web_map_room(web_map_id)
+        view_state = self._build_web_map_view_state(web_map_room)
         message = self._build_full_message(
             view_state,
             channel="admin",
@@ -190,7 +190,7 @@ class Broadcaster:
         )
 
         await ws.send_bytes(self._encode_message(message))
-        self._admin_last_states[admin_id] = view_state
+        self._web_map_last_states[web_map_id] = view_state
 
     def _build_visible_state_for_player(self, player_id: str) -> dict:
         allowed_sources = self.state.get_allowed_sources_for_player(player_id)
@@ -249,17 +249,17 @@ class Broadcaster:
         )
         await ws.send_bytes(self._encode_message(message))
 
-    async def broadcast_admin_updates(self, force_full: bool = False) -> None:
+    async def broadcast_web_map_updates(self, force_full: bool = False) -> None:
         """向管理端广播增量（必要时全量）。"""
-        if not self.state.admin_connections:
-            self._admin_last_states = {}
+        if not self.state.web_map_connections:
+            self._web_map_last_states = {}
             return
 
         disconnected = []
-        for admin_id, ws in list(self.state.admin_connections.items()):
+        for web_map_id, ws in list(self.state.web_map_connections.items()):
             try:
-                current_state = self._build_admin_view_state(self.state.get_admin_room(admin_id))
-                previous_state = self._admin_last_states.get(admin_id)
+                current_state = self._build_web_map_view_state(self.state.get_web_map_room(web_map_id))
+                previous_state = self._web_map_last_states.get(web_map_id)
 
                 if force_full or previous_state is None:
                     message = self._build_full_message(
@@ -269,8 +269,8 @@ class Broadcaster:
                     )
                     await ws.send_bytes(self._encode_message(message))
                 else:
-                    patch_state = self._compute_admin_patch(previous_state, current_state)
-                    if self._has_admin_patch_changes(patch_state):
+                    patch_state = self._compute_web_map_patch(previous_state, current_state)
+                    if self._has_web_map_patch_changes(patch_state):
                         message = self._build_patch_message(
                             patch_state,
                             channel="admin",
@@ -278,18 +278,18 @@ class Broadcaster:
                         )
                         await ws.send_bytes(self._encode_message(message))
 
-                self._admin_last_states[admin_id] = current_state
+                self._web_map_last_states[web_map_id] = current_state
             except Exception as e:
-                logger.warning("Error sending admin update to %s: %s", admin_id, e)
-                disconnected.append(admin_id)
+                logger.warning("Error sending web-map update to %s: %s", web_map_id, e)
+                disconnected.append(web_map_id)
 
-        for admin_id in disconnected:
-            if admin_id in self.state.admin_connections:
-                del self.state.admin_connections[admin_id]
-            if admin_id in self.state.admin_connection_rooms:
-                del self.state.admin_connection_rooms[admin_id]
-            if admin_id in self._admin_last_states:
-                del self._admin_last_states[admin_id]
+        for web_map_id in disconnected:
+            if web_map_id in self.state.web_map_connections:
+                del self.state.web_map_connections[web_map_id]
+            if web_map_id in self.state.web_map_connection_rooms:
+                del self.state.web_map_connection_rooms[web_map_id]
+            if web_map_id in self._web_map_last_states:
+                del self._web_map_last_states[web_map_id]
 
     async def broadcast_updates(self, force_full_to_delta: bool = False) -> None:
         """统一广播入口：清理超时、计算 patch、按能力下发。"""
@@ -362,7 +362,7 @@ class Broadcaster:
         for player_id in disconnected:
             self.state.remove_connection(player_id)
 
-        await self.broadcast_admin_updates()
+        await self.broadcast_web_map_updates()
 
     async def request_preexpiry_refreshes(self) -> None:
         """在对象即将超时前，向对应来源客户端请求该范围内的全量确认。"""
@@ -470,3 +470,9 @@ class Broadcaster:
                     e,
                 )
                 self.state.remove_connection(player_id)
+
+    async def send_admin_snapshot_full(self, admin_id: str) -> None:
+        await self.send_web_map_snapshot_full(admin_id)
+
+    async def broadcast_admin_updates(self, force_full: bool = False) -> None:
+        await self.broadcast_web_map_updates(force_full)
