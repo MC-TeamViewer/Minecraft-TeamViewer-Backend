@@ -1,0 +1,537 @@
+syntax = "proto3";
+
+package teamviewer.v1;
+
+option java_multiple_files = true;
+option java_package = "fun.prof_chen.teamviewer.main_code.network.proto";
+option java_outer_classname = "TeamviewerProto";
+
+message StringList {
+  repeated string values = 1;
+}
+
+message SameServerGroup {
+  string group_id = 1;
+  repeated string members = 2;
+}
+
+message SameServerGroupList {
+  repeated SameServerGroup values = 1;
+}
+
+message TabPlayerEntry {
+  optional string uuid = 1;
+  optional string name = 2;
+  optional string display_name = 3;
+  optional string prefixed_name = 4;
+}
+
+message TabPlayerReport {
+  optional double timestamp = 1;
+  repeated TabPlayerEntry players = 2;
+}
+
+message AdminTabState {
+  bool enabled = 1;
+  string room_code = 2;
+  map<string, TabPlayerReport> reports = 3;
+  repeated SameServerGroup groups = 4;
+}
+
+message TabStatePatch {
+  optional bool enabled = 1;
+  optional string room_code = 2;
+  optional SameServerGroupList groups = 3;
+  map<string, TabPlayerReport> upsert_reports = 4;
+  repeated string delete_reports = 5;
+}
+
+message PlayerMark {
+  string team = 1;
+  optional string color = 2;
+  optional string label = 3;
+  optional string source = 4;
+}
+
+message PlayerData {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  optional double vx = 4;
+  optional double vy = 5;
+  optional double vz = 6;
+  string dimension = 7;
+  optional string player_name = 8;
+  optional string player_uuid = 9;
+  optional double health = 10;
+  optional double max_health = 11;
+  optional double armor = 12;
+  optional bool is_riding = 13;
+  optional double width = 14;
+  optional double height = 15;
+}
+
+message PlayerDelta {
+  optional double x = 1;
+  optional double y = 2;
+  optional double z = 3;
+  optional double vx = 4;
+  optional double vy = 5;
+  optional double vz = 6;
+  optional string dimension = 7;
+  optional string player_name = 8;
+  optional string player_uuid = 9;
+  optional double health = 10;
+  optional double max_health = 11;
+  optional double armor = 12;
+  optional bool is_riding = 13;
+  optional double width = 14;
+  optional double height = 15;
+}
+
+message EntityData {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  optional double vx = 4;
+  optional double vy = 5;
+  optional double vz = 6;
+  string dimension = 7;
+  optional string entity_type = 8;
+  optional string entity_name = 9;
+  optional double width = 10;
+  optional double height = 11;
+}
+
+message EntityDelta {
+  optional double x = 1;
+  optional double y = 2;
+  optional double z = 3;
+  optional double vx = 4;
+  optional double vy = 5;
+  optional double vz = 6;
+  optional string dimension = 7;
+  optional string entity_type = 8;
+  optional string entity_name = 9;
+  optional double width = 10;
+  optional double height = 11;
+}
+
+message WaypointData {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  string dimension = 4;
+  string name = 5;
+  optional string symbol = 6;
+  optional int32 color = 7;
+  optional string owner_id = 8;
+  optional string owner_name = 9;
+  optional int64 created_at = 10;
+  optional int32 ttl_seconds = 11;
+  optional string waypoint_kind = 12;
+  optional bool replace_old_quick = 13;
+  optional int32 max_quick_marks = 14;
+  optional string target_type = 15;
+  optional string target_entity_id = 16;
+  optional string target_entity_type = 17;
+  optional string target_entity_name = 18;
+  optional string room_code = 19;
+  optional bool permanent = 20;
+  optional string tactical_type = 21;
+  optional string source_type = 22;
+  optional string deletable_by = 23;
+}
+
+message WaypointDelta {
+  optional double x = 1;
+  optional double y = 2;
+  optional double z = 3;
+  optional string dimension = 4;
+  optional string name = 5;
+  optional string symbol = 6;
+  optional int32 color = 7;
+  optional string owner_id = 8;
+  optional string owner_name = 9;
+  optional int64 created_at = 10;
+  optional int32 ttl_seconds = 11;
+  optional string waypoint_kind = 12;
+  optional bool replace_old_quick = 13;
+  optional int32 max_quick_marks = 14;
+  optional string target_type = 15;
+  optional string target_entity_id = 16;
+  optional string target_entity_type = 17;
+  optional string target_entity_name = 18;
+  optional string room_code = 19;
+  optional bool permanent = 20;
+  optional string tactical_type = 21;
+  optional string source_type = 22;
+  optional string deletable_by = 23;
+}
+
+message BattleChunkData {
+  int32 chunk_x = 1;
+  int32 chunk_z = 2;
+  string dimension = 3;
+  optional string symbol = 4;
+  optional string marker_type = 5;
+  string color_raw = 6;
+  optional string color_note = 7;
+  optional int64 observed_at = 8;
+  optional int64 position_sampled_at = 9;
+  optional string alignment_source = 10;
+  optional string reporter_id = 11;
+  optional string room_code = 12;
+}
+
+message BattleChunkDelta {
+  optional int32 chunk_x = 1;
+  optional int32 chunk_z = 2;
+  optional string dimension = 3;
+  optional string symbol = 4;
+  optional string marker_type = 5;
+  optional string color_raw = 6;
+  optional string color_note = 7;
+  optional int64 observed_at = 8;
+  optional int64 position_sampled_at = 9;
+  optional string alignment_source = 10;
+  optional string reporter_id = 11;
+  optional string room_code = 12;
+}
+
+message BattleMapObservationCandidate {
+  int32 base_chunk_x = 1;
+  int32 base_chunk_z = 2;
+  int64 position_sampled_at = 3;
+  string source = 4;
+}
+
+message BattleMapObservationCell {
+  int32 rel_chunk_x = 1;
+  int32 rel_chunk_z = 2;
+  optional string symbol = 3;
+  string color_raw = 4;
+}
+
+message HandshakeRequest {
+  string network_protocol_version = 1;
+  string minimum_compatible_network_protocol_version = 2;
+  string local_program_version = 3;
+  optional string program_version = 4;
+  optional string room_code = 5;
+  optional string room_id = 6;
+  optional string submit_player_id = 7;
+  optional int32 preferred_report_interval_ticks = 8;
+  optional int32 min_report_interval_ticks = 9;
+  optional int32 max_report_interval_ticks = 10;
+}
+
+message Ping {
+}
+
+message ResyncRequest {
+  optional string reason = 1;
+  optional string submit_player_id = 2;
+}
+
+message CommandPlayerMarkSet {
+  string player_id = 1;
+  string team = 2;
+  optional string color = 3;
+  optional string label = 4;
+  optional string source = 5;
+}
+
+message CommandPlayerMarkClear {
+  string player_id = 1;
+}
+
+message CommandPlayerMarkClearAll {
+}
+
+message CommandSameServerFilterSet {
+  bool enabled = 1;
+}
+
+message CommandTacticalWaypointSet {
+  optional string waypoint_id = 1;
+  optional double x = 2;
+  optional double z = 3;
+  optional string label = 4;
+  optional string dimension = 5;
+  optional string tactical_type = 6;
+  optional bool permanent = 7;
+  optional int32 ttl_seconds = 8;
+  optional string color = 9;
+  optional string room_code = 10;
+  optional string room_id = 11;
+}
+
+message PlayersUpdate {
+  optional string submit_player_id = 1;
+  map<string, PlayerData> players = 2;
+}
+
+message TabPlayersUpdate {
+  optional string submit_player_id = 1;
+  repeated TabPlayerEntry tab_players = 2;
+}
+
+message TabPlayerUpsert {
+  string key = 1;
+  TabPlayerEntry data = 2;
+}
+
+message TabPlayersPatch {
+  optional string submit_player_id = 1;
+  repeated TabPlayerUpsert upsert = 2;
+  repeated string delete = 3;
+}
+
+message PlayerUpsert {
+  string id = 1;
+  PlayerDelta data = 2;
+}
+
+message PlayersPatch {
+  optional string submit_player_id = 1;
+  repeated PlayerUpsert upsert = 2;
+  repeated string delete = 3;
+}
+
+message EntitiesUpdate {
+  optional string submit_player_id = 1;
+  map<string, EntityData> entities = 2;
+}
+
+message EntityUpsert {
+  string id = 1;
+  EntityDelta data = 2;
+}
+
+message EntitiesPatch {
+  optional string submit_player_id = 1;
+  repeated EntityUpsert upsert = 2;
+  repeated string delete = 3;
+}
+
+message StateKeepalive {
+  optional string submit_player_id = 1;
+  repeated string players = 2;
+  repeated string entities = 3;
+}
+
+message SourceStateClear {
+  optional string submit_player_id = 1;
+  repeated string scopes = 2;
+}
+
+message WaypointsUpdate {
+  optional string submit_player_id = 1;
+  map<string, WaypointData> waypoints = 2;
+}
+
+message WaypointUpsert {
+  string id = 1;
+  WaypointDelta data = 2;
+}
+
+message WaypointsPatchScope {
+  repeated WaypointUpsert upsert = 1;
+  repeated string delete = 2;
+}
+
+message WaypointsDelete {
+  optional string submit_player_id = 1;
+  repeated string waypoint_ids = 2;
+}
+
+message WaypointsEntityDeathCancel {
+  optional string submit_player_id = 1;
+  repeated string target_entity_ids = 2;
+}
+
+message BattleMapObservation {
+  optional string submit_player_id = 1;
+  string dimension = 2;
+  int32 map_size = 3;
+  int32 anchor_row = 4;
+  int32 anchor_col = 5;
+  int64 snapshot_observed_at = 6;
+  int64 parsed_at = 7;
+  repeated BattleMapObservationCandidate candidates = 8;
+  repeated BattleMapObservationCell cells = 9;
+}
+
+message HandshakeAck {
+  bool ready = 1;
+  string network_protocol_version = 2;
+  string minimum_compatible_network_protocol_version = 3;
+  string local_program_version = 4;
+  string room_code = 5;
+  bool delta_enabled = 6;
+  optional string error = 7;
+  optional string reject_reason = 8;
+  optional int32 digest_interval_sec = 9;
+  optional double broadcast_hz = 10;
+  optional int32 report_interval_ticks = 11;
+  optional int32 player_timeout_sec = 12;
+  optional int32 entity_timeout_sec = 13;
+  optional int32 battle_chunk_timeout_sec = 14;
+}
+
+message PlayerMarkAckDetail {
+  string player_id = 1;
+  optional PlayerMark mark = 2;
+}
+
+message ClearAllPlayerMarksAckDetail {
+  int32 removed_count = 1;
+}
+
+message SameServerFilterAckDetail {
+  bool enabled = 1;
+}
+
+message TacticalWaypointAckDetail {
+  string waypoint_id = 1;
+  WaypointData waypoint = 2;
+}
+
+message WaypointsDeleteAckDetail {
+  repeated string waypoint_ids = 1;
+}
+
+message AdminAck {
+  bool ok = 1;
+  optional string action = 2;
+  optional string error = 3;
+  optional string command = 4;
+  oneof detail {
+    PlayerMarkAckDetail player_mark = 10;
+    ClearAllPlayerMarksAckDetail clear_all_player_marks = 11;
+    SameServerFilterAckDetail same_server_filter = 12;
+    TacticalWaypointAckDetail tactical_waypoint = 13;
+    WaypointsDeleteAckDetail waypoints_delete = 14;
+  }
+}
+
+message Pong {
+  double server_time = 1;
+}
+
+message SnapshotFull {
+  map<string, PlayerData> players = 1;
+  map<string, EntityData> entities = 2;
+  map<string, WaypointData> waypoints = 3;
+  map<string, BattleChunkData> battle_chunks = 4;
+  map<string, PlayerMark> player_marks = 5;
+  optional AdminTabState tab_state = 6;
+  optional string room_code = 7;
+  repeated string connections = 8;
+  optional int32 connections_count = 9;
+  optional double server_time = 10;
+}
+
+message PlayerPatchScope {
+  repeated PlayerUpsert upsert = 1;
+  repeated string delete = 2;
+}
+
+message EntityPatchScope {
+  repeated EntityUpsert upsert = 1;
+  repeated string delete = 2;
+}
+
+message BattleChunkUpsert {
+  string id = 1;
+  BattleChunkDelta data = 2;
+}
+
+message BattleChunkPatchScope {
+  repeated BattleChunkUpsert upsert = 1;
+  repeated string delete = 2;
+}
+
+message PlayerMarkUpsert {
+  string id = 1;
+  PlayerMark data = 2;
+}
+
+message PlayerMarkPatchScope {
+  repeated PlayerMarkUpsert upsert = 1;
+  repeated string delete = 2;
+}
+
+message Patch {
+  optional PlayerPatchScope players = 1;
+  optional EntityPatchScope entities = 2;
+  optional WaypointsPatchScope waypoints = 3;
+  optional BattleChunkPatchScope battle_chunks = 4;
+  optional PlayerMarkPatchScope player_marks = 5;
+  optional TabStatePatch tab_state_patch = 6;
+  optional StringList connections = 7;
+  optional int32 connections_count = 8;
+  optional double server_time = 9;
+}
+
+message Digest {
+  string players = 1;
+  string entities = 2;
+  string waypoints = 3;
+  optional string battle_chunks = 4;
+}
+
+message RefreshRequest {
+  string reason = 1;
+  double server_time = 2;
+  repeated string players = 3;
+  repeated string entities = 4;
+  repeated string battle_chunks = 5;
+}
+
+message ReportRateHint {
+  int32 report_interval_ticks = 1;
+  double broadcast_hz = 2;
+  optional string reason = 3;
+}
+
+enum WireChannel {
+  WIRE_CHANNEL_UNSPECIFIED = 0;
+  WIRE_CHANNEL_PLAYER = 1;
+  WIRE_CHANNEL_ADMIN = 2;
+}
+
+message WireEnvelope {
+  WireChannel channel = 1;
+  oneof payload {
+    HandshakeRequest handshake_request = 10;
+    Ping ping = 11;
+    ResyncRequest resync_request = 12;
+    CommandPlayerMarkSet command_player_mark_set = 13;
+    CommandPlayerMarkClear command_player_mark_clear = 14;
+    CommandPlayerMarkClearAll command_player_mark_clear_all = 15;
+    CommandSameServerFilterSet command_same_server_filter_set = 16;
+    CommandTacticalWaypointSet command_tactical_waypoint_set = 17;
+    PlayersUpdate players_update = 18;
+    TabPlayersUpdate tab_players_update = 19;
+    TabPlayersPatch tab_players_patch = 20;
+    PlayersPatch players_patch = 21;
+    EntitiesUpdate entities_update = 22;
+    EntitiesPatch entities_patch = 23;
+    StateKeepalive state_keepalive = 24;
+    SourceStateClear source_state_clear = 25;
+    WaypointsUpdate waypoints_update = 26;
+    WaypointsDelete waypoints_delete = 27;
+    WaypointsEntityDeathCancel waypoints_entity_death_cancel = 28;
+    BattleMapObservation battle_map_observation = 29;
+    HandshakeAck handshake_ack = 30;
+    AdminAck admin_ack = 31;
+    Pong pong = 32;
+    SnapshotFull snapshot_full = 33;
+    Patch patch = 34;
+    Digest digest = 35;
+    RefreshRequest refresh_request = 36;
+    ReportRateHint report_rate_hint = 37;
+  }
+}

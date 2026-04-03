@@ -1,7 +1,7 @@
 import logging
 import time
 
-from .codec import MsgpackMessageCodec
+from .codec import ProtobufMessageCodec
 from .protocol import DigestPacket, PatchPacket, RefreshRequestOutboundPacket, ReportRateHintPacket, SnapshotFullPacket
 from .state import ServerState
 
@@ -21,7 +21,7 @@ class Broadcaster:
 
     def __init__(self, state: ServerState) -> None:
         self.state = state
-        self._codec = MsgpackMessageCodec()
+        self._codec = ProtobufMessageCodec()
         self._admin_last_states: dict[str, dict] = {}
         self._last_player_report_hints: dict[str, int] = {}
         self._player_sync_scopes = ("players", "entities", "waypoints", "battleChunks")

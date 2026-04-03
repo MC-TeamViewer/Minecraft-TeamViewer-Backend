@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from server.broadcaster import Broadcaster
-from server.codec import MsgpackMessageCodec
+from server.codec import ProtobufMessageCodec
 from server.models import BattleChunkData, EntityData, PlayerData, WaypointData
 from server.protocol import (
     AdminAckPacket,
@@ -34,8 +34,8 @@ from server.state import ServerState
 
 
 
-NETWORK_PROTOCOL_VERSION = "0.5.1" # 服务器使用的协议版本
-SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.5.0" # 服务器兼容的最低协议版本
+NETWORK_PROTOCOL_VERSION = "0.6.0" # 服务器使用的协议版本
+SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.6.0" # 服务器兼容的最低协议版本
 SERVER_PROGRAM_VERSION = "team-view-relay-server-dev"
 
 
@@ -54,10 +54,17 @@ def configure_logging() -> None:
 configure_logging()
 logger = logging.getLogger("teamviewrelay.main")
 
-message_codec = MsgpackMessageCodec()
+message_codec = ProtobufMessageCodec()
 
-
-async def send_packet(websocket: WebSocket, packet) -> None:
+async def send_packet(websocket: WebSocket, packet, *, channel: str | None = None) -> None:
+    if channel:
+        if isinstance(packet, dict):
+            body = dict(packet)
+        else:
+            body = packet.model_dump(exclude_none=True)
+        body["channel"] = channel
+        await websocket.send_bytes(message_codec.encode(body))
+        return
     await websocket.send_bytes(message_codec.encode(packet))
 
 
@@ -97,6 +104,8 @@ async def reject_handshake(
     websocket: WebSocket,
     reason: str,
     room_code: str,
+    *,
+    channel: str = "player",
 ) -> None:
     await send_packet(
         websocket,
@@ -114,6 +123,7 @@ async def reject_handshake(
             entityTimeoutSec=state.ENTITY_TIMEOUT,
             battleChunkTimeoutSec=state.BATTLE_CHUNK_TIMEOUT,
         ),
+        channel=channel,
     )
     close_reason = reason if len(reason) <= 120 else reason[:120]
     await websocket.close(code=1008, reason=close_reason)
@@ -225,7 +235,7 @@ async def admin_ws(websocket: WebSocket):
                         admin_room,
                         rejection_reason,
                     )
-                    await reject_handshake(websocket, rejection_reason, admin_room)
+                    await reject_handshake(websocket, rejection_reason, admin_room, channel="admin")
                     return
 
                 logger.info(
@@ -249,6 +259,7 @@ async def admin_ws(websocket: WebSocket):
                         entityTimeoutSec=state.ENTITY_TIMEOUT,
                         battleChunkTimeoutSec=state.BATTLE_CHUNK_TIMEOUT,
                     ),
+                    channel="admin",
                 )
                 await broadcaster.send_admin_snapshot_full(admin_id)
                 continue
@@ -258,7 +269,7 @@ async def admin_ws(websocket: WebSocket):
                 continue
 
             if isinstance(packet, PingPacket):
-                await send_packet(websocket, PongPacket(serverTime=time.time()))
+                await send_packet(websocket, PongPacket(serverTime=time.time()), channel="admin")
                 continue
 
             if isinstance(packet, ResyncRequestPacket):
@@ -501,6 +512,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         websocket,
                         rejection_reason,
                         HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE),
+                        channel="player",
                     )
                     return
 

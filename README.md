@@ -45,7 +45,9 @@ uv run main.py
 
 当前服务端协议常量位于 `src/main.py`：
 
-- `NETWORK_PROTOCOL_VERSION = 0.5.1`
-- `SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = 0.5.0`
+- `NETWORK_PROTOCOL_VERSION = 0.6.0`
+- `SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = 0.6.0`
+
+共享 ProtoBuf 协议源位于 `proto/teamviewer/v1/teamviewer.proto`，服务端运行时代码使用提交到仓库中的 Python 生成产物。
 
 详细字段与报文结构见仓库根目录文档：`docs/PLAYER_ESP_NETWORK_PROTOCOL.md`
