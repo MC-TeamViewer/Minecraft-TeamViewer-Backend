@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+import msgpack
 from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.json_format import ParseDict
 from google.protobuf.message import Message
@@ -395,6 +396,36 @@ def _convert_outbound_body(packet_type: str, body: dict[str, Any]) -> tuple[str,
         if key not in {"type", "channel"}
     }
     return payload_name, channel, proto_body
+
+
+class MsgpackMessageCodec:
+    """MessagePack 编解码器：用于兼容旧版本客户端 (0.5.x 及更早)。"""
+
+    def decode(self, payload: bytes | bytearray | memoryview | str) -> dict[str, Any]:
+        raw: bytes
+        if isinstance(payload, str):
+            raw = payload.encode("utf-8")
+        elif isinstance(payload, memoryview):
+            raw = payload.tobytes()
+        else:
+            raw = bytes(payload)
+
+        try:
+            data = msgpack.unpackb(raw, raw=False)
+        except Exception as exc:
+            raise PacketDecodeError("invalid_msgpack", str(exc)) from exc
+
+        if not isinstance(data, dict):
+            raise PacketDecodeError("invalid_payload", "payload must be an object")
+
+        return data
+
+    def encode(self, packet: BaseModel | dict[str, Any]) -> bytes:
+        if isinstance(packet, BaseModel):
+            body = packet.model_dump(exclude_none=True)
+        else:
+            body = packet
+        return msgpack.packb(body, use_bin_type=True)
 
 
 class ProtobufMessageCodec:

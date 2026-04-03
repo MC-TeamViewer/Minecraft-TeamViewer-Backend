@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from server.broadcaster import Broadcaster
-from server.codec import ProtobufMessageCodec
+from server.codec import ProtobufMessageCodec, MsgpackMessageCodec
 from server.models import BattleChunkData, EntityData, PlayerData, WaypointData
 from server.protocol import (
     AdminAckPacket,
@@ -55,6 +55,7 @@ configure_logging()
 logger = logging.getLogger("teamviewrelay.main")
 
 message_codec = ProtobufMessageCodec()
+msgpack_codec = MsgpackMessageCodec()  # 用于兼容旧版本客户端
 
 async def send_packet(websocket: WebSocket, packet, *, channel: str | None = None) -> None:
     if channel:
@@ -68,6 +69,12 @@ async def send_packet(websocket: WebSocket, packet, *, channel: str | None = Non
     await websocket.send_bytes(message_codec.encode(packet))
 
 
+async def send_msgpack_response(websocket: WebSocket, response_data: dict) -> None:
+    """使用 MessagePack 发送响应（用于兼容旧版本客户端）"""
+    packed = msgpack_codec.encode(response_data)
+    await websocket.send_bytes(packed)
+
+
 async def receive_payload(websocket: WebSocket) -> dict:
     message = await websocket.receive()
     if message.get("type") == "websocket.disconnect":
@@ -78,7 +85,41 @@ async def receive_payload(websocket: WebSocket) -> dict:
         payload = message.get("text")
     if payload is None:
         raise PacketDecodeError("invalid_payload", "payload must be bytes")
-    return message_codec.decode(payload)
+    
+    # 首先尝试使用 Protobuf 解析
+    try:
+        return message_codec.decode(payload)
+    except PacketDecodeError as proto_error:
+        # Protobuf 解析失败，尝试使用 MessagePack 解析 (兼容旧版本)
+        try:
+            msgpack_data = msgpack_codec.decode(payload)
+            # 检查是否是握手包，如果是则直接拒绝
+            if msgpack_data.get("type") == "handshake":
+                logger.warning(
+                    "Detected legacy MessagePack handshake (clientProtocol=%s, programVersion=%s). "
+                    "This server version only supports Protobuf protocol (0.6.0+). "
+                    "Please upgrade your client."
+                    "现在的网络协议以更新到0.6.0+版本，原有交互协议MessagePack已弃用，换为ProtoBuf，0.6.0以下版本不再支持。",
+                    msgpack_data.get("networkProtocolVersion", "unknown"),
+                    msgpack_data.get("localProgramVersion", "unknown"),
+                )
+                # 返回一个特殊标记，让上层知道这是旧版本客户端
+                msgpack_data["_legacy_msgpack"] = True
+                return msgpack_data
+            
+            # 非握手包也拒绝解析
+            logger.warning(
+                "Received legacy MessagePack packet (type=%s). "
+                "This server version only supports Protobuf protocol (0.6.0+). "
+                "Please upgrade your client.",
+                msgpack_data.get("type", "unknown"),
+            )
+            msgpack_data["_legacy_msgpack"] = True
+            return msgpack_data
+            
+        except PacketDecodeError:
+            # 两种格式都解析失败，抛出错误
+            raise proto_error
 
 
 def resolve_handshake_rejection_reason(packet: HandshakePacket) -> str | None:
@@ -106,25 +147,29 @@ async def reject_handshake(
     room_code: str,
     *,
     channel: str = "player",
+    use_msgpack: bool = False,  # 是否使用 MessagePack 格式返回（兼容旧版本）
 ) -> None:
-    await send_packet(
-        websocket,
-        HandshakeAckPacket(
-            ready=False,
-            networkProtocolVersion=NETWORK_PROTOCOL_VERSION,
-            minimumCompatibleNetworkProtocolVersion=SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION,
-            localProgramVersion=SERVER_PROGRAM_VERSION,
-            roomCode=room_code,
-            deltaEnabled=True,
-            error="version_incompatible",
-            rejectReason=reason,
-            broadcastHz=state.broadcast_hz,
-            playerTimeoutSec=state.PLAYER_TIMEOUT,
-            entityTimeoutSec=state.ENTITY_TIMEOUT,
-            battleChunkTimeoutSec=state.BATTLE_CHUNK_TIMEOUT,
-        ),
-        channel=channel,
+    ack_packet = HandshakeAckPacket(
+        ready=False,
+        networkProtocolVersion=NETWORK_PROTOCOL_VERSION,
+        minimumCompatibleNetworkProtocolVersion=SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION,
+        localProgramVersion=SERVER_PROGRAM_VERSION,
+        roomCode=room_code,
+        deltaEnabled=True,
+        error="version_incompatible",
+        rejectReason=reason,
+        broadcastHz=state.broadcast_hz,
+        playerTimeoutSec=state.PLAYER_TIMEOUT,
+        entityTimeoutSec=state.ENTITY_TIMEOUT,
+        battleChunkTimeoutSec=state.BATTLE_CHUNK_TIMEOUT,
     )
+    
+    if use_msgpack:
+        # 对于旧版本客户端，使用 MessagePack 格式返回
+        await send_msgpack_response(websocket, ack_packet.model_dump(exclude_none=True))
+    else:
+        await send_packet(websocket, ack_packet, channel=channel)
+    
     close_reason = reason if len(reason) <= 120 else reason[:120]
     await websocket.close(code=1008, reason=close_reason)
 
@@ -224,6 +269,25 @@ async def admin_ws(websocket: WebSocket):
                 continue
 
             if isinstance(packet, HandshakePacket):
+                # 检查是否是旧版本 MessagePack 客户端
+                if payload.get("_legacy_msgpack"):
+                    legacy_room = state.set_admin_room(admin_id, HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE))
+                    legacy_reason = (
+                        "unsupported_protocol_version: "
+                        "This server requires Protobuf protocol (0.6.0+). "
+                        "MessagePack protocol (0.5.x and earlier) is no longer supported. "
+                        "Please upgrade to the latest client version."
+                        "现在的网络协议已更新到0.6.0+版本，原有交互协议MessagePack已弃用，换为ProtoBuf，0.6.0以下版本不再支持。"
+                    )
+                    logger.warning(
+                        "Rejecting legacy MessagePack admin client (clientProtocol=%s, roomCode=%s)",
+                        HandshakeHelpers.protocol_version(packet),
+                        legacy_room,
+                    )
+                    # 使用 MessagePack 格式返回拒绝响应，确保客户端能解析
+                    await reject_handshake(websocket, legacy_reason, legacy_room, channel="admin", use_msgpack=True)
+                    return
+                
                 client_protocol = HandshakeHelpers.protocol_version(packet)
                 client_program_version = HandshakeHelpers.program_version(packet)
                 admin_room = state.set_admin_room(admin_id, HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE))
@@ -510,6 +574,31 @@ async def websocket_endpoint(websocket: WebSocket):
             if isinstance(packet_submit_id, str) and packet_submit_id:
                 submit_player_id = packet_submit_id
 
+            # 检查是否是旧版本 MessagePack 客户端
+            if payload.get("_legacy_msgpack"):
+                # 对于旧版本客户端，直接拒绝握手并提示升级
+                legacy_room = HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE)
+                legacy_reason = (
+                    "unsupported_protocol_version: "
+                    "This server requires Protobuf protocol (0.6.0+). "
+                    "MessagePack protocol (0.5.x and earlier) is no longer supported. "
+                    "Please upgrade to the latest client version."
+                )
+                logger.warning(
+                    "Rejecting legacy MessagePack client (submitPlayerId=%s, roomCode=%s)",
+                    submit_player_id,
+                    legacy_room,
+                )
+                # 使用 MessagePack 格式返回拒绝响应，确保客户端能解析
+                await reject_handshake(
+                    websocket,
+                    legacy_reason,
+                    legacy_room,
+                    channel="player",
+                    use_msgpack=True,
+                )
+                return
+            
             # 握手：建立能力协商（协议版本、是否支持 delta）。
             if isinstance(packet, HandshakePacket):
                 rejection_reason = resolve_handshake_rejection_reason(packet)
