@@ -101,7 +101,41 @@ def _message_to_value(value: Any) -> Any:
     return value
 
 
+def _battle_map_observation_to_plain_dict(message: Message) -> dict[str, Any]:
+    return {
+        "submitPlayerId": message.submit_player_id,
+        "dimension": message.dimension,
+        "mapSize": message.map_size,
+        "anchorRow": message.anchor_row,
+        "anchorCol": message.anchor_col,
+        "snapshotObservedAt": message.snapshot_observed_at,
+        "parsedAt": message.parsed_at,
+        "candidates": [
+            {
+                "baseChunkX": candidate.base_chunk_x,
+                "baseChunkZ": candidate.base_chunk_z,
+                "positionSampledAt": candidate.position_sampled_at,
+                "source": candidate.source,
+            }
+            for candidate in message.candidates
+        ],
+        "cells": [
+            {
+                "relChunkX": cell.rel_chunk_x,
+                "relChunkZ": cell.rel_chunk_z,
+                "symbol": cell.symbol if hasattr(cell, "symbol") else None,
+                "colorRaw": cell.color_raw,
+            }
+            for cell in message.cells
+        ],
+    }
+
+
 def _message_to_plain_dict(message: Message) -> dict[str, Any]:
+    message_name = getattr(getattr(message, "DESCRIPTOR", None), "name", "")
+    if message_name == "BattleMapObservation":
+        return _battle_map_observation_to_plain_dict(message)
+
     output: dict[str, Any] = {}
     for field, value in message.ListFields():
         key = field.json_name

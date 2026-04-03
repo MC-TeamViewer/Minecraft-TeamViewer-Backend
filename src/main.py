@@ -488,11 +488,22 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
+            payload = None
             try:
                 payload = await receive_payload(websocket)
                 packet = PacketParsers.parse_player(payload)
             except PacketDecodeError as e:
-                logger.debug("Error decoding player packet: %s", e)
+                payload_type = None
+                if isinstance(payload, dict):
+                    raw_type = payload.get("type")
+                    if isinstance(raw_type, str) and raw_type.strip():
+                        payload_type = raw_type.strip()
+
+                logger.warning(
+                    "Error decoding player packet type=%s detail=%s",
+                    payload_type or "unknown",
+                    e.detail,
+                )
                 continue
 
             packet_submit_id = getattr(packet, "submitPlayerId", None)
@@ -821,10 +832,19 @@ async def websocket_endpoint(websocket: WebSocket):
                     current_time=current_time,
                 )
                 if not result.get("accepted"):
-                    logger.debug(
+                    logger.warning(
                         "Ignored battle_map_observation submitPlayerId=%s reason=%s",
                         submit_player_id,
                         result.get("reason"),
+                    )
+                    
+                else:
+                    logger.debug(
+                        "Accepted battle_map_observation submitPlayerId=%s reason=%s upserted=%s currentTime=%s",
+                        submit_player_id,
+                        result.get("reason"),
+                        result.get("upserted"),
+                        current_time,
                     )
 
                 continue
