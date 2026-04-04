@@ -1,21 +1,50 @@
-name: Build and Push Docker Image
+name: Team View Relay Backend Docker CI
 
 on:
   push:
     branches:
       - main
+      - dev
     tags:
       - 'v*'
   pull_request:
     branches:
       - main
+      - dev
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Buf
+        uses: bufbuild/buf-setup-action@v1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Generate protobuf bindings
+        run: ./scripts/generate_proto_python.sh
+
+      - name: Install dependencies
+        run: uv sync --extra dev --extra test
+
+      - name: Run tests
+        run: UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -24,6 +53,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Buf
+        uses: bufbuild/buf-setup-action@v1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Generate protobuf bindings
+        run: ./scripts/generate_proto_python.sh
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

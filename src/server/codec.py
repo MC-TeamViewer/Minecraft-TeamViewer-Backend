@@ -15,49 +15,36 @@ class MessageCodec(Protocol):
     def encode(self, packet: dict[str, Any] | Any) -> bytes: ...
 
 
-_PAYLOAD_TO_TYPE: dict[str, str] = {
-    "player_handshake_request": "handshake",
-    "web_map_handshake_request": "handshake",
-    "admin_handshake_request": "handshake",
-    "ping": "ping",
-    "resync_request": "resync_req",
-    "handshake_ack": "handshake_ack",
-    "web_map_ack": "web_map_ack",
-    "pong": "pong",
-    "snapshot_full": "snapshot_full",
-    "patch": "patch",
-    "digest": "digest",
-    "refresh_request": "refresh_req",
-    "report_rate_hint": "report_rate_hint",
+_WIRE_PAYLOADS: dict[str, tuple[str, type[Message]]] = {
+    "player_handshake_request": ("handshake", teamviewer_pb2.PlayerHandshakeRequest),
+    "web_map_handshake_request": ("handshake", teamviewer_pb2.WebMapHandshakeRequest),
+    "admin_handshake_request": ("handshake", teamviewer_pb2.AdminHandshakeRequest),
+    "ping": ("ping", teamviewer_pb2.Ping),
+    "resync_request": ("resync_req", teamviewer_pb2.ResyncRequest),
+    "handshake_ack": ("handshake_ack", teamviewer_pb2.HandshakeAck),
+    "web_map_ack": ("web_map_ack", teamviewer_pb2.WebMapAck),
+    "pong": ("pong", teamviewer_pb2.Pong),
+    "snapshot_full": ("snapshot_full", teamviewer_pb2.SnapshotFull),
+    "patch": ("patch", teamviewer_pb2.Patch),
+    "digest": ("digest", teamviewer_pb2.Digest),
+    "refresh_request": ("refresh_req", teamviewer_pb2.RefreshRequest),
+    "report_rate_hint": ("report_rate_hint", teamviewer_pb2.ReportRateHint),
 }
 
-_TYPE_TO_PAYLOAD: dict[str, str] = {
-    "ping": "ping",
-    "resync_req": "resync_request",
-    "handshake_ack": "handshake_ack",
-    "web_map_ack": "web_map_ack",
-    "pong": "pong",
-    "snapshot_full": "snapshot_full",
-    "patch": "patch",
-    "digest": "digest",
-    "refresh_req": "refresh_request",
-    "report_rate_hint": "report_rate_hint",
+_PAYLOAD_TO_TYPE: dict[str, str] = {
+    payload_name: packet_type
+    for payload_name, (packet_type, _) in _WIRE_PAYLOADS.items()
 }
 
 _PAYLOAD_TO_MESSAGE: dict[str, type[Message]] = {
-    "player_handshake_request": teamviewer_pb2.PlayerHandshakeRequest,
-    "web_map_handshake_request": teamviewer_pb2.WebMapHandshakeRequest,
-    "admin_handshake_request": teamviewer_pb2.AdminHandshakeRequest,
-    "ping": teamviewer_pb2.Ping,
-    "resync_request": teamviewer_pb2.ResyncRequest,
-    "handshake_ack": teamviewer_pb2.HandshakeAck,
-    "web_map_ack": teamviewer_pb2.WebMapAck,
-    "pong": teamviewer_pb2.Pong,
-    "snapshot_full": teamviewer_pb2.SnapshotFull,
-    "patch": teamviewer_pb2.Patch,
-    "digest": teamviewer_pb2.Digest,
-    "refresh_request": teamviewer_pb2.RefreshRequest,
-    "report_rate_hint": teamviewer_pb2.ReportRateHint,
+    payload_name: message_cls
+    for payload_name, (_, message_cls) in _WIRE_PAYLOADS.items()
+}
+
+_TYPE_TO_PAYLOAD: dict[str, str] = {
+    packet_type: payload_name
+    for payload_name, (packet_type, _) in _WIRE_PAYLOADS.items()
+    if packet_type != "handshake"
 }
 
 _WIRE_CHANNEL_TO_NAME: dict[int, str] = {
@@ -533,6 +520,7 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
     if payload_name in {"player_handshake_request", "web_map_handshake_request", "admin_handshake_request"}:
         data = _message_to_plain_dict(payload)
         data["type"] = "handshake"
+        data["_payload_case"] = payload_name
         return data
 
     if payload_name == "web_map_command":
@@ -542,6 +530,8 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
         command_payload = getattr(payload, command_name)
         data = _message_to_plain_dict(command_payload)
         data["type"] = _WEB_MAP_COMMAND_TO_TYPE.get(command_name, command_name)
+        data["_payload_case"] = payload_name
+        data["_command_case"] = command_name
         return data
 
     if payload_name == "player_report_bundle":
@@ -549,6 +539,7 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
         bundle: dict[str, Any] = {
             "type": "player_report_bundle",
             "submitPlayerId": data.get("submitPlayerId"),
+            "_payload_case": payload_name,
         }
 
         players_replace = data.get("playersReplace")
@@ -626,6 +617,7 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
         packet: dict[str, Any] = {
             "type": "web_map_ack",
             "ok": bool(data.get("ok")),
+            "_payload_case": payload_name,
         }
         for key in ("action", "error", "command"):
             value = data.get(key)
@@ -654,6 +646,7 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
         data = _message_to_plain_dict(payload)
         data["battleChunks"] = _battle_chunk_entries_to_local_map(data.get("battleChunks"))
         data["type"] = "snapshot_full"
+        data["_payload_case"] = payload_name
         return data
 
     if payload_name == "patch":
@@ -665,17 +658,20 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
                 "delete": _battle_chunk_refs_to_local_ids(battle_chunk_scope.get("delete")),
             }
         data["type"] = "patch"
+        data["_payload_case"] = payload_name
         return data
 
     if payload_name == "refresh_request":
         data = _message_to_plain_dict(payload)
         data["battleChunks"] = _battle_chunk_refs_to_local_ids(data.get("battleChunks"))
         data["type"] = "refresh_req"
+        data["_payload_case"] = payload_name
         return data
 
     packet_type = _PAYLOAD_TO_TYPE.get(payload_name, payload_name)
     data = _message_to_plain_dict(payload)
     data["type"] = packet_type
+    data["_payload_case"] = payload_name
 
     if payload_name in {"players_patch", "entities_patch", "tab_players_patch"}:
         data["upsert"] = _patch_upserts_to_map(data.get("upsert", []))

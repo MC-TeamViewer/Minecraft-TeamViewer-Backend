@@ -36,6 +36,7 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
     )
     assert handshake["type"] == "handshake"
     assert handshake["_wire_channel"] == "player"
+    assert handshake["_payload_case"] == "player_handshake_request"
     assert handshake["submitPlayerId"] == "00000000-0000-0000-0000-000000000001"
 
     ping = CODEC.decode(CODEC.encode({"type": "ping"}))
@@ -74,6 +75,7 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
         )
     )
     assert web_map_ack["type"] == "web_map_ack"
+    assert web_map_ack["_payload_case"] == "web_map_ack"
     assert web_map_ack["playerId"] == "player-1"
 
     snapshot_full = CODEC.decode(
@@ -131,6 +133,7 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
         )
     )
     assert patch["type"] == "patch"
+    assert patch["_payload_case"] == "patch"
     assert patch["players"]["delete"] == ["player-2"]
     assert patch["battleChunks"]["delete"] == ["minecraft:overworld|2|3"]
 
@@ -168,6 +171,8 @@ def test_codec_decodes_inbound_only_payloads() -> None:
 
     web_map_command = CODEC.decode(web_map_command_envelope.SerializeToString())
     assert web_map_command["type"] == "command_player_mark_set"
+    assert web_map_command["_payload_case"] == "web_map_command"
+    assert web_map_command["_command_case"] == "set_player_mark"
     assert web_map_command["playerId"] == "player-1"
     assert web_map_command["_wire_channel"] == "web_map"
 
