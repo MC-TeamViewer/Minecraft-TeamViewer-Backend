@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from google.protobuf.descriptor import FieldDescriptor
-from google.protobuf.json_format import ParseDict
 from google.protobuf.message import Message
 
 from .proto_generated.teamviewer.v1 import teamviewer_pb2
@@ -148,9 +147,12 @@ def _split_battle_chunk_id(chunk_id: str) -> tuple[str, int, int] | None:
     if not isinstance(chunk_id, str):
         return None
     parts = chunk_id.rsplit("|", 3)
-    if len(parts) != 4:
+    if len(parts) == 3:
+        dimension, chunk_x_raw, chunk_z_raw = parts
+    elif len(parts) == 4:
+        _, dimension, chunk_x_raw, chunk_z_raw = parts
+    else:
         return None
-    _, dimension, chunk_x_raw, chunk_z_raw = parts
     chunk_x = _coerce_int(chunk_x_raw)
     chunk_z = _coerce_int(chunk_z_raw)
     dimension_text = str(dimension or "").strip()
@@ -421,6 +423,112 @@ def _remap_message_dict(data: dict[str, Any], descriptor) -> dict[str, Any]:
     return remapped
 
 
+def _coerce_scalar_for_field(field: FieldDescriptor, value: Any) -> Any:
+    if field.type == FieldDescriptor.TYPE_ENUM:
+        if isinstance(value, str):
+            enum_value = field.enum_type.values_by_name.get(value)
+            if enum_value is not None:
+                return enum_value.number
+        return value
+    if field.type == FieldDescriptor.TYPE_STRING:
+        if value is None:
+            return ""
+        return str(value)
+    if field.type == FieldDescriptor.TYPE_BOOL:
+        return bool(value)
+    if field.type in {
+        FieldDescriptor.TYPE_INT32,
+        FieldDescriptor.TYPE_INT64,
+        FieldDescriptor.TYPE_SINT32,
+        FieldDescriptor.TYPE_SINT64,
+        FieldDescriptor.TYPE_SFIXED32,
+        FieldDescriptor.TYPE_SFIXED64,
+        FieldDescriptor.TYPE_FIXED32,
+        FieldDescriptor.TYPE_FIXED64,
+        FieldDescriptor.TYPE_UINT32,
+        FieldDescriptor.TYPE_UINT64,
+    }:
+        return int(value)
+    if field.type in {
+        FieldDescriptor.TYPE_DOUBLE,
+        FieldDescriptor.TYPE_FLOAT,
+    }:
+        return float(value)
+    if field.type == FieldDescriptor.TYPE_BYTES:
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, bytearray):
+            return bytes(value)
+    return value
+
+
+def _populate_message_field(message: Message, field: FieldDescriptor, value: Any) -> None:
+    if field.type == FieldDescriptor.TYPE_MESSAGE:
+        message_type = field.message_type
+        if message_type is None:
+            return
+
+        if field.is_repeated:
+            if message_type.GetOptions().map_entry:
+                if not isinstance(value, dict):
+                    return
+                key_field = message_type.fields_by_name.get("key")
+                value_field = message_type.fields_by_name.get("value")
+                if key_field is None or value_field is None:
+                    return
+                container = getattr(message, field.name)
+                for raw_key, raw_value in value.items():
+                    map_key = _coerce_scalar_for_field(key_field, raw_key)
+                    if value_field.type == FieldDescriptor.TYPE_MESSAGE:
+                        if not isinstance(raw_value, dict):
+                            continue
+                        child = container[map_key]
+                        _populate_message(child, raw_value, value_field.message_type)
+                    else:
+                        container[map_key] = _coerce_scalar_for_field(value_field, raw_value)
+                return
+
+            if not isinstance(value, list):
+                return
+            container = getattr(message, field.name)
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                child = container.add()
+                _populate_message(child, item, message_type)
+            return
+
+        if not isinstance(value, dict):
+            return
+        child = message_type._concrete_class()
+        _populate_message(child, value, message_type)
+        getattr(message, field.name).CopyFrom(child)
+        return
+
+    if field.is_repeated:
+        if not isinstance(value, list):
+            return
+        container = getattr(message, field.name)
+        container.extend(_coerce_scalar_for_field(field, item) for item in value)
+        return
+
+    setattr(message, field.name, _coerce_scalar_for_field(field, value))
+
+
+def _populate_message(message: Message, data: dict[str, Any], descriptor=None) -> Message:
+    message_descriptor = descriptor or message.DESCRIPTOR
+    remapped = _remap_message_dict(data, message_descriptor)
+    fields_by_json = {field.json_name: field for field in message_descriptor.fields}
+
+    for key, value in remapped.items():
+        field = fields_by_json.get(str(key))
+        if field is None or value is None:
+            continue
+        _populate_message_field(message, field, value)
+
+    return message
+
+
 def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
     if payload_name in {"player_handshake_request", "web_map_handshake_request", "admin_handshake_request"}:
         data = _message_to_plain_dict(payload)
@@ -512,6 +620,35 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
                 bundle[key] = value
 
         return bundle
+
+    if payload_name == "web_map_ack":
+        data = _message_to_plain_dict(payload)
+        packet: dict[str, Any] = {
+            "type": "web_map_ack",
+            "ok": bool(data.get("ok")),
+        }
+        for key in ("action", "error", "command"):
+            value = data.get(key)
+            if value is not None:
+                packet[key] = value
+
+        for detail_key, output_keys in (
+            ("playerMark", ("playerId", "mark")),
+            ("clearAllPlayerMarks", ("removedCount",)),
+            ("sameServerFilter", ("enabled",)),
+            ("tacticalWaypoint", ("waypointId", "waypoint")),
+            ("waypointsDelete", ("waypointIds",)),
+        ):
+            detail = data.get(detail_key)
+            if not isinstance(detail, dict):
+                continue
+            for output_key in output_keys:
+                value = detail.get(output_key)
+                if value is not None:
+                    packet[output_key] = value
+            break
+
+        return packet
 
     if payload_name == "snapshot_full":
         data = _message_to_plain_dict(payload)
@@ -790,8 +927,7 @@ class ProtobufMessageCodec:
 
         message = payload_cls()
         try:
-            normalized_body = _remap_message_dict(proto_body, message.DESCRIPTOR)
-            ParseDict(normalized_body, message, ignore_unknown_fields=False)
+            _populate_message(message, proto_body)
         except Exception as exc:
             raise PacketDecodeError("invalid_payload", str(exc)) from exc
 

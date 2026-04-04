@@ -526,13 +526,13 @@ message WireEnvelope {
     ResyncRequest resync_request = 14;
     WebMapCommand web_map_command = 15;
     PlayerReportBundle player_report_bundle = 16;
-    HandshakeAck handshake_ack = 30;
-    WebMapAck web_map_ack = 31;
-    Pong pong = 32;
-    SnapshotFull snapshot_full = 33;
-    Patch patch = 34;
-    Digest digest = 35;
-    RefreshRequest refresh_request = 36;
-    ReportRateHint report_rate_hint = 37;
+    HandshakeAck handshake_ack = 17;
+    WebMapAck web_map_ack = 18;
+    Pong pong = 19;
+    SnapshotFull snapshot_full = 20;
+    Patch patch = 21;
+    Digest digest = 22;
+    RefreshRequest refresh_request = 23;
+    ReportRateHint report_rate_hint = 24;
   }
 }

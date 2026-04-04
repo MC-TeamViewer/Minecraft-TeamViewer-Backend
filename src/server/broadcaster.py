@@ -32,6 +32,13 @@ class Broadcaster:
     def _encode_message(self, packet) -> bytes:
         return self._codec.encode(packet)
 
+    def _encode_message_once(self, packet, cache: dict[str, bytes], cache_key: str) -> bytes:
+        encoded = cache.get(cache_key)
+        if encoded is None:
+            encoded = self._encode_message(packet)
+            cache[cache_key] = encoded
+        return encoded
+
     def _build_full_message(
         self,
         scope_state: dict,
@@ -286,6 +293,8 @@ class Broadcaster:
             return
 
         disconnected = []
+        room_states: dict[str, dict] = {}
+        encoded_full_by_room: dict[str, bytes] = {}
         for web_map_id, ws in list(self.state.web_map_connections.items()):
             web_map_room = self.state.get_web_map_room(web_map_id)
             if not self.state.websocket_is_connected(ws):
@@ -299,18 +308,26 @@ class Broadcaster:
                 disconnected.append(web_map_id)
                 continue
             try:
-                current_state = self._build_web_map_view_state(web_map_room)
+                room_key = self.state.normalize_room_code(web_map_room)
+                current_state = room_states.get(room_key)
+                if current_state is None:
+                    current_state = self._build_web_map_view_state(web_map_room)
+                    room_states[room_key] = current_state
                 previous_state = self._web_map_last_states.get(web_map_id)
                 message_kind = "idle"
 
                 if force_full or previous_state is None:
                     message_kind = "snapshot_full"
-                    message = self._build_full_message(
-                        current_state,
-                        channel="web_map",
-                        extra={"server_time": time.time()},
-                    )
-                    await ws.send_bytes(self._encode_message(message))
+                    encoded = encoded_full_by_room.get(room_key)
+                    if encoded is None:
+                        message = self._build_full_message(
+                            current_state,
+                            channel="web_map",
+                            extra={"server_time": time.time()},
+                        )
+                        encoded = self._encode_message(message)
+                        encoded_full_by_room[room_key] = encoded
+                    await ws.send_bytes(encoded)
                 else:
                     patch_state = self._compute_web_map_patch(previous_state, current_state)
                     if self._has_web_map_patch_changes(patch_state):
@@ -368,6 +385,7 @@ class Broadcaster:
         changes = self.state.refresh_resolved_states()
 
         changed = self.state.has_patch_changes(changes)
+        encoded_cache: dict[str, bytes] = {}
 
         disconnected = []
         for player_id, ws in list(self.state.connections.items()):
@@ -401,7 +419,8 @@ class Broadcaster:
                     )
                     compact_scopes["playerMarks"] = dict(self.state.player_marks)
                     full_msg = self._build_full_message(compact_scopes)
-                    await ws.send_bytes(self._encode_message(full_msg))
+                    encoded = self._encode_message_once(full_msg, encoded_cache, "global_player_full")
+                    await ws.send_bytes(encoded)
                 elif changed:
                     patch_state = {
                         "players": changes["players"],
@@ -410,7 +429,8 @@ class Broadcaster:
                         "battleChunks": changes["battleChunks"],
                     }
                     patch_msg = self._build_patch_message(patch_state)
-                    await ws.send_bytes(self._encode_message(patch_msg))
+                    encoded = self._encode_message_once(patch_msg, encoded_cache, "global_player_patch")
+                    await ws.send_bytes(encoded)
 
                 if not requires_scoped:
                     await self.maybe_send_digest(player_id)
@@ -506,6 +526,7 @@ class Broadcaster:
 
     async def broadcast_report_rate_hints(self, reason: str = "runtime") -> None:
         broadcast_hz = self.state.broadcast_hz
+        encoded_cache: dict[tuple[int, float, str | None], bytes] = {}
         for player_id, ws in list(self.state.connections.items()):
             if not self.state.websocket_is_connected(ws):
                 continue
@@ -531,7 +552,12 @@ class Broadcaster:
                 reason=reason,
             )
             try:
-                await ws.send_bytes(self._encode_message(packet))
+                cache_key = (suggested_ticks, broadcast_hz, reason)
+                encoded = encoded_cache.get(cache_key)
+                if encoded is None:
+                    encoded = self._encode_message(packet)
+                    encoded_cache[cache_key] = encoded
+                await ws.send_bytes(encoded)
             except Exception as e:
                 logger.warning(
                     "Error sending report_rate_hint to player=%s state=(%s): %s",
