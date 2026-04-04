@@ -1580,7 +1580,10 @@ class ServerState:
             new_data = new_node.get("data") if isinstance(new_node, dict) else None
             if not isinstance(new_data, dict):
                 new_data = {}
-            delta = dict(new_data) if full_replace else cls.compute_field_delta(old_data if isinstance(old_data, dict) else None, new_data)
+            if full_replace:
+                delta = dict(new_data) if old_data != new_data else {}
+            else:
+                delta = cls.compute_field_delta(old_data if isinstance(old_data, dict) else None, new_data)
             if delta:
                 scope_patch["upsert"][object_id] = delta
 
