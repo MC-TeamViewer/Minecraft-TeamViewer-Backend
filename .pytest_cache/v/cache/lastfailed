@@ -1,0 +1,3 @@
+{
+  "tests/test_legacy_handshake_upgrade_hint.py::test_legacy_msgpack_handshake_closed_with_upgrade_hint": true
+}

@@ -44,12 +44,19 @@ from server.protocol import (
     WebMapAckPacket,
 )
 from server.state import ServerState
+from server.uuid_codec import normalize_inbound_uuid_fields
 
 
 
 NETWORK_PROTOCOL_VERSION = "0.6.0" # 服务器使用的协议版本
 SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.6.0" # 服务器兼容的最低协议版本
 SERVER_PROGRAM_VERSION = "team-view-relay-server-dev"
+LEGACY_PROTOCOL_REJECTION_REASON = (
+    "unsupported_protocol_version: "
+    "当前服务器仅支持 Protobuf 协议（0.6.0 及以上）。"
+    "MessagePack 协议（0.5.x 及更早版本）已不再支持。"
+    "请升级到最新版本的客户端后重试。"
+)
 
 
 def configure_logging() -> None:
@@ -81,6 +88,10 @@ async def send_packet(websocket: WebSocket, packet, *, channel: str | None = Non
     await websocket.send_bytes(message_codec.encode(packet))
 
 
+async def send_legacy_messagepack_packet(websocket: WebSocket, packet: dict) -> None:
+    await websocket.send_bytes(msgpack.packb(packet, use_bin_type=True))
+
+
 def describe_websocket(websocket: WebSocket) -> str:
     state_text = ServerState.websocket_state_label(websocket)
     close_code = getattr(websocket, "close_code", None)
@@ -110,8 +121,24 @@ def _decode_legacy_messagepack_handshake(payload: bytes | bytearray | memoryview
     if data.get("type") != "handshake":
         return None
 
+    data = normalize_inbound_uuid_fields(data)
     data["_legacy_msgpack"] = True
     return data
+
+
+def truncate_websocket_close_reason(reason: str, max_bytes: int = 123) -> str:
+    text = str(reason or "")
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+
+    truncated = encoded[:max_bytes]
+    while truncated:
+        try:
+            return truncated.decode("utf-8")
+        except UnicodeDecodeError:
+            truncated = truncated[:-1]
+    return ""
 
 
 async def receive_payload(websocket: WebSocket, *, allow_legacy_handshake: bool = False) -> dict:
@@ -190,6 +217,7 @@ async def reject_handshake(
     *,
     channel: str = "player",
     send_ack: bool = True,
+    legacy_messagepack_ack: bool = False,
 ) -> None:
     ack_packet = HandshakeAckPacket(
         ready=False,
@@ -206,10 +234,28 @@ async def reject_handshake(
         battleChunkTimeoutSec=state.BATTLE_CHUNK_TIMEOUT,
     )
     
-    if send_ack:
+    if legacy_messagepack_ack:
+        await send_legacy_messagepack_packet(
+            websocket,
+            {
+                "type": "handshake_ack",
+                "ready": False,
+                "networkProtocolVersion": NETWORK_PROTOCOL_VERSION,
+                "minimumCompatibleNetworkProtocolVersion": SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION,
+                "localProgramVersion": SERVER_PROGRAM_VERSION,
+                "roomCode": room_code,
+                "deltaEnabled": True,
+                "error": "version_incompatible",
+                "rejectReason": reason,
+                "broadcastHz": state.broadcast_hz,
+                "playerTimeoutSec": state.PLAYER_TIMEOUT,
+                "entityTimeoutSec": state.ENTITY_TIMEOUT,
+            },
+        )
+    elif send_ack:
         await send_packet(websocket, ack_packet, channel=channel)
     
-    close_reason = reason if len(reason) <= 120 else reason[:120]
+    close_reason = truncate_websocket_close_reason(reason)
     await websocket.close(code=1008, reason=close_reason)
 
 
@@ -440,23 +486,25 @@ async def web_map_ws(websocket: WebSocket):
             if isinstance(packet, HandshakePacket):
                 if payload.get("_legacy_msgpack"):
                     legacy_room = state.set_web_map_room(web_map_id, HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE))
-                    legacy_reason = (
-                        "unsupported_protocol_version: "
-                        "This server requires Protobuf protocol (0.6.0+). "
-                        "MessagePack protocol (0.5.x and earlier) is no longer supported. "
-                        "Please upgrade to the latest client version."
-                    )
+                    legacy_reason = LEGACY_PROTOCOL_REJECTION_REASON
                     logger.warning(
                         "Rejecting legacy MessagePack web-map client (clientProtocol=%s, roomCode=%s)",
                         HandshakeHelpers.protocol_version(packet),
                         legacy_room,
                     )
-                    await reject_handshake(websocket, legacy_reason, legacy_room, channel="web_map", send_ack=False)
+                    await reject_handshake(
+                        websocket,
+                        legacy_reason,
+                        legacy_room,
+                        channel="web_map",
+                        send_ack=False,
+                        legacy_messagepack_ack=True,
+                    )
                     return
                 
                 client_protocol = HandshakeHelpers.protocol_version(packet)
                 client_program_version = HandshakeHelpers.program_version(packet)
-                web_map_room = state.set_web_map_room(web_map_id, HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE))
+                web_map_room = state.normalize_room_code(HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE))
                 rejection_reason = resolve_handshake_rejection_reason(packet)
                 if rejection_reason:
                     logger.warning(
@@ -468,14 +516,6 @@ async def web_map_ws(websocket: WebSocket):
                     await reject_handshake(websocket, rejection_reason, web_map_room, channel="web_map")
                     return
 
-                logger.info(
-                    "Web-map connected (clientProtocol=%s, clientProgramVersion=%s, roomCode=%s)",
-                    client_protocol,
-                    client_program_version,
-                    web_map_room,
-                )
-                state.web_map_connections[web_map_id] = websocket
-                handshake_completed = True
                 await send_packet(
                     websocket,
                     HandshakeAckPacket(
@@ -490,6 +530,15 @@ async def web_map_ws(websocket: WebSocket):
                         battleChunkTimeoutSec=state.BATTLE_CHUNK_TIMEOUT,
                     ),
                     channel="web_map",
+                )
+                state.web_map_connections[web_map_id] = websocket
+                state.set_web_map_room(web_map_id, web_map_room)
+                handshake_completed = True
+                logger.info(
+                    "Web-map connected (clientProtocol=%s, clientProgramVersion=%s, roomCode=%s)",
+                    client_protocol,
+                    client_program_version,
+                    web_map_room,
                 )
                 try:
                     await broadcaster.send_web_map_snapshot_full(web_map_id)
@@ -799,12 +848,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if payload.get("_legacy_msgpack"):
                 # 对于旧版本客户端，直接拒绝握手并提示升级
                 legacy_room = HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE)
-                legacy_reason = (
-                    "unsupported_protocol_version: "
-                    "This server requires Protobuf protocol (0.6.0+). "
-                    "MessagePack protocol (0.5.x and earlier) is no longer supported. "
-                    "Please upgrade to the latest client version."
-                )
+                legacy_reason = LEGACY_PROTOCOL_REJECTION_REASON
                 logger.warning(
                     "Rejecting legacy MessagePack client (submitPlayerId=%s, roomCode=%s)",
                     submit_player_id,
@@ -816,6 +860,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     legacy_room,
                     channel="player",
                     send_ack=False,
+                    legacy_messagepack_ack=True,
                 )
                 return
             
@@ -837,10 +882,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     return
 
                 if submit_player_id:
-                    state.connections[submit_player_id] = websocket
                     client_protocol = HandshakeHelpers.protocol_version(packet)
                     client_program_version = HandshakeHelpers.program_version(packet)
-                    client_room = state.set_player_room(submit_player_id, HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE))
+                    client_room = state.normalize_room_code(HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE))
                     state.mark_player_capability(
                         submit_player_id,
                         client_protocol,
@@ -858,13 +902,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     if isinstance(caps, dict):
                         caps["negotiatedReportIntervalTicks"] = negotiated_ticks
 
-                    logger.info(
-                        "Client %s connected (protocol=%s, programVersion=%s, roomCode=%s)",
-                        submit_player_id,
-                        client_protocol,
-                        client_program_version,
-                        client_room,
-                    )
                     ack = {
                         "networkProtocolVersion": NETWORK_PROTOCOL_VERSION,
                         "minimumCompatibleNetworkProtocolVersion": SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION,
@@ -879,6 +916,15 @@ async def websocket_endpoint(websocket: WebSocket):
                         "battleChunkTimeoutSec": state.BATTLE_CHUNK_TIMEOUT,
                     }
                     await send_packet(websocket, HandshakeAckPacket(**ack))
+                    state.connections[submit_player_id] = websocket
+                    state.set_player_room(submit_player_id, client_room)
+                    logger.info(
+                        "Client %s connected (protocol=%s, programVersion=%s, roomCode=%s)",
+                        submit_player_id,
+                        client_protocol,
+                        client_program_version,
+                        client_room,
+                    )
                     await broadcaster.send_snapshot_full_to_player(submit_player_id)
                 continue
 
