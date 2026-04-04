@@ -1,73 +1,162 @@
 # TeamViewRelay Backend
 
-TeamViewRelay 的后端聚合服务，基于 FastAPI + WebSocket。
+TeamViewRelay 的后端聚合服务，基于 FastAPI + WebSocket。它负责接收 Minecraft 客户端上报的数据，按房间号（`roomCode`）聚合并广播给游戏内客户端和网页地图端。
 
-## 功能
+相关组件：
 
-- 接收客户端上报的玩家/实体/路标数据
+- [Minecraft_TeamViewer](https://github.com/MC-TeamViewer/Minecraft_TeamViewer)：Minecraft 客户端 Mod
+- [Minecraft-TeamViewer-Web-Script](https://github.com/MC-TeamViewer/Minecraft-TeamViewer-Web-Script)：网页地图投影脚本
+- [map-nodemc-plugin-blocker](https://github.com/MC-TeamViewer/map-nodemc-plugin-blocker)：可选的 NodeMC 页面屏蔽脚本，不依赖本后端
+
+## 项目简介
+
+后端的核心职责：
+
+- 接收玩家客户端上报的玩家、实体、路标、战局区块等状态
 - 按 `roomCode` 分房广播
-- 提供 `/web-map/ws` 网页地图通道（状态快照、观察端指令）
-- 预留 `/admin/ws` 真后台管理通道（当前仅占位）
-- 支持增量同步（`snapshot_full` / `patch` / `digest`）
+- 为网页地图脚本提供 `/web-map/ws` WebSocket 通道
+- 提供状态快照、健康检查和兼容路由
+- 使用共享 ProtoBuf 协议进行二进制收发
 
-## 环境
+## 适用场景 / 与其他项目关系
+
+- Mod 通过本后端共享房间内团队状态。
+- 网页地图脚本通过本后端订阅同一房间的地图投影数据。
+- 不运行后端时，Mod 和网页地图脚本无法跨客户端同步状态。
+
+## 快速开始
+
+1. 安装 Python `3.12+`。
+2. 在仓库根目录执行 `uv sync` 安装依赖。
+3. 运行 `uv run src/main.py` 启动服务。
+4. 让 Mod 连接 `ws://127.0.0.1:8765/mc-client`。
+5. 让网页地图脚本连接 `ws://127.0.0.1:8765/web-map/ws`。
+
+## 安装 / 运行
+
+环境要求：
 
 - Python `>=3.12`
 - 推荐使用 `uv`
 
-## 启动
+启动命令：
 
 ```bash
-cd backend-server/src
-uv run main.py
+uv sync
+uv run src/main.py
 ```
 
-默认监听：`0.0.0.0:8765`
+默认监听地址：
 
-## 关键端点
+- `0.0.0.0:8765`
 
-- 玩家 WS：`/playeresp`
-- 网页地图 WS：`/web-map/ws`
-- 兼容别名：`/adminws`（仅开发期保留，正式发布前移除）
-- 后台管理 WS：`/admin/ws`（当前仅占位）
-- 健康检查：`/health`
-- 快照调试：`/snapshot`
+## 配置或使用说明
 
-## 运行配置
+### 端点说明
 
-配置文件：`src/server/server_state_config.toml`
+当前可用端点：
 
-可配置项包括：
+- `/mc-client`：当前推荐的玩家客户端 WebSocket 入口
+- `/playeresp`：兼容别名，保留给旧客户端
+- `/web-map/ws`：网页地图 WebSocket 入口
+- `/adminws`：已弃用兼容别名，会提示迁移到 `/web-map/ws`
+- `/admin/ws`：预留管理接口，当前仅占位
+- `/health`：健康检查
+- `/snapshot`：状态快照调试接口
 
-- 对象超时（玩家 / 实体 / 路标）
-- digest 间隔
-- 广播频率与拥塞降级阈值
-- 同服过滤开关（Tab 列表归并）
+推荐接入方式：
 
-## 协议版本
+- Minecraft Mod 连接 `/mc-client`
+- 网页地图脚本连接 `/web-map/ws`
 
-当前服务端协议常量位于 `src/main.py`：
+### 运行配置
+
+运行时配置文件：
+
+- `src/server/server_state_config.toml`
+
+这个文件主要控制：
+
+- 玩家、实体、路标、战局区块等对象超时
+- digest 间隔和广播频率
+- 广播拥塞降级阈值
+- 同服过滤（Tab 列表归并）相关行为
+
+如果你要调整“多久清理离线对象”“广播频率多高”“同服过滤是否默认启用”，优先看这个文件。
+
+### 与其他组件如何协作
+
+- Mod 负责上报玩家、实体、报点和共享路标
+- 后端负责聚合、兼容校验、广播和快照
+- 网页地图脚本负责把后端状态渲染到 squaremap 页面
+
+## 常见问题
+
+### Mod 连不上后端
+
+- 先确认后端已经启动，并监听在 `8765`
+- 再确认 Mod 使用的是 `ws://127.0.0.1:8765/mc-client`
+- 如果 Mod 仍使用默认的 `8080` 端口，会直接连接失败
+
+### 网页地图脚本没有投影
+
+- 确认脚本连接的是 `/web-map/ws`
+- 确认脚本和 Mod 的 `roomCode` 一致
+- 可用 `/health` 和 `/snapshot` 辅助排查
+
+### 老客户端还能不能走 `/playeresp` 或 `/adminws`
+
+- 目前兼容路由仍然存在，但推荐迁移到 `/mc-client` 和 `/web-map/ws`
+
+## 开发与构建
+
+常用命令：
+
+```bash
+uv sync
+uv run src/main.py
+uv run pytest -q
+```
+
+协议代码生成：
+
+```bash
+./scripts/generate_proto_python.sh
+```
+
+主要目录：
+
+- `src/main.py`：服务入口和路由
+- `src/server/`：状态、广播、协议和编解码逻辑
+- `tests/`：后端测试
+
+## 协议 / 版本兼容
+
+当前协议常量位于 `src/main.py`：
 
 - `NETWORK_PROTOCOL_VERSION = 0.6.0`
 - `SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = 0.6.0`
 
-共享 ProtoBuf 协议源位于 `third_party/TeamViewRelay-Protocol/proto/teamviewer/v1/teamviewer.proto`，服务端通过 `scripts/generate_proto_python.sh` 生成本地 Python 产物。
+共享 ProtoBuf 协议源位于：
 
-详细字段与报文结构见仓库根目录文档：`docs/PLAYER_ESP_NETWORK_PROTOCOL.md`
+- `third_party/TeamViewRelay-Protocol/proto/teamviewer/v1/teamviewer.proto`
 
-## 子模块与协议版本
+Python 协议产物通过下面脚本生成：
 
-- clone 推荐使用：`git clone --recursive`
-- 已有仓库补拉子模块：`git submodule update --init --recursive`
-- 当前仓库依赖的是被锁定的协议 submodule commit，不会自动跟随协议仓库远端更新
-- 升级协议版本的标准流程：
+- `scripts/generate_proto_python.sh`
+
+子模块与协议版本：
+
+- 推荐使用 `git clone --recursive`
+- 已有仓库可执行 `git submodule update --init --recursive`
+- 当前依赖锁定在 `third_party/TeamViewRelay-Protocol` 的指定 commit，不会自动跟随远端更新
+
+升级协议版本的常规流程：
 
 ```bash
 git -C third_party/TeamViewRelay-Protocol fetch --tags
 git -C third_party/TeamViewRelay-Protocol checkout proto/v0.6.0
 git add third_party/TeamViewRelay-Protocol
 ./scripts/generate_proto_python.sh
-UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q
+uv run pytest -q
 ```
-
-- GitHub “Download ZIP” 不包含 submodule 内容，不是推荐的开发方式
