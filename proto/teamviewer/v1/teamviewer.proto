@@ -169,34 +169,30 @@ message WaypointDelta {
   optional string deletable_by = 23;
 }
 
-message BattleChunkData {
+message BattleChunkCoord {
   int32 chunk_x = 1;
   int32 chunk_z = 2;
-  string dimension = 3;
-  optional string symbol = 4;
-  optional string marker_type = 5;
-  string color_raw = 6;
-  optional string color_note = 7;
-  optional int64 observed_at = 8;
-  optional int64 position_sampled_at = 9;
-  optional string alignment_source = 10;
-  optional string reporter_id = 11;
-  optional string room_code = 12;
 }
 
-message BattleChunkDelta {
-  optional int32 chunk_x = 1;
-  optional int32 chunk_z = 2;
-  optional string dimension = 3;
-  optional string symbol = 4;
-  optional string marker_type = 5;
-  optional string color_raw = 6;
-  optional string color_note = 7;
-  optional int64 observed_at = 8;
-  optional int64 position_sampled_at = 9;
-  optional string alignment_source = 10;
-  optional string reporter_id = 11;
-  optional string room_code = 12;
+message BattleChunkRef {
+  string dimension = 1;
+  BattleChunkCoord coord = 2;
+}
+
+message BattleChunkValue {
+  optional string symbol = 1;
+  optional string marker_type = 2;
+  string color_raw = 3;
+  optional string color_note = 4;
+  optional int64 observed_at = 5;
+  optional int64 position_sampled_at = 6;
+  optional string alignment_source = 7;
+  optional string reporter_id = 8;
+}
+
+message BattleChunkEntry {
+  BattleChunkRef ref = 1;
+  BattleChunkValue data = 2;
 }
 
 message BattleMapObservationCandidate {
@@ -439,7 +435,7 @@ message SnapshotFull {
   map<string, PlayerData> players = 1;
   map<string, EntityData> entities = 2;
   map<string, WaypointData> waypoints = 3;
-  map<string, BattleChunkData> battle_chunks = 4;
+  repeated BattleChunkEntry battle_chunks = 4;
   map<string, PlayerMark> player_marks = 5;
   optional WebMapTabState tab_state = 6;
   optional string room_code = 7;
@@ -449,13 +445,13 @@ message SnapshotFull {
 }
 
 message BattleChunkUpsert {
-  string id = 1;
-  BattleChunkDelta data = 2;
+  BattleChunkRef ref = 1;
+  BattleChunkValue data = 2;
 }
 
 message BattleChunkPatchScope {
   repeated BattleChunkUpsert upsert = 1;
-  repeated string delete = 2;
+  repeated BattleChunkRef delete = 2;
 }
 
 message PlayerMarkUpsert {
@@ -492,7 +488,7 @@ message RefreshRequest {
   double server_time = 2;
   repeated string players = 3;
   repeated string entities = 4;
-  repeated string battle_chunks = 5;
+  repeated BattleChunkRef battle_chunks = 5;
 }
 
 message ReportRateHint {

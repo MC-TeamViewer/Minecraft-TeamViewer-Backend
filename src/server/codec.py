@@ -126,6 +126,192 @@ def _battle_map_observation_to_plain_dict(message: Message) -> dict[str, Any]:
     }
 
 
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _split_battle_chunk_id(chunk_id: str) -> tuple[str, int, int] | None:
+    if not isinstance(chunk_id, str):
+        return None
+    parts = chunk_id.rsplit("|", 3)
+    if len(parts) != 4:
+        return None
+    _, dimension, chunk_x_raw, chunk_z_raw = parts
+    chunk_x = _coerce_int(chunk_x_raw)
+    chunk_z = _coerce_int(chunk_z_raw)
+    dimension_text = str(dimension or "").strip()
+    if not dimension_text or chunk_x is None or chunk_z is None:
+        return None
+    return dimension_text, chunk_x, chunk_z
+
+
+def _battle_chunk_synthetic_id(dimension: Any, chunk_x: Any, chunk_z: Any) -> str | None:
+    dimension_text = str(dimension or "").strip()
+    normalized_chunk_x = _coerce_int(chunk_x)
+    normalized_chunk_z = _coerce_int(chunk_z)
+    if not dimension_text or normalized_chunk_x is None or normalized_chunk_z is None:
+        return None
+    return f"{dimension_text}|{normalized_chunk_x}|{normalized_chunk_z}"
+
+
+def _battle_chunk_ref_from_sources(chunk_id: str | None, data: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    payload = data if isinstance(data, dict) else {}
+    dimension = str(payload.get("dimension") or "").strip()
+    chunk_x = _coerce_int(payload.get("chunkX"))
+    chunk_z = _coerce_int(payload.get("chunkZ"))
+    if not dimension or chunk_x is None or chunk_z is None:
+        parsed = _split_battle_chunk_id(chunk_id or "")
+        if parsed is None:
+            return None
+        dimension, chunk_x, chunk_z = parsed
+    return {
+        "dimension": dimension,
+        "coord": {
+            "chunkX": chunk_x,
+            "chunkZ": chunk_z,
+        },
+    }
+
+
+def _battle_chunk_value_from_data(data: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    color_raw = data.get("colorRaw")
+    if not isinstance(color_raw, str) or not color_raw:
+        return None
+    value: dict[str, Any] = {
+        "colorRaw": color_raw,
+    }
+    for source_key, target_key in (
+        ("symbol", "symbol"),
+        ("markerType", "markerType"),
+        ("colorNote", "colorNote"),
+        ("observedAt", "observedAt"),
+        ("positionSampledAt", "positionSampledAt"),
+        ("alignmentSource", "alignmentSource"),
+        ("reporterId", "reporterId"),
+    ):
+        raw = data.get(source_key)
+        if raw is not None:
+            value[target_key] = raw
+    return value
+
+
+def _battle_chunk_entry_to_local(entry: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    if not isinstance(entry, dict):
+        return None
+    ref = entry.get("ref")
+    if not isinstance(ref, dict):
+        return None
+    coord = ref.get("coord")
+    if not isinstance(coord, dict):
+        return None
+    dimension = str(ref.get("dimension") or "").strip()
+    chunk_x = _coerce_int(coord.get("chunkX"))
+    chunk_z = _coerce_int(coord.get("chunkZ"))
+    chunk_id = _battle_chunk_synthetic_id(dimension, chunk_x, chunk_z)
+    if chunk_id is None:
+        return None
+
+    raw_value = entry.get("data")
+    value = dict(raw_value) if isinstance(raw_value, dict) else {}
+    value["dimension"] = dimension
+    value["chunkX"] = chunk_x
+    value["chunkZ"] = chunk_z
+    return chunk_id, value
+
+
+def _battle_chunk_entries_to_local_map(entries: Any) -> dict[str, Any]:
+    if not isinstance(entries, list):
+        return {}
+    mapped: dict[str, Any] = {}
+    for item in entries:
+        local_entry = _battle_chunk_entry_to_local(item)
+        if local_entry is None:
+            continue
+        chunk_id, value = local_entry
+        mapped[chunk_id] = value
+    return mapped
+
+
+def _battle_chunk_refs_to_local_ids(entries: Any) -> list[str]:
+    if not isinstance(entries, list):
+        return []
+    mapped: list[str] = []
+    for item in entries:
+        local_entry = _battle_chunk_entry_to_local({"ref": item, "data": {}})
+        if local_entry is None:
+            continue
+        mapped.append(local_entry[0])
+    return mapped
+
+
+def _battle_chunk_snapshot_to_proto(scope: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(scope, dict):
+        return []
+    entries: list[dict[str, Any]] = []
+    for chunk_id, raw_data in scope.items():
+        if not isinstance(chunk_id, str) or not isinstance(raw_data, dict):
+            continue
+        ref = _battle_chunk_ref_from_sources(chunk_id, raw_data)
+        value = _battle_chunk_value_from_data(raw_data)
+        if ref is None or value is None:
+            continue
+        entries.append({
+            "ref": ref,
+            "data": value,
+        })
+    return entries
+
+
+def _battle_chunk_patch_to_proto(scope: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(scope, dict):
+        return None
+    proto_scope: dict[str, Any] = {}
+    upsert = scope.get("upsert")
+    delete = scope.get("delete")
+    if isinstance(upsert, dict) and upsert:
+        proto_upsert: list[dict[str, Any]] = []
+        for chunk_id, patch in upsert.items():
+            if not isinstance(chunk_id, str) or not isinstance(patch, dict):
+                continue
+            ref = _battle_chunk_ref_from_sources(chunk_id, patch)
+            value = _battle_chunk_value_from_data(patch)
+            if ref is None or value is None:
+                continue
+            proto_upsert.append({
+                "ref": ref,
+                "data": value,
+            })
+        if proto_upsert:
+            proto_scope["upsert"] = proto_upsert
+    if isinstance(delete, list) and delete:
+        proto_delete = [
+            ref
+            for item in delete
+            if isinstance(item, str) and item
+            for ref in [_battle_chunk_ref_from_sources(item)]
+            if ref is not None
+        ]
+        if proto_delete:
+            proto_scope["delete"] = proto_delete
+    return proto_scope or None
+
+
 def _message_to_plain_dict(message: Message) -> dict[str, Any]:
     message_name = getattr(getattr(message, "DESCRIPTOR", None), "name", "")
     if message_name == "BattleMapObservation":
@@ -327,6 +513,29 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
 
         return bundle
 
+    if payload_name == "snapshot_full":
+        data = _message_to_plain_dict(payload)
+        data["battleChunks"] = _battle_chunk_entries_to_local_map(data.get("battleChunks"))
+        data["type"] = "snapshot_full"
+        return data
+
+    if payload_name == "patch":
+        data = _message_to_plain_dict(payload)
+        battle_chunk_scope = data.get("battleChunks")
+        if isinstance(battle_chunk_scope, dict):
+            data["battleChunks"] = {
+                "upsert": _battle_chunk_entries_to_local_map(battle_chunk_scope.get("upsert")),
+                "delete": _battle_chunk_refs_to_local_ids(battle_chunk_scope.get("delete")),
+            }
+        data["type"] = "patch"
+        return data
+
+    if payload_name == "refresh_request":
+        data = _message_to_plain_dict(payload)
+        data["battleChunks"] = _battle_chunk_refs_to_local_ids(data.get("battleChunks"))
+        data["type"] = "refresh_req"
+        return data
+
     packet_type = _PAYLOAD_TO_TYPE.get(payload_name, payload_name)
     data = _message_to_plain_dict(payload)
     data["type"] = packet_type
@@ -366,12 +575,15 @@ def _convert_patch_body(body: dict[str, Any]) -> dict[str, Any]:
         ("players", "players"),
         ("entities", "entities"),
         ("waypoints", "waypoints"),
-        ("battleChunks", "battleChunks"),
         ("playerMarks", "playerMarks"),
     ):
         converted = _scope_patch_to_proto(body.get(old_key))
         if converted:
             proto_body[new_key] = converted
+
+    battle_chunks = _battle_chunk_patch_to_proto(body.get("battleChunks"))
+    if battle_chunks:
+        proto_body["battleChunks"] = battle_chunks
 
     meta = body.get("meta")
     if isinstance(meta, dict):
@@ -398,10 +610,14 @@ def _convert_patch_body(body: dict[str, Any]) -> dict[str, Any]:
 
 def _convert_snapshot_body(body: dict[str, Any]) -> dict[str, Any]:
     proto_body: dict[str, Any] = {}
-    for key in ("players", "entities", "waypoints", "battleChunks", "playerMarks", "tabState", "connections"):
+    for key in ("players", "entities", "waypoints", "playerMarks", "tabState", "connections"):
         value = body.get(key)
         if value is not None:
             proto_body[key] = value
+
+    battle_chunks = _battle_chunk_snapshot_to_proto(body.get("battleChunks"))
+    if battle_chunks:
+        proto_body["battleChunks"] = battle_chunks
 
     if body.get("roomCode") is not None:
         proto_body["roomCode"] = body.get("roomCode")
@@ -459,6 +675,24 @@ def _convert_web_map_ack_body(body: dict[str, Any]) -> dict[str, Any]:
     return proto_body
 
 
+def _convert_refresh_request_body(body: dict[str, Any]) -> dict[str, Any]:
+    proto_body = {
+        key: value
+        for key, value in body.items()
+        if key not in {"type", "channel", "battleChunks"}
+    }
+    battle_chunks = body.get("battleChunks")
+    if isinstance(battle_chunks, list):
+        proto_body["battleChunks"] = [
+            ref
+            for item in battle_chunks
+            if isinstance(item, str) and item
+            for ref in [_battle_chunk_ref_from_sources(item)]
+            if ref is not None
+        ]
+    return proto_body
+
+
 def _convert_outbound_body(packet_type: str, body: dict[str, Any]) -> tuple[str, int, dict[str, Any]]:
     if packet_type == "handshake":
         channel_name = str(body.get("channel") or "").strip().lower()
@@ -500,6 +734,8 @@ def _convert_outbound_body(packet_type: str, body: dict[str, Any]) -> tuple[str,
         return payload_name, channel, _convert_digest_body(body)
     if packet_type == "web_map_ack":
         return payload_name, channel, _convert_web_map_ack_body(body)
+    if packet_type == "refresh_req":
+        return payload_name, channel, _convert_refresh_request_body(body)
 
     proto_body = {
         key: value

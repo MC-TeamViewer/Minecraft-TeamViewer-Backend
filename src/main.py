@@ -81,6 +81,17 @@ async def send_packet(websocket: WebSocket, packet, *, channel: str | None = Non
     await websocket.send_bytes(message_codec.encode(packet))
 
 
+def describe_websocket(websocket: WebSocket) -> str:
+    state_text = ServerState.websocket_state_label(websocket)
+    close_code = getattr(websocket, "close_code", None)
+    close_reason = getattr(websocket, "close_reason", None)
+    return (
+        f"state=({state_text}), "
+        f"closeCode={close_code if close_code is not None else 'unknown'}, "
+        f"closeReason={close_reason!r}"
+    )
+
+
 def _decode_legacy_messagepack_handshake(payload: bytes | bytearray | memoryview | str) -> dict | None:
     if isinstance(payload, str):
         return None
@@ -400,6 +411,10 @@ async def web_map_ws(websocket: WebSocket):
     if str(websocket.url.path) == "/adminws":
         logger.warning("Deprecated websocket route /adminws used; migrate clients to /web-map/ws")
     handshake_completed = False
+    web_map_room = state.DEFAULT_ROOM_CODE
+    disconnect_reason = "connection_closed"
+    disconnect_code = None
+    disconnect_exception = None
     try:
         while True:
             try:
@@ -476,7 +491,18 @@ async def web_map_ws(websocket: WebSocket):
                     ),
                     channel="web_map",
                 )
-                await broadcaster.send_web_map_snapshot_full(web_map_id)
+                try:
+                    await broadcaster.send_web_map_snapshot_full(web_map_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Initial web-map snapshot send failed (webMapId=%s, roomCode=%s, %s): %s: %r",
+                        web_map_id,
+                        web_map_room,
+                        describe_websocket(websocket),
+                        type(exc).__name__,
+                        exc,
+                    )
+                    raise
                 continue
 
             if not handshake_completed:
@@ -676,11 +702,25 @@ async def web_map_ws(websocket: WebSocket):
                 continue
 
             await send_packet(websocket, WebMapAckPacket(ok=False, error="unsupported_command"))
-    except WebSocketDisconnect:
-        pass
+    except WebSocketDisconnect as exc:
+        disconnect_reason = "client_disconnect"
+        disconnect_code = getattr(exc, "code", None)
+        disconnect_exception = exc
     except Exception as e:
+        disconnect_reason = f"error:{type(e).__name__}"
+        disconnect_exception = e
         logger.exception("Web-map websocket error: %s", e)
     finally:
+        logger.info(
+            "Web-map disconnected (webMapId=%s, roomCode=%s, handshakeCompleted=%s, reason=%s, code=%s, %s, error=%r)",
+            web_map_id,
+            web_map_room,
+            handshake_completed,
+            disconnect_reason,
+            disconnect_code,
+            describe_websocket(websocket),
+            disconnect_exception,
+        )
         if web_map_id in state.web_map_connections:
             del state.web_map_connections[web_map_id]
         if web_map_id in state.web_map_connection_rooms:

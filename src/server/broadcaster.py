@@ -1,6 +1,8 @@
 import logging
 import time
 
+from fastapi import WebSocketDisconnect
+
 from .codec import ProtobufMessageCodec
 from .protocol import DigestPacket, PatchPacket, RefreshRequestOutboundPacket, ReportRateHintPacket, SnapshotFullPacket
 from .state import ServerState
@@ -106,6 +108,7 @@ class Broadcaster:
             scope_patch = self.state.compute_scope_patch(
                 self._wrap_plain_scope(old_state.get(scope, {})),
                 self._wrap_plain_scope(new_state.get(scope, {})),
+                full_replace=(scope == "battleChunks"),
             )
             if scope_patch.get("upsert") or scope_patch.get("delete"):
                 patch[scope] = scope_patch
@@ -176,9 +179,36 @@ class Broadcaster:
     def _has_web_map_patch_changes(self, patch: dict) -> bool:
         return self._has_scope_patch_changes(patch, self._web_map_sync_scopes) or bool(patch.get("meta"))
 
+    def _describe_web_map_socket(self, ws) -> str:
+        state_text = self.state.websocket_state_label(ws)
+        close_code = getattr(ws, "close_code", None)
+        close_reason = getattr(ws, "close_reason", None)
+        return (
+            f"state=({state_text}), "
+            f"closeCode={close_code if close_code is not None else 'unknown'}, "
+            f"closeReason={close_reason!r}"
+        )
+
+    def _drop_web_map_connection(self, web_map_id: str) -> None:
+        if web_map_id in self.state.web_map_connections:
+            del self.state.web_map_connections[web_map_id]
+        if web_map_id in self.state.web_map_connection_rooms:
+            del self.state.web_map_connection_rooms[web_map_id]
+        if web_map_id in self._web_map_last_states:
+            del self._web_map_last_states[web_map_id]
+
     async def send_web_map_snapshot_full(self, web_map_id: str) -> None:
         ws = self.state.web_map_connections.get(web_map_id)
         if ws is None:
+            return
+        if not self.state.websocket_is_connected(ws):
+            logger.info(
+                "Skip full web-map snapshot for disconnected client %s (roomCode=%s, %s)",
+                web_map_id,
+                self.state.get_web_map_room(web_map_id),
+                self._describe_web_map_socket(ws),
+            )
+            self._drop_web_map_connection(web_map_id)
             return
 
         web_map_room = self.state.get_web_map_room(web_map_id)
@@ -257,11 +287,24 @@ class Broadcaster:
 
         disconnected = []
         for web_map_id, ws in list(self.state.web_map_connections.items()):
+            web_map_room = self.state.get_web_map_room(web_map_id)
+            if not self.state.websocket_is_connected(ws):
+                logger.info(
+                    "Skip web-map broadcast to disconnected client %s (roomCode=%s, forceFull=%s, %s)",
+                    web_map_id,
+                    web_map_room,
+                    force_full,
+                    self._describe_web_map_socket(ws),
+                )
+                disconnected.append(web_map_id)
+                continue
             try:
-                current_state = self._build_web_map_view_state(self.state.get_web_map_room(web_map_id))
+                current_state = self._build_web_map_view_state(web_map_room)
                 previous_state = self._web_map_last_states.get(web_map_id)
+                message_kind = "idle"
 
                 if force_full or previous_state is None:
+                    message_kind = "snapshot_full"
                     message = self._build_full_message(
                         current_state,
                         channel="web_map",
@@ -271,6 +314,7 @@ class Broadcaster:
                 else:
                     patch_state = self._compute_web_map_patch(previous_state, current_state)
                     if self._has_web_map_patch_changes(patch_state):
+                        message_kind = "patch"
                         message = self._build_patch_message(
                             patch_state,
                             channel="web_map",
@@ -279,17 +323,43 @@ class Broadcaster:
                         await ws.send_bytes(self._encode_message(message))
 
                 self._web_map_last_states[web_map_id] = current_state
+            except WebSocketDisconnect as e:
+                logger.info(
+                    "Web-map client disconnected during send %s (webMapId=%s, roomCode=%s, code=%s, %s)",
+                    message_kind,
+                    web_map_id,
+                    web_map_room,
+                    getattr(e, "code", None),
+                    self._describe_web_map_socket(ws),
+                )
+                disconnected.append(web_map_id)
+            except RuntimeError as e:
+                logger.warning(
+                    "RuntimeError sending web-map %s to %s (roomCode=%s, forceFull=%s, %s): %s: %r",
+                    message_kind,
+                    web_map_id,
+                    web_map_room,
+                    force_full,
+                    self._describe_web_map_socket(ws),
+                    type(e).__name__,
+                    e,
+                )
+                disconnected.append(web_map_id)
             except Exception as e:
-                logger.warning("Error sending web-map update to %s: %s", web_map_id, e)
+                logger.warning(
+                    "Error sending web-map %s to %s (roomCode=%s, forceFull=%s, %s): %s: %r",
+                    message_kind,
+                    web_map_id,
+                    web_map_room,
+                    force_full,
+                    self._describe_web_map_socket(ws),
+                    type(e).__name__,
+                    e,
+                )
                 disconnected.append(web_map_id)
 
         for web_map_id in disconnected:
-            if web_map_id in self.state.web_map_connections:
-                del self.state.web_map_connections[web_map_id]
-            if web_map_id in self.state.web_map_connection_rooms:
-                del self.state.web_map_connection_rooms[web_map_id]
-            if web_map_id in self._web_map_last_states:
-                del self._web_map_last_states[web_map_id]
+            self._drop_web_map_connection(web_map_id)
 
     async def broadcast_updates(self, force_full_to_delta: bool = False) -> None:
         """统一广播入口：清理超时、计算 patch、按能力下发。"""

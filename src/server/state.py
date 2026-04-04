@@ -1568,7 +1568,7 @@ class ServerState:
         return resolved
 
     @classmethod
-    def compute_scope_patch(cls, old_map: Dict[str, dict], new_map: Dict[str, dict]) -> dict:
+    def compute_scope_patch(cls, old_map: Dict[str, dict], new_map: Dict[str, dict], *, full_replace: bool = False) -> dict:
         scope_patch = {"upsert": {}, "delete": []}
 
         for object_id in old_map.keys() - new_map.keys():
@@ -1580,7 +1580,7 @@ class ServerState:
             new_data = new_node.get("data") if isinstance(new_node, dict) else None
             if not isinstance(new_data, dict):
                 new_data = {}
-            delta = cls.compute_field_delta(old_data if isinstance(old_data, dict) else None, new_data)
+            delta = dict(new_data) if full_replace else cls.compute_field_delta(old_data if isinstance(old_data, dict) else None, new_data)
             if delta:
                 scope_patch["upsert"][object_id] = delta
 
@@ -1625,7 +1625,7 @@ class ServerState:
             "players": self.compute_scope_patch(old_players, self.players),
             "entities": self.compute_scope_patch(old_entities, self.entities),
             "waypoints": self.compute_scope_patch(old_waypoints, self.waypoints),
-            "battleChunks": self.compute_scope_patch(old_battle_chunks, self.battle_chunks),
+            "battleChunks": self.compute_scope_patch(old_battle_chunks, self.battle_chunks, full_replace=True),
         }
 
     @staticmethod
