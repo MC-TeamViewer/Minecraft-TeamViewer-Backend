@@ -6,7 +6,9 @@ if str(BACKEND_SRC) not in sys.path:
     sys.path.insert(0, str(BACKEND_SRC))
 
 from server.codec import ProtobufMessageCodec
+from server.broadcaster import Broadcaster
 from server.proto_generated.teamviewer.v1 import teamviewer_pb2
+from server.state import ServerState
 
 
 CODEC = ProtobufMessageCodec()
@@ -16,7 +18,7 @@ def test_wire_envelope_payload_field_numbers_are_contiguous() -> None:
     payload = teamviewer_pb2.WireEnvelope.DESCRIPTOR.oneofs_by_name["payload"]
     field_numbers = [field.number for field in payload.fields]
 
-    assert field_numbers == list(range(10, 25))
+    assert field_numbers == list(range(10, 27))
     assert teamviewer_pb2.WireEnvelope.DESCRIPTOR.fields_by_name["channel"].number == 1
 
 
@@ -26,8 +28,8 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
             {
                 "type": "handshake",
                 "channel": "player",
-                "networkProtocolVersion": "0.6.0",
-                "minimumCompatibleNetworkProtocolVersion": "0.6.0",
+                "networkProtocolVersion": "0.6.1",
+                "minimumCompatibleNetworkProtocolVersion": "0.6.1",
                 "localProgramVersion": "client",
                 "submitPlayerId": "00000000-0000-0000-0000-000000000001",
                 "roomCode": "room-a",
@@ -50,8 +52,8 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
         CODEC.encode(
             {
                 "type": "handshake_ack",
-                "networkProtocolVersion": "0.6.0",
-                "minimumCompatibleNetworkProtocolVersion": "0.6.0",
+                "networkProtocolVersion": "0.6.1",
+                "minimumCompatibleNetworkProtocolVersion": "0.6.1",
                 "localProgramVersion": "server",
                 "roomCode": "room-a",
                 "deltaEnabled": True,
@@ -189,3 +191,58 @@ def test_codec_decodes_inbound_only_payloads() -> None:
     assert bundle["submitPlayerId"] == "player-1"
     assert bundle["playersPatch"]["upsert"]["player-1"]["dimension"] == "minecraft:overworld"
     assert bundle["waypointsDelete"]["waypointIds"] == ["wp-1"]
+
+
+def test_player_outbound_digest_view_matches_client_visible_battle_chunk_shape() -> None:
+    state = ServerState()
+    broadcaster = Broadcaster(state)
+
+    sync_view_state = {
+        "players": {
+            "player-1": {
+                "x": 1.0,
+                "y": 64.0,
+                "z": 2.0,
+                "dimension": "minecraft:overworld",
+                "playerName": "tester",
+                "playerUUID": None,
+            }
+        },
+        "entities": {},
+        "waypoints": {
+            "wp-1": {
+                "x": 1.0,
+                "y": 64.0,
+                "z": 2.0,
+                "dimension": "minecraft:overworld",
+                "name": "wp",
+                "roomCode": None,
+            }
+        },
+        "battleChunks": {
+            "default|minecraft:overworld|1|2": {
+                "dimension": "minecraft:overworld",
+                "chunkX": 1,
+                "chunkZ": 2,
+                "colorRaw": "#112233",
+                "roomCode": "default",
+                "colorMode": "raw_observed",
+                "colorSemanticKey": None,
+            }
+        },
+    }
+
+    digest_view = broadcaster._build_player_outbound_digest_view(sync_view_state)
+
+    assert digest_view["players"]["player-1"]["playerName"] == "tester"
+    assert "playerUUID" not in digest_view["players"]["player-1"]
+    assert "roomCode" not in digest_view["waypoints"]["wp-1"]
+    assert "default|minecraft:overworld|1|2" not in digest_view["battleChunks"]
+    assert digest_view["battleChunks"]["minecraft:overworld|1|2"] == {
+        "dimension": "minecraft:overworld",
+        "chunkX": 1,
+        "chunkZ": 2,
+        "colorRaw": "#112233",
+        "roomCode": "default",
+        "colorMode": "raw_observed",
+    }

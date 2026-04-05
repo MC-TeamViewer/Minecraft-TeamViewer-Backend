@@ -134,8 +134,8 @@ uv run pytest -q
 
 当前协议常量位于 `src/main.py`：
 
-- `NETWORK_PROTOCOL_VERSION = 0.6.0`
-- `SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = 0.6.0`
+- `NETWORK_PROTOCOL_VERSION = 0.6.1`
+- `SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = 0.6.1`
 
 共享 ProtoBuf 协议源位于：
 
@@ -155,7 +155,7 @@ Python 协议产物通过下面脚本生成：
 
 ```bash
 git -C third_party/TeamViewRelay-Protocol fetch --tags
-git -C third_party/TeamViewRelay-Protocol checkout proto/v0.6.0
+git -C third_party/TeamViewRelay-Protocol checkout proto/v0.6.1
 git add third_party/TeamViewRelay-Protocol
 ./scripts/generate_proto_python.sh
 uv run pytest -q

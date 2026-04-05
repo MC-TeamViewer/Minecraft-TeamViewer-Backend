@@ -71,7 +71,7 @@ def live_server() -> str:
 def build_handshake(
     *,
     channel: str,
-    protocol_version: str = "0.6.0",
+    protocol_version: str = "0.6.1",
     room_code: str = "test-room",
     submit_player_id: str | None = None,
 ) -> bytes:
@@ -98,7 +98,8 @@ def decode_legacy_msgpack_packet(payload: bytes) -> dict:
 
 def test_truncate_websocket_close_reason_limits_utf8_bytes() -> None:
     reason = (
-        "unsupported_protocol_version: 当前服务器仅支持 Protobuf 协议（0.6.0 及以上）。"
+        "unsupported_protocol_version: 当前服务器仅支持 Protobuf 协议（0.6.1 及以上）。"
+        "battleChunks 同步与一致性修正要求客户端升级到 0.6.1。"
         "MessagePack 协议（0.5.x 及更早版本）已不再支持。"
         "请升级到最新版本的客户端后重试。"
     )
@@ -212,6 +213,29 @@ async def test_web_map_route_rejects_player_wire_channel_handshake(live_server: 
         assert handshake_ack["type"] == "handshake_ack"
         assert handshake_ack.get("ready") is not True
         assert "channel_mismatch" in str(handshake_ack.get("rejectReason") or "")
+
+        with pytest.raises(websockets.exceptions.ConnectionClosedError) as exc_info:
+            await asyncio.wait_for(websocket.recv(), timeout=5.0)
+
+    assert exc_info.value.code == 1008
+
+
+@pytest.mark.asyncio
+async def test_player_route_rejects_proto_060_client(live_server: str) -> None:
+    async with websockets.connect(f"{live_server}/mc-client") as websocket:
+        await websocket.send(
+            build_handshake(
+                channel="player",
+                protocol_version="0.6.0",
+                submit_player_id="00000000-0000-0000-0000-000000000001",
+            )
+        )
+
+        handshake_ack = decode_packet(await asyncio.wait_for(websocket.recv(), timeout=5.0))
+        assert handshake_ack["type"] == "handshake_ack"
+        assert handshake_ack.get("ready") is not True
+        assert "client_protocol_too_old" in str(handshake_ack.get("rejectReason") or "")
+        assert handshake_ack.get("minimumCompatibleNetworkProtocolVersion") == "0.6.1"
 
         with pytest.raises(websockets.exceptions.ConnectionClosedError) as exc_info:
             await asyncio.wait_for(websocket.recv(), timeout=5.0)

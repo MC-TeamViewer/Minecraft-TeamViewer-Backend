@@ -753,6 +753,49 @@ class ServerState:
         safe_dimension = str(dimension or "").strip() or "minecraft:overworld"
         return f"{safe_room_code}|{safe_dimension}|{int(chunk_x)}|{int(chunk_z)}"
 
+    @staticmethod
+    def _coerce_battle_chunk_coord(value) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return int(value)
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return int(text)
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def build_client_visible_battle_chunk_id(cls, chunk_id: Optional[str], data: Optional[dict] = None) -> Optional[str]:
+        payload = data if isinstance(data, dict) else {}
+        dimension = str(payload.get("dimension") or "").strip()
+        chunk_x = cls._coerce_battle_chunk_coord(payload.get("chunkX"))
+        chunk_z = cls._coerce_battle_chunk_coord(payload.get("chunkZ"))
+
+        if not dimension or chunk_x is None or chunk_z is None:
+            if not isinstance(chunk_id, str):
+                return None
+            parts = chunk_id.rsplit("|", 3)
+            if len(parts) == 4:
+                _, dimension, raw_chunk_x, raw_chunk_z = parts
+            elif len(parts) == 3:
+                dimension, raw_chunk_x, raw_chunk_z = parts
+            else:
+                return None
+            dimension = str(dimension or "").strip()
+            chunk_x = cls._coerce_battle_chunk_coord(raw_chunk_x)
+            chunk_z = cls._coerce_battle_chunk_coord(raw_chunk_z)
+
+        if not dimension or chunk_x is None or chunk_z is None:
+            return None
+        return f"{dimension}|{chunk_x}|{chunk_z}"
+
     def build_battle_map_observation_hash(
         self,
         dimension: str,
@@ -1313,6 +1356,41 @@ class ServerState:
         """将最终视图转换为下发格式（只保留 data）。"""
         return {sid: node.get("data", {}) for sid, node in state_map.items()}
 
+    @classmethod
+    def prune_none_fields(cls, value):
+        if isinstance(value, dict):
+            return {
+                key: cls.prune_none_fields(item)
+                for key, item in value.items()
+                if item is not None
+            }
+        if isinstance(value, list):
+            return [cls.prune_none_fields(item) for item in value]
+        return value
+
+    def build_player_outbound_digest_scope(self, scope_name: str, scope_map: Dict[str, dict]) -> Dict[str, dict]:
+        if not isinstance(scope_map, dict):
+            return {}
+
+        if scope_name == "battleChunks":
+            projected: Dict[str, dict] = {}
+            for chunk_id, raw_data in scope_map.items():
+                if not isinstance(raw_data, dict):
+                    continue
+                client_visible_id = self.build_client_visible_battle_chunk_id(chunk_id, raw_data)
+                if client_visible_id is None:
+                    continue
+                projected[client_visible_id] = self.prune_none_fields(
+                    self.build_battle_chunk_sync_data(raw_data, include_meta=False)
+                )
+            return projected
+
+        return {
+            str(object_id): self.prune_none_fields(raw_data if isinstance(raw_data, dict) else {})
+            for object_id, raw_data in scope_map.items()
+            if isinstance(object_id, str) and object_id
+        }
+
     @staticmethod
     def canonical_number(value: float) -> str:
         if not math.isfinite(value):
@@ -1359,6 +1437,19 @@ class ServerState:
             lines.append(f"{node_json}:{cls.canonical_value(data)}")
 
         raw = "\n".join(lines)
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+    @classmethod
+    def state_digest_plain(cls, state_map: Dict[str, dict]) -> str:
+        lines = []
+        for node_id in sorted(state_map.keys()):
+            data = state_map.get(node_id, {})
+            if not isinstance(data, dict):
+                data = {}
+            node_json = json.dumps(str(node_id), ensure_ascii=False, separators=(",", ":"))
+            lines.append(f"{node_json}:{cls.canonical_value(data)}")
+
+        raw = "".join(f"{line}\n" for line in lines)
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
     def build_digests(self) -> dict:

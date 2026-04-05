@@ -182,6 +182,32 @@ class Broadcaster:
             for scope in scopes
         }
 
+    def _build_global_player_sync_node_state(self) -> dict:
+        return {
+            "players": self.state.players,
+            "entities": self.state.entities,
+            "waypoints": self.state.waypoints,
+            "battleChunks": self.state.battle_chunks,
+        }
+
+    def _build_player_sync_view_state(self, node_scope_state: dict) -> dict:
+        return self._compact_scope_state(node_scope_state, self._player_sync_scopes)
+
+    def _build_player_outbound_digest_view(self, sync_view_state: dict) -> dict[str, dict]:
+        return {
+            scope: self.state.build_player_outbound_digest_scope(scope, sync_view_state.get(scope, {}))
+            for scope in self._player_sync_scopes
+        }
+
+    def _build_player_sync_digests(self, sync_view_state: dict) -> dict[str, str]:
+        digest_view = self._build_player_outbound_digest_view(sync_view_state)
+        return {
+            "players": self.state.state_digest_plain(digest_view.get("players", {})),
+            "entities": self.state.state_digest_plain(digest_view.get("entities", {})),
+            "waypoints": self.state.state_digest_plain(digest_view.get("waypoints", {})),
+            "battleChunks": self.state.state_digest_plain(digest_view.get("battleChunks", {})),
+        }
+
     def _has_web_map_patch_changes(self, patch: dict) -> bool:
         return self._has_scope_patch_changes(patch, self._web_map_sync_scopes) or bool(patch.get("meta"))
 
@@ -256,9 +282,9 @@ class Broadcaster:
         if ws is None:
             return
         visible = self._build_visible_state_for_player(player_id)
-        compact_scopes = self._compact_scope_state(visible, self._player_sync_scopes)
-        compact_scopes["playerMarks"] = dict(self.state.player_marks)
-        message = self._build_full_message(compact_scopes)
+        sync_view_state = self._build_player_sync_view_state(visible)
+        sync_view_state["playerMarks"] = dict(self.state.player_marks)
+        message = self._build_full_message(sync_view_state)
         await ws.send_bytes(self._encode_message(message))
 
     async def maybe_send_digest(self, player_id: str, visible_state: dict | None = None) -> None:
@@ -274,14 +300,16 @@ class Broadcaster:
 
         caps["lastDigestSent"] = now
         if visible_state is None:
-            visible_state = self._build_visible_state_for_player(player_id)
+            visible_state = (
+                self._build_visible_state_for_player(player_id)
+                if self.state.requires_scoped_delivery(player_id)
+                else self._build_global_player_sync_node_state()
+            )
+        sync_view_state = self._build_player_sync_view_state(visible_state)
+        hashes = self._build_player_sync_digests(sync_view_state)
+        logger.debug("Sending player digest player=%s source=outbound_projected hashes=%s", player_id, hashes)
         message = DigestPacket(
-            hashes={
-                "players": self.state.state_digest(visible_state["players"]),
-                "entities": self.state.state_digest(visible_state["entities"]),
-                "waypoints": self.state.state_digest(visible_state["waypoints"]),
-                "battleChunks": self.state.state_digest(visible_state["battleChunks"]),
-            },
+            hashes=hashes,
         )
         await ws.send_bytes(self._encode_message(message))
 
@@ -401,23 +429,15 @@ class Broadcaster:
                 if requires_scoped:
                     visible = self._build_visible_state_for_player(player_id)
                     if force_full_to_delta or changed:
-                        compact_scopes = self._compact_scope_state(visible, self._player_sync_scopes)
-                        compact_scopes["playerMarks"] = dict(self.state.player_marks)
-                        full_msg = self._build_full_message(compact_scopes)
+                        sync_view_state = self._build_player_sync_view_state(visible)
+                        sync_view_state["playerMarks"] = dict(self.state.player_marks)
+                        full_msg = self._build_full_message(sync_view_state)
                         await ws.send_bytes(self._encode_message(full_msg))
                     await self.maybe_send_digest(player_id, visible)
                 elif force_full_to_delta:
-                    compact_scopes = self._compact_scope_state(
-                        {
-                            "players": self.state.players,
-                            "entities": self.state.entities,
-                            "waypoints": self.state.waypoints,
-                            "battleChunks": self.state.battle_chunks,
-                        },
-                        self._player_sync_scopes,
-                    )
-                    compact_scopes["playerMarks"] = dict(self.state.player_marks)
-                    full_msg = self._build_full_message(compact_scopes)
+                    sync_view_state = self._build_player_sync_view_state(self._build_global_player_sync_node_state())
+                    sync_view_state["playerMarks"] = dict(self.state.player_marks)
+                    full_msg = self._build_full_message(sync_view_state)
                     encoded = self._encode_message_once(full_msg, encoded_cache, "global_player_full")
                     await ws.send_bytes(encoded)
                 elif changed:

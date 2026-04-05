@@ -51,11 +51,12 @@ from server.uuid_codec import normalize_inbound_uuid_fields
 
 
 NETWORK_PROTOCOL_VERSION = "0.6.1" # 服务器使用的协议版本
-SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.6.0" # 服务器兼容的最低协议版本
+SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.6.1" # 服务器兼容的最低协议版本
 SERVER_PROGRAM_VERSION = "team-view-relay-server-dev"
 LEGACY_PROTOCOL_REJECTION_REASON = (
     "unsupported_protocol_version: "
-    "当前服务器仅支持 Protobuf 协议（0.6.0 及以上）。"
+    "当前服务器仅支持 Protobuf 协议（0.6.1 及以上）。"
+    "battleChunks 同步与一致性修正要求客户端升级到 0.6.1。"
     "MessagePack 协议（0.5.x 及更早版本）已不再支持。"
     "请升级到最新版本的客户端后重试。"
 )
@@ -166,7 +167,7 @@ async def receive_payload(websocket: WebSocket, *, allow_legacy_handshake: bool 
 
         logger.warning(
             "Detected legacy MessagePack handshake (clientProtocol=%s, programVersion=%s). "
-            "This server version only supports Protobuf protocol (0.6.0+). "
+            "This server version only supports Protobuf protocol (0.6.1+). "
             "Please upgrade your client.",
             legacy_handshake.get("networkProtocolVersion", "unknown"),
             legacy_handshake.get("localProgramVersion", "unknown"),
