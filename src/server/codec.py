@@ -29,6 +29,8 @@ _WIRE_PAYLOADS: dict[str, tuple[str, type[Message]]] = {
     "digest": ("digest", teamviewer_pb2.Digest),
     "refresh_request": ("refresh_req", teamviewer_pb2.RefreshRequest),
     "report_rate_hint": ("report_rate_hint", teamviewer_pb2.ReportRateHint),
+    "battle_chunk_meta_request": ("battle_chunk_meta_req", teamviewer_pb2.BattleChunkMetaRequest),
+    "battle_chunk_meta_snapshot": ("battle_chunk_meta_snapshot", teamviewer_pb2.BattleChunkMetaSnapshot),
 }
 
 _PAYLOAD_TO_TYPE: dict[str, str] = {
@@ -176,7 +178,11 @@ def _battle_chunk_ref_from_sources(chunk_id: str | None, data: dict[str, Any] | 
     }
 
 
-def _battle_chunk_value_from_data(data: dict[str, Any] | None) -> dict[str, Any] | None:
+def _battle_chunk_value_from_data(
+    data: dict[str, Any] | None,
+    *,
+    include_meta: bool,
+) -> dict[str, Any] | None:
     if not isinstance(data, dict):
         return None
     color_raw = data.get("colorRaw")
@@ -189,14 +195,23 @@ def _battle_chunk_value_from_data(data: dict[str, Any] | None) -> dict[str, Any]
         ("symbol", "symbol"),
         ("markerType", "markerType"),
         ("colorNote", "colorNote"),
-        ("observedAt", "observedAt"),
-        ("positionSampledAt", "positionSampledAt"),
-        ("alignmentSource", "alignmentSource"),
-        ("reporterId", "reporterId"),
+        ("roomCode", "roomCode"),
+        ("colorMode", "colorMode"),
+        ("colorSemanticKey", "colorSemanticKey"),
     ):
         raw = data.get(source_key)
         if raw is not None:
             value[target_key] = raw
+    if include_meta:
+        for source_key, target_key in (
+            ("observedAt", "observedAt"),
+            ("positionSampledAt", "positionSampledAt"),
+            ("alignmentSource", "alignmentSource"),
+            ("reporterId", "reporterId"),
+        ):
+            raw = data.get(source_key)
+            if raw is not None:
+                value[target_key] = raw
     return value
 
 
@@ -257,7 +272,7 @@ def _battle_chunk_snapshot_to_proto(scope: dict[str, Any] | None) -> list[dict[s
         if not isinstance(chunk_id, str) or not isinstance(raw_data, dict):
             continue
         ref = _battle_chunk_ref_from_sources(chunk_id, raw_data)
-        value = _battle_chunk_value_from_data(raw_data)
+        value = _battle_chunk_value_from_data(raw_data, include_meta=False)
         if ref is None or value is None:
             continue
         entries.append({
@@ -279,7 +294,7 @@ def _battle_chunk_patch_to_proto(scope: dict[str, Any] | None) -> dict[str, Any]
             if not isinstance(chunk_id, str) or not isinstance(patch, dict):
                 continue
             ref = _battle_chunk_ref_from_sources(chunk_id, patch)
-            value = _battle_chunk_value_from_data(patch)
+            value = _battle_chunk_value_from_data(patch, include_meta=False)
             if ref is None or value is None:
                 continue
             proto_upsert.append({
@@ -299,6 +314,24 @@ def _battle_chunk_patch_to_proto(scope: dict[str, Any] | None) -> dict[str, Any]
         if proto_delete:
             proto_scope["delete"] = proto_delete
     return proto_scope or None
+
+
+def _battle_chunk_meta_snapshot_to_proto(scope: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(scope, dict):
+        return {}
+    entries: list[dict[str, Any]] = []
+    for chunk_id, raw_data in scope.items():
+        if not isinstance(chunk_id, str) or not isinstance(raw_data, dict):
+            continue
+        ref = _battle_chunk_ref_from_sources(chunk_id, raw_data)
+        value = _battle_chunk_value_from_data(raw_data, include_meta=True)
+        if ref is None or value is None:
+            continue
+        entries.append({
+            "ref": ref,
+            "data": value,
+        })
+    return {"battleChunks": entries}
 
 
 def _message_to_plain_dict(message: Message) -> dict[str, Any]:
@@ -602,6 +635,7 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
                     value["type"] = "battle_map_observation"
                 elif key == "stateKeepalive":
                     value["type"] = "state_keepalive"
+                    value["battleChunks"] = _battle_chunk_refs_to_local_ids(value.get("battleChunks"))
                 elif key == "sourceStateClear":
                     value["type"] = "source_state_clear"
                 elif key == "waypointsDelete":
@@ -665,6 +699,20 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
         data = _message_to_plain_dict(payload)
         data["battleChunks"] = _battle_chunk_refs_to_local_ids(data.get("battleChunks"))
         data["type"] = "refresh_req"
+        data["_payload_case"] = payload_name
+        return data
+
+    if payload_name == "battle_chunk_meta_request":
+        data = _message_to_plain_dict(payload)
+        data["battleChunks"] = _battle_chunk_refs_to_local_ids(data.get("battleChunks"))
+        data["type"] = "battle_chunk_meta_req"
+        data["_payload_case"] = payload_name
+        return data
+
+    if payload_name == "battle_chunk_meta_snapshot":
+        data = _message_to_plain_dict(payload)
+        data["battleChunks"] = _battle_chunk_entries_to_local_map(data.get("battleChunks"))
+        data["type"] = "battle_chunk_meta_snapshot"
         data["_payload_case"] = payload_name
         return data
 
@@ -826,6 +874,10 @@ def _convert_refresh_request_body(body: dict[str, Any]) -> dict[str, Any]:
     return proto_body
 
 
+def _convert_battle_chunk_meta_snapshot_body(body: dict[str, Any]) -> dict[str, Any]:
+    return _battle_chunk_meta_snapshot_to_proto(body.get("battleChunks"))
+
+
 def _convert_outbound_body(packet_type: str, body: dict[str, Any]) -> tuple[str, int, dict[str, Any]]:
     if packet_type == "handshake":
         channel_name = str(body.get("channel") or "").strip().lower()
@@ -869,6 +921,8 @@ def _convert_outbound_body(packet_type: str, body: dict[str, Any]) -> tuple[str,
         return payload_name, channel, _convert_web_map_ack_body(body)
     if packet_type == "refresh_req":
         return payload_name, channel, _convert_refresh_request_body(body)
+    if packet_type == "battle_chunk_meta_snapshot":
+        return payload_name, channel, _convert_battle_chunk_meta_snapshot_body(body)
 
     proto_body = {
         key: value

@@ -115,7 +115,6 @@ class Broadcaster:
             scope_patch = self.state.compute_scope_patch(
                 self._wrap_plain_scope(old_state.get(scope, {})),
                 self._wrap_plain_scope(new_state.get(scope, {})),
-                full_replace=(scope == "battleChunks"),
             )
             if scope_patch.get("upsert") or scope_patch.get("delete"):
                 patch[scope] = scope_patch
@@ -466,7 +465,7 @@ class Broadcaster:
                 source_id,
                 players=payload.get("players", []),
                 entities=payload.get("entities", []),
-                battle_chunks=[],
+                battle_chunks=payload.get("battleChunks", []),
                 reason="expiry_soon",
                 current_time=current_time,
                 bypass_cooldown=False,

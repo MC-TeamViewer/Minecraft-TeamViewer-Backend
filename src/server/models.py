@@ -79,11 +79,13 @@ class BattleChunkData(BaseModel):
     markerType: Optional[str] = Field(default=None, description="符号语义类型", json_schema_extra={"reliableTransport": True})
     colorRaw: str = Field(default=..., description="原始颜色值", json_schema_extra={"reliableTransport": True})
     colorNote: Optional[str] = Field(default=None, description="颜色备注", json_schema_extra={"reliableTransport": True})
-    observedAt: int = Field(default=..., description="客户端观测时间(ms)", json_schema_extra={"reliableTransport": True})
+    roomCode: Optional[str] = Field(default=None, description="房间号", json_schema_extra={"reliableTransport": True})
+    colorMode: Optional[str] = Field(default=None, description="颜色解释模式", json_schema_extra={"reliableTransport": True})
+    colorSemanticKey: Optional[str] = Field(default=None, description="颜色语义键", json_schema_extra={"reliableTransport": True})
+    observedAt: Optional[int] = Field(default=None, description="客户端观测时间(ms)", json_schema_extra={"reliableTransport": True})
     positionSampledAt: Optional[int] = Field(default=None, description="用于对齐的本地位置采样时间(ms)", json_schema_extra={"reliableTransport": True})
     alignmentSource: Optional[str] = Field(default=None, description="绝对定位对齐来源", json_schema_extra={"reliableTransport": True})
     reporterId: Optional[str] = Field(default=None, description="上报玩家UUID", json_schema_extra={"reliableTransport": True})
-    roomCode: Optional[str] = Field(default=None, description="房间号", json_schema_extra={"reliableTransport": True})
 
     model_config = ConfigDict(extra="ignore")
 

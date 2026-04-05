@@ -14,6 +14,8 @@ from server.broadcaster import Broadcaster
 from server.codec import ProtobufMessageCodec
 from server.models import BattleChunkData, EntityData, PlayerData, WaypointData
 from server.protocol import (
+    BattleChunkMetaRequestPacket,
+    BattleChunkMetaSnapshotPacket,
     BattleMapObservationPacket,
     CommandPlayerMarkClearAllPacket,
     CommandPlayerMarkClearPacket,
@@ -48,7 +50,7 @@ from server.uuid_codec import normalize_inbound_uuid_fields
 
 
 
-NETWORK_PROTOCOL_VERSION = "0.6.0" # 服务器使用的协议版本
+NETWORK_PROTOCOL_VERSION = "0.6.1" # 服务器使用的协议版本
 SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.6.0" # 服务器兼容的最低协议版本
 SERVER_PROGRAM_VERSION = "team-view-relay-server-dev"
 LEGACY_PROTOCOL_REJECTION_REASON = (
@@ -566,6 +568,21 @@ async def web_map_ws(websocket: WebSocket):
                 await broadcaster.send_web_map_snapshot_full(web_map_id)
                 continue
 
+            if isinstance(packet, BattleChunkMetaRequestPacket):
+                requested_chunk_ids = [
+                    chunk_id
+                    for chunk_id in packet.battleChunks[:256]
+                    if isinstance(chunk_id, str) and chunk_id
+                ]
+                await send_packet(
+                    websocket,
+                    BattleChunkMetaSnapshotPacket(
+                        battleChunks=state.select_battle_chunk_meta_snapshot(web_map_room, requested_chunk_ids),
+                    ),
+                    channel="web_map",
+                )
+                continue
+
             if isinstance(packet, CommandPlayerMarkSetPacket):
                 target_player_id = packet.playerId
                 updated_mark = state.set_player_mark(
@@ -953,11 +970,18 @@ async def websocket_endpoint(websocket: WebSocket):
                         submit_player_id,
                         current_time,
                     )
-                    if touched_players or touched_entities:
+                    touched_battle_chunks = state.touch_reports(
+                        state.battle_chunk_reports,
+                        packet.battleChunks,
+                        submit_player_id,
+                        current_time,
+                    )
+                    if touched_players or touched_entities or touched_battle_chunks:
                         logger.debug(
                             "Applied state_keepalive "
                             f"submitPlayerId={submit_player_id} players={touched_players}/{len(packet.players)} "
-                            f"entities={touched_entities}/{len(packet.entities)}"
+                            f"entities={touched_entities}/{len(packet.entities)} "
+                            f"battleChunks={touched_battle_chunks}/{len(packet.battleChunks)}"
                         )
                     continue
 

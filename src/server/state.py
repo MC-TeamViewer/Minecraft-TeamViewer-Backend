@@ -60,6 +60,7 @@ class ServerState:
     DEFAULT_ROOM_CODE = "default"
     WEB_MAP_TACTICAL_SOURCE_PREFIX = "__web_map_tactical__:"
     BATTLE_CHUNK_CACHE_SOURCE_PREFIX = "__battle_chunk_cache__:"
+    BATTLE_CHUNK_COLOR_MODE_RAW_OBSERVED = "raw_observed"
 
     # 服务端配置文件（TOML）路径。
     CONFIG_FILE_NAME = "server_state_config.toml"
@@ -71,6 +72,7 @@ class ServerState:
         self.entities: Dict[str, dict] = {}
         self.waypoints: Dict[str, dict] = {}
         self.battle_chunks: Dict[str, dict] = {}
+        self.battle_chunk_meta: Dict[str, dict] = {}
         self.battle_chunk_cache: Dict[str, dict] = {}
 
         # 原始上报池：object_id -> source_id -> state_node。
@@ -364,6 +366,27 @@ class ServerState:
         normalized["markerType"] = marker_type
         return normalized
 
+    def build_battle_chunk_sync_data(self, payload: dict, *, include_meta: bool) -> dict:
+        if not isinstance(payload, dict):
+            return {}
+        normalized = dict(payload)
+        color_mode = str(normalized.get("colorMode") or "").strip()
+        if not color_mode:
+            normalized["colorMode"] = self.BATTLE_CHUNK_COLOR_MODE_RAW_OBSERVED
+        validated = BattleChunkData(**normalized).model_dump()
+        if not include_meta:
+            for field_name in ("observedAt", "positionSampledAt", "alignmentSource", "reporterId"):
+                validated.pop(field_name, None)
+        return self.apply_battle_chunk_symbol_rules(validated)
+
+    @staticmethod
+    def clone_state_node_with_data(node: dict, data: dict) -> dict:
+        return {
+            "timestamp": ServerState.node_timestamp(node),
+            "submitPlayerId": node.get("submitPlayerId") if isinstance(node, dict) else None,
+            "data": dict(data) if isinstance(data, dict) else {},
+        }
+
     def normalize_battle_chunk_node(self, node: dict) -> dict:
         if not isinstance(node, dict):
             return node
@@ -371,7 +394,7 @@ class ServerState:
         if not isinstance(data, dict):
             return node
         normalized = dict(node)
-        normalized["data"] = self.apply_battle_chunk_symbol_rules(data)
+        normalized["data"] = self.build_battle_chunk_sync_data(data, include_meta=True)
         return normalized
 
     @staticmethod
@@ -787,10 +810,50 @@ class ServerState:
             projected[chunk_id] = {
                 "chunkX": absolute_chunk_x,
                 "chunkZ": absolute_chunk_z,
+                "dimension": dimension,
                 "symbol": cell.get("symbol"),
                 "colorRaw": str(cell.get("colorRaw") or "").strip() or "#FFFFFF",
+                "colorNote": None,
+                "roomCode": room_code,
+                "colorMode": self.BATTLE_CHUNK_COLOR_MODE_RAW_OBSERVED,
+                "colorSemanticKey": None,
             }
         return projected
+
+    def build_battle_chunk_semantic_projection_hash(self, projected: dict[str, dict]) -> str:
+        normalized_projection = {
+            chunk_id: self.build_battle_chunk_sync_data(chunk_data, include_meta=False)
+            for chunk_id, chunk_data in projected.items()
+            if isinstance(chunk_id, str) and chunk_id and isinstance(chunk_data, dict)
+        }
+        raw = self.canonical_value(normalized_projection)
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+    def touch_battle_chunk_report_meta(
+        self,
+        chunk_id: str,
+        source_id: str,
+        current_time: float,
+        snapshot_observed_at: int,
+        candidate: dict,
+    ) -> bool:
+        source_bucket = self.battle_chunk_reports.get(chunk_id)
+        if not isinstance(source_bucket, dict):
+            return False
+        node = source_bucket.get(source_id)
+        if not isinstance(node, dict):
+            return False
+        data = node.get("data")
+        if not isinstance(data, dict):
+            return False
+        refreshed = dict(data)
+        refreshed["observedAt"] = int(snapshot_observed_at)
+        refreshed["positionSampledAt"] = candidate.get("positionSampledAt")
+        refreshed["alignmentSource"] = candidate.get("source")
+        refreshed["reporterId"] = source_id
+        node["data"] = self.build_battle_chunk_sync_data(refreshed, include_meta=True)
+        node["timestamp"] = float(current_time)
+        return True
 
     def choose_battle_map_candidate(
         self,
@@ -920,25 +983,7 @@ class ServerState:
         if not normalized_candidates or not normalized_cells:
             return {"accepted": False, "reason": "empty_observation", "upserted": 0}
 
-        observation_hash = self.build_battle_map_observation_hash(
-            normalized_dimension,
-            int(map_size),
-            int(anchor_row),
-            int(anchor_col),
-            int(snapshot_observed_at),
-            normalized_candidates,
-            normalized_cells,
-        )
         reporter_state = self.battle_map_reporter_state.get(submit_player_id, {})
-        last_snapshot_observed_at = reporter_state.get("lastSnapshotObservedAt")
-        last_observation_hash = reporter_state.get("lastObservationHash")
-        if (
-            isinstance(last_snapshot_observed_at, int)
-            and isinstance(last_observation_hash, str)
-            and last_observation_hash == observation_hash
-            and int(snapshot_observed_at) <= last_snapshot_observed_at
-        ):
-            return {"accepted": False, "reason": "duplicate_observation", "upserted": 0}
 
         chosen_candidate, decision_reason = self.choose_battle_map_candidate(
             submit_player_id,
@@ -958,6 +1003,7 @@ class ServerState:
             chosen_candidate["baseChunkZ"],
             normalized_cells,
         )
+        semantic_hash = self.build_battle_chunk_semantic_projection_hash(projected)
         previous_projected_chunk_ids = set()
         if isinstance(reporter_state.get("lastProjectedChunkIds"), list):
             previous_projected_chunk_ids = {
@@ -971,38 +1017,44 @@ class ServerState:
             self.delete_report(self.battle_chunk_reports, stale_chunk_id, submit_player_id)
 
         upserted = 0
-        for chunk_id, cell in projected.items():
-            payload = {
-                "chunkX": cell["chunkX"],
-                "chunkZ": cell["chunkZ"],
-                "dimension": normalized_dimension,
-                "symbol": cell["symbol"],
-                "colorRaw": cell["colorRaw"],
-                "colorNote": None,
-                "observedAt": int(snapshot_observed_at),
-                "positionSampledAt": chosen_candidate["positionSampledAt"],
-                "alignmentSource": chosen_candidate["source"],
-                "reporterId": submit_player_id,
-                "roomCode": normalized_room,
-            }
-            normalized_payload = BattleChunkData(**payload).model_dump()
-            normalized_payload = self.apply_battle_chunk_symbol_rules(normalized_payload)
-            node = self.build_state_node(submit_player_id, now, normalized_payload)
-            self.upsert_report(self.battle_chunk_reports, chunk_id, submit_player_id, node)
-            upserted += 1
+        semantic_unchanged = (
+            reporter_state.get("lastSemanticProjectionHash") == semantic_hash
+            and previous_projected_chunk_ids == current_projected_chunk_ids
+        )
+
+        if semantic_unchanged:
+            for chunk_id in current_projected_chunk_ids:
+                self.touch_battle_chunk_report_meta(
+                    chunk_id,
+                    submit_player_id,
+                    now,
+                    int(snapshot_observed_at),
+                    chosen_candidate,
+                )
+        else:
+            for chunk_id, cell in projected.items():
+                payload = dict(cell)
+                payload["observedAt"] = int(snapshot_observed_at)
+                payload["positionSampledAt"] = chosen_candidate["positionSampledAt"]
+                payload["alignmentSource"] = chosen_candidate["source"]
+                payload["reporterId"] = submit_player_id
+                normalized_payload = self.build_battle_chunk_sync_data(payload, include_meta=True)
+                node = self.build_state_node(submit_player_id, now, normalized_payload)
+                self.upsert_report(self.battle_chunk_reports, chunk_id, submit_player_id, node)
+                upserted += 1
 
         self.battle_map_reporter_state[submit_player_id] = {
             "lastAcceptedBaseChunkX": chosen_candidate["baseChunkX"],
             "lastAcceptedBaseChunkZ": chosen_candidate["baseChunkZ"],
             "lastAcceptedDimension": normalized_dimension,
             "lastSnapshotObservedAt": int(snapshot_observed_at),
-            "lastObservationHash": observation_hash,
+            "lastSemanticProjectionHash": semantic_hash,
             "lastParsedAt": int(parsed_at),
             "lastProjectedChunkIds": sorted(current_projected_chunk_ids),
         }
         return {
             "accepted": True,
-            "reason": decision_reason,
+            "reason": "semantic_unchanged" if semantic_unchanged else decision_reason,
             "upserted": upserted,
         }
 
@@ -1069,6 +1121,24 @@ class ServerState:
             filtered[object_id] = node
 
         return filtered
+
+    def select_battle_chunk_meta_snapshot(self, room_code: str, chunk_ids: list[str]) -> Dict[str, dict]:
+        visible_meta = self.filter_battle_chunk_state_by_sources_and_room(
+            self.battle_chunk_meta,
+            self.get_active_sources_in_room(room_code),
+            room_code,
+        )
+        selected: Dict[str, dict] = {}
+        for chunk_id in chunk_ids:
+            if not isinstance(chunk_id, str) or not chunk_id:
+                continue
+            node = visible_meta.get(chunk_id)
+            if not isinstance(node, dict):
+                continue
+            data = node.get("data")
+            if isinstance(data, dict):
+                selected[chunk_id] = dict(data)
+        return selected
 
     def build_web_map_tab_snapshot(self, room_code: Optional[str] = None) -> dict:
         self.cleanup_tab_reports()
@@ -1472,15 +1542,18 @@ class ServerState:
                 continue
 
             room_code = self.normalize_room_code(data.get("roomCode"))
-            cached_data = self.apply_battle_chunk_symbol_rules(data)
-            cached_data["roomCode"] = room_code
+            cached_data = self.build_battle_chunk_sync_data({**data, "roomCode": room_code}, include_meta=True)
             self.battle_chunk_cache[chunk_id] = self.build_state_node(
                 self.build_battle_chunk_cache_source_id(room_code),
                 now,
                 cached_data,
             )
 
-    def build_effective_battle_chunk_state(self, active_battle_chunks: Dict[str, dict], current_time: Optional[float] = None) -> Dict[str, dict]:
+    def build_effective_battle_chunk_states(
+        self,
+        active_battle_chunks: Dict[str, dict],
+        current_time: Optional[float] = None,
+    ) -> tuple[Dict[str, dict], Dict[str, dict]]:
         now = time.time() if current_time is None else float(current_time)
         self.update_battle_chunk_cache(active_battle_chunks, now)
 
@@ -1494,7 +1567,19 @@ class ServerState:
             for chunk_id, node in active_battle_chunks.items()
             if isinstance(node, dict)
         })
-        return effective
+        core_state: Dict[str, dict] = {}
+        meta_state: Dict[str, dict] = {}
+        for chunk_id, node in effective.items():
+            data = node.get("data") if isinstance(node, dict) else None
+            if not isinstance(data, dict):
+                continue
+            core_data = self.build_battle_chunk_sync_data(data, include_meta=False)
+            meta_data = self.build_battle_chunk_sync_data(data, include_meta=True)
+            if core_data:
+                core_state[chunk_id] = self.clone_state_node_with_data(node, core_data)
+            if meta_data:
+                meta_state[chunk_id] = self.clone_state_node_with_data(node, meta_data)
+        return core_state, meta_state
 
     @classmethod
     def resolve_report_map(
@@ -1622,13 +1707,13 @@ class ServerState:
             self.SOURCE_SWITCH_THRESHOLD_SEC,
             prefer_object_id_source=False,
         )
-        self.battle_chunks = self.build_effective_battle_chunk_state(active_battle_chunks, current_time)
+        self.battle_chunks, self.battle_chunk_meta = self.build_effective_battle_chunk_states(active_battle_chunks, current_time)
 
         return {
             "players": self.compute_scope_patch(old_players, self.players),
             "entities": self.compute_scope_patch(old_entities, self.entities),
             "waypoints": self.compute_scope_patch(old_waypoints, self.waypoints),
-            "battleChunks": self.compute_scope_patch(old_battle_chunks, self.battle_chunks, full_replace=True),
+            "battleChunks": self.compute_scope_patch(old_battle_chunks, self.battle_chunks),
         }
 
     @staticmethod
@@ -1790,13 +1875,14 @@ class ServerState:
           submit_player_id: {
             "players": [player_id, ...],
             "entities": [entity_id, ...],
+            "battleChunks": [chunk_id, ...],
           }
         }
         """
         requests: Dict[str, dict] = {}
 
         def maybe_add(scope: str, source_id: str, object_id: str) -> None:
-            payload = requests.setdefault(source_id, {"players": [], "entities": []})
+            payload = requests.setdefault(source_id, {"players": [], "entities": [], "battleChunks": []})
             items = payload[scope]
             if len(items) >= self.REFRESH_REQUEST_MAX_ITEMS_PER_SCOPE:
                 return
@@ -1839,11 +1925,12 @@ class ServerState:
 
         scan_scope("players", self.player_reports, lambda node: self.PLAYER_TIMEOUT)
         scan_scope("entities", self.entity_reports, lambda node: self.ENTITY_TIMEOUT)
+        scan_scope("battleChunks", self.battle_chunk_reports, lambda node: self.BATTLE_CHUNK_TIMEOUT)
 
         # 过滤空 payload
         filtered: Dict[str, dict] = {}
         for source_id, payload in requests.items():
-            if payload["players"] or payload["entities"]:
+            if payload["players"] or payload["entities"] or payload["battleChunks"]:
                 filtered[source_id] = payload
 
         return filtered

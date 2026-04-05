@@ -123,6 +123,7 @@ class StateKeepalivePacket(PacketModel):
     submitPlayerId: str | None = None
     players: list[str] = Field(default_factory=list)
     entities: list[str] = Field(default_factory=list)
+    battleChunks: list[str] = Field(default_factory=list)
 
 
 class SourceStateClearPacket(PacketModel):
@@ -169,6 +170,11 @@ class BattleMapObservationPacket(PacketModel):
     cells: list[BattleMapObservationCell] = Field(default_factory=list)
 
 
+class BattleChunkMetaRequestPacket(PacketModel):
+    type: Literal["battle_chunk_meta_req"]
+    battleChunks: list[str] = Field(default_factory=list)
+
+
 class ScopePatchPacket(PacketModel):
     upsert: dict[str, dict[str, Any]] = Field(default_factory=dict)
     delete: list[str] = Field(default_factory=list)
@@ -196,6 +202,7 @@ WebMapInboundPacket = Annotated[
     HandshakePacket
     | PingPacket
     | ResyncRequestPacket
+    | BattleChunkMetaRequestPacket
     | CommandPlayerMarkSetPacket
     | CommandPlayerMarkClearPacket
     | CommandPlayerMarkClearAllPacket
@@ -389,3 +396,9 @@ class ReportRateHintPacket(OutboundPacket):
     reportIntervalTicks: int
     broadcastHz: float
     reason: str | None = None
+
+
+class BattleChunkMetaSnapshotPacket(OutboundPacket):
+    type: Literal["battle_chunk_meta_snapshot"] = "battle_chunk_meta_snapshot"
+    channel: str | None = None
+    battleChunks: dict[str, Any] = Field(default_factory=dict)
