@@ -1,4 +1,8 @@
 <script setup lang="ts">
+import ElButton from "element-plus/es/components/button/index";
+import ElSegmented from "element-plus/es/components/segmented/index";
+import { ElCheckboxButton, ElCheckboxGroup } from "element-plus/es/components/checkbox/index";
+import { ElOption, ElSelect } from "element-plus/es/components/select/index";
 import { computed } from "vue";
 import type { CheckboxValueType } from "element-plus";
 

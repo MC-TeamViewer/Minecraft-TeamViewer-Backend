@@ -26,6 +26,13 @@ export interface OverviewPayload {
   dbPathMasked: string;
   broadcastHz: number;
   hourlyPeak24h: number;
+  observability: {
+    sseSubscribers: number;
+    lastRetentionCleanup: string | null;
+    apiErrors: number;
+    sseErrors: number;
+    trustProxyHeaders: boolean;
+  };
   serverTime?: number;
 }
 
@@ -66,6 +73,7 @@ export interface AuditPayload {
   items: AuditItem[];
   nextBeforeId: number | null;
   limit: number;
+  availableEventTypes: string[];
   serverTime?: number;
 }
 
@@ -73,6 +81,17 @@ export interface AuditFilters {
   eventType: string;
   actorTypes: string[];
   success: "" | "true" | "false";
+}
+
+export interface MetricsFilters {
+  roomCode: string;
+  dailyDays: number;
+  hourlyHours: number;
+}
+
+export interface DashboardFilters {
+  audit: AuditFilters;
+  metrics: MetricsFilters;
 }
 
 export interface BootstrapPayload {
@@ -90,3 +109,17 @@ export const DEFAULT_AUDIT_FILTERS: AuditFilters = {
   actorTypes: ["player", "web_map", "system"],
   success: "",
 };
+
+export const DEFAULT_METRICS_FILTERS: MetricsFilters = {
+  roomCode: "",
+  dailyDays: 30,
+  hourlyHours: 48,
+};
+
+export const DEFAULT_DASHBOARD_FILTERS: DashboardFilters = {
+  audit: DEFAULT_AUDIT_FILTERS,
+  metrics: DEFAULT_METRICS_FILTERS,
+};
+
+export const DAILY_RANGE_OPTIONS = [7, 14, 30, 60, 90];
+export const HOURLY_RANGE_OPTIONS = [12, 24, 48, 72, 168];

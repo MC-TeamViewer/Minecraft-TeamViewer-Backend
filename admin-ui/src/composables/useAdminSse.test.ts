@@ -1,6 +1,6 @@
 import { effectScope } from "vue";
 
-import { DEFAULT_AUDIT_FILTERS } from "@/types";
+import { DEFAULT_AUDIT_FILTERS, DEFAULT_METRICS_FILTERS } from "@/types";
 import { buildAdminEventsUrl, useAdminSse, type EventSourceLike } from "@/composables/useAdminSse";
 
 class MockEventSource implements EventSourceLike {
@@ -44,13 +44,18 @@ describe("buildAdminEventsUrl", () => {
   it("encodes repeated actorTypes in the SSE url", () => {
     const url = new URL(
       buildAdminEventsUrl(
-        { ...DEFAULT_AUDIT_FILTERS, actorTypes: ["player", "system"], success: "false" },
+        {
+          audit: { ...DEFAULT_AUDIT_FILTERS, actorTypes: ["player", "system"], success: "false" },
+          metrics: { ...DEFAULT_METRICS_FILTERS, roomCode: "room-a", dailyDays: 14, hourlyHours: 24 },
+        },
         "http://testserver",
       ),
     );
 
     expect(url.searchParams.getAll("auditActorTypes")).toEqual(["player", "system"]);
     expect(url.searchParams.get("auditSuccess")).toBe("false");
+    expect(url.searchParams.get("dailyRoomCode")).toBe("room-a");
+    expect(url.searchParams.get("dailyDays")).toBe("14");
   });
 });
 
@@ -74,7 +79,10 @@ describe("useAdminSse", () => {
     const scope = effectScope();
     const api = scope.run(() =>
       useAdminSse({
-        getAuditFilters: () => DEFAULT_AUDIT_FILTERS,
+        getDashboardFilters: () => ({
+          audit: DEFAULT_AUDIT_FILTERS,
+          metrics: DEFAULT_METRICS_FILTERS,
+        }),
         onBootstrap,
         onOverview,
         onDailyMetrics,
@@ -87,17 +95,30 @@ describe("useAdminSse", () => {
 
     expect(api).toBeTruthy();
     api!.connect();
+    const bootstrapPromise = api!.waitForBootstrap(500);
     expect(MockEventSource.instances).toHaveLength(1);
     MockEventSource.instances[0].emit("open", {});
     expect(api!.status.value).toBe("live");
 
     MockEventSource.instances[0].emit("bootstrap", {
       serverTime: 1,
-      overview: { playerConnections: 0, webMapConnections: 0, activeRooms: 0, rooms: [], connectionDetails: [], timezone: "UTC", dbPathMasked: ".../teamviewer-admin.db", broadcastHz: 10, hourlyPeak24h: 0 },
+      overview: {
+        playerConnections: 0,
+        webMapConnections: 0,
+        activeRooms: 0,
+        rooms: [],
+        connectionDetails: [],
+        timezone: "UTC",
+        dbPathMasked: ".../teamviewer-admin.db",
+        broadcastHz: 10,
+        hourlyPeak24h: 0,
+        observability: { sseSubscribers: 1, lastRetentionCleanup: null, apiErrors: 0, sseErrors: 0, trustProxyHeaders: false },
+      },
       dailyMetrics: { timezone: "UTC", roomCode: null, items: [] },
       hourlyMetrics: { timezone: "UTC", roomCode: null, items: [] },
-      audit: { items: [], nextBeforeId: null, limit: 100 },
+      audit: { items: [], nextBeforeId: null, limit: 100, availableEventTypes: [] },
     });
+    await expect(bootstrapPromise).resolves.toBe(true);
     expect(onBootstrap).toHaveBeenCalledTimes(1);
 
     MockEventSource.instances[0].fail();

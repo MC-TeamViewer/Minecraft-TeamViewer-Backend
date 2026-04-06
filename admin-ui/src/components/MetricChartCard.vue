@@ -1,31 +1,34 @@
 <script setup lang="ts">
+import ElCard from "element-plus/es/components/card/index";
 import { BarChart } from "echarts/charts";
-import {
-  GridComponent,
-  LegendComponent,
-  TitleComponent,
-  TooltipComponent,
-} from "echarts/components";
-import { CanvasRenderer } from "echarts/renderers";
+import { GridComponent, TitleComponent, TooltipComponent } from "echarts/components";
 import * as echarts from "echarts/core";
+import { CanvasRenderer } from "echarts/renderers";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { buildBarChartOption } from "@/charts";
 import type { MetricsPayload } from "@/types";
 
-echarts.use([BarChart, GridComponent, LegendComponent, TitleComponent, TooltipComponent, CanvasRenderer]);
-
 const props = defineProps<{
   title: string;
   description: string;
   metrics: MetricsPayload | null;
+  loading?: boolean;
 }>();
+
+echarts.use([BarChart, GridComponent, TitleComponent, TooltipComponent, CanvasRenderer]);
 
 const chartEl = ref<HTMLDivElement | null>(null);
 let chart: echarts.ECharts | null = null;
 let resizeObserver: ResizeObserver | null = null;
+let intersectionObserver: IntersectionObserver | null = null;
+const isVisible = ref(false);
+let chartSignature = "";
 
 const metaText = computed(() => {
+  if (props.loading) {
+    return "筛选更新中";
+  }
   if (!props.metrics) {
     return "加载中";
   }
@@ -35,19 +38,60 @@ const metaText = computed(() => {
   return `${props.metrics.timezone} · 最新 ${latest} · 峰值 ${max}`;
 });
 
-const renderChart = () => {
-  if (!chartEl.value) {
-    return;
+function buildSignature(metrics: MetricsPayload | null): string {
+  return JSON.stringify({
+    roomCode: metrics?.roomCode ?? "",
+    days: metrics?.days ?? null,
+    hours: metrics?.hours ?? null,
+    itemLength: metrics?.items.length ?? 0,
+  });
+}
+
+function disposeChart() {
+  if (chart) {
+    chart.dispose();
+    chart = null;
   }
-  if (!chart) {
+}
+
+function ensureChart() {
+  if (!chart && chartEl.value) {
     chart = echarts.init(chartEl.value);
   }
-  chart.setOption(buildBarChartOption(props.metrics), true);
-  chart.resize();
+}
+
+const renderChart = async (forceRebuild = false) => {
+  if (!isVisible.value || !chartEl.value) {
+    return;
+  }
+  if (props.loading || !props.metrics) {
+    chart?.clear();
+    return;
+  }
+
+  const nextSignature = buildSignature(props.metrics);
+  if (forceRebuild || nextSignature !== chartSignature) {
+    disposeChart();
+    chartSignature = nextSignature;
+  }
+
+  ensureChart();
+  chart?.clear();
+  chart?.setOption(buildBarChartOption(props.metrics), true);
+  chart?.resize();
 };
 
 onMounted(() => {
-  renderChart();
+  if (chartEl.value) {
+    intersectionObserver = new IntersectionObserver((entries) => {
+      const visible = entries.some((entry) => entry.isIntersecting);
+      if (visible && !isVisible.value) {
+        isVisible.value = true;
+        void renderChart(true);
+      }
+    });
+    intersectionObserver.observe(chartEl.value);
+  }
   if (chartEl.value) {
     resizeObserver = new ResizeObserver(() => {
       chart?.resize();
@@ -57,16 +101,17 @@ onMounted(() => {
 });
 
 watch(
-  () => props.metrics,
+  () => [props.metrics, props.loading] as const,
   () => {
-    renderChart();
+    void renderChart();
   },
   { deep: true },
 );
 
 onBeforeUnmount(() => {
+  intersectionObserver?.disconnect();
   resizeObserver?.disconnect();
-  chart?.dispose();
+  disposeChart();
 });
 </script>
 
@@ -81,6 +126,10 @@ onBeforeUnmount(() => {
         <span class="chart-meta">{{ metaText }}</span>
       </div>
     </template>
-    <div ref="chartEl" class="chart-host" />
+    <div ref="chartEl" class="chart-host">
+      <div v-if="!isVisible || loading || !metrics" class="chart-placeholder chart-placeholder-overlay">
+        {{ !isVisible ? "图表进入可视区域后加载" : loading ? "筛选更新中" : "暂无图表数据" }}
+      </div>
+    </div>
   </el-card>
 </template>

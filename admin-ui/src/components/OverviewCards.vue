@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import ElCard from "element-plus/es/components/card/index";
 import { computed } from "vue";
 
 import type { OverviewPayload } from "@/types";

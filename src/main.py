@@ -5,11 +5,9 @@ import logging
 import os
 import secrets
 import asyncio
-import ipaddress
 import time
 import uuid
 from contextlib import asynccontextmanager
-from functools import lru_cache
 from pathlib import Path
 
 import msgpack
@@ -18,6 +16,9 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 from pydantic import ValidationError
 
 from server.admin_frontend import ADMIN_UI_INDEX_PATH, admin_ui_ready, resolve_admin_asset_path
+from server.admin_models import AdminObservabilityPayload
+from server.admin_payloads import AdminPayloadService
+from server.admin_proxy_ip import get_request_remote_addr, get_websocket_remote_addr, parse_bool_env
 from server.admin_sse import AdminSseHub
 from server.admin_store import AdminStore, AdminStoreConfig
 from server.broadcaster import Broadcaster
@@ -89,10 +90,16 @@ logger = logging.getLogger("teamviewrelay.main")
 
 message_codec = ProtobufMessageCodec()
 admin_store: AdminStore | None = None
+admin_payload_service: AdminPayloadService | None = None
 admin_retention_task: asyncio.Task | None = None
 admin_sse_hub = AdminSseHub()
 web_map_connection_meta: dict[str, dict] = {}
 DEFAULT_ADMIN_DB_PATH = "./data/teamviewer-admin.db"
+admin_runtime_stats = {
+    "lastRetentionCleanup": None,
+    "apiErrors": 0,
+    "sseErrors": 0,
+}
 
 
 def parse_positive_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -106,13 +113,6 @@ def parse_positive_int_env(name: str, default: int, *, minimum: int, maximum: in
     return max(minimum, min(value, maximum))
 
 
-def parse_bool_env(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-
 def build_admin_store_config() -> AdminStoreConfig:
     return AdminStoreConfig(
         db_path=os.getenv("TEAMVIEWER_DB_PATH", DEFAULT_ADMIN_DB_PATH),
@@ -122,103 +122,14 @@ def build_admin_store_config() -> AdminStoreConfig:
     )
 
 
-def get_remote_addr_from_client(client) -> str | None:
-    host = getattr(client, "host", None)
-    if isinstance(host, str) and host.strip():
-        return host
-    return None
-
-
-def normalize_ip_text(value: str | None) -> str | None:
-    text = str(value or "").strip().strip('"')
-    if not text:
-        return None
-
-    if text.startswith("[") and "]" in text:
-        text = text[1:text.index("]")]
-
-    try:
-        return str(ipaddress.ip_address(text))
-    except ValueError:
-        pass
-
-    if text.count(":") == 1 and "." in text:
-        host, _, _port = text.rpartition(":")
-        try:
-            return str(ipaddress.ip_address(host))
-        except ValueError:
-            return None
-
-    return None
-
-
-def extract_client_ip_from_headers(headers) -> str | None:
-    if headers is None:
-        return None
-
-    x_forwarded_for = headers.get("x-forwarded-for")
-    if isinstance(x_forwarded_for, str):
-        for item in x_forwarded_for.split(","):
-            normalized = normalize_ip_text(item)
-            if normalized:
-                return normalized
-
-    x_real_ip = headers.get("x-real-ip")
-    if isinstance(x_real_ip, str):
-        normalized = normalize_ip_text(x_real_ip)
-        if normalized:
-            return normalized
-
-    return None
-
-
-@lru_cache(maxsize=1)
-def get_trusted_proxy_networks() -> tuple[ipaddress._BaseNetwork, ...]:
-    raw_value = os.getenv(
-        "TEAMVIEWER_TRUSTED_PROXY_CIDRS",
-        "127.0.0.1/32,::1/128,172.16.0.0/12",
-    )
-    networks: list[ipaddress._BaseNetwork] = []
-
-    for raw_item in str(raw_value).split(","):
-        item = raw_item.strip()
-        if not item:
-            continue
-        try:
-            networks.append(ipaddress.ip_network(item, strict=False))
-        except ValueError:
-            logger.warning("Ignore invalid TEAMVIEWER_TRUSTED_PROXY_CIDRS entry: %s", item)
-
-    return tuple(networks)
-
-
-def should_trust_proxy_headers(client_host: str | None) -> bool:
-    if not parse_bool_env("TEAMVIEWER_TRUST_PROXY_HEADERS", False):
-        return False
-
-    normalized = normalize_ip_text(client_host)
-    if normalized is None:
-        return False
-
-    ip_obj = ipaddress.ip_address(normalized)
-    return any(ip_obj in network for network in get_trusted_proxy_networks())
-
-
-def get_effective_remote_addr(client, headers=None) -> str | None:
-    direct_addr = get_remote_addr_from_client(client)
-    if not should_trust_proxy_headers(direct_addr):
-        return direct_addr
-
-    forwarded_addr = extract_client_ip_from_headers(headers)
-    return forwarded_addr or direct_addr
-
-
-def get_request_remote_addr(request: Request) -> str | None:
-    return get_effective_remote_addr(request.client, request.headers)
-
-
-def get_websocket_remote_addr(websocket: WebSocket) -> str | None:
-    return get_effective_remote_addr(websocket.client, websocket.headers)
+def get_admin_observability_payload() -> AdminObservabilityPayload:
+    return {
+        "sseSubscribers": admin_sse_hub.subscriber_count(),
+        "lastRetentionCleanup": admin_runtime_stats["lastRetentionCleanup"],
+        "apiErrors": int(admin_runtime_stats["apiErrors"]),
+        "sseErrors": int(admin_runtime_stats["sseErrors"]),
+        "trustProxyHeaders": parse_bool_env("TEAMVIEWER_TRUST_PROXY_HEADERS", False),
+    }
 
 
 def admin_ui_unavailable_response() -> PlainTextResponse:
@@ -438,36 +349,21 @@ def build_connection_details() -> list[dict]:
 
 
 async def build_admin_overview_payload() -> dict:
-    if admin_store is None:
+    if admin_payload_service is None:
         raise RuntimeError("admin_store_unavailable")
-
-    rooms = build_room_overview()
-    connection_details = build_connection_details()
-    hourly_metrics = await admin_store.query_hourly_metrics(hours=24)
-    hourly_peak = max((item["activePlayers"] for item in hourly_metrics["items"]), default=0)
-    return {
-        "playerConnections": len(state.connections),
-        "webMapConnections": len(state.web_map_connections),
-        "activeRooms": len(rooms),
-        "rooms": rooms,
-        "connectionDetails": connection_details,
-        "timezone": admin_store.timezone_label,
-        "dbPathMasked": admin_store.masked_db_path,
-        "broadcastHz": state.broadcast_hz,
-        "hourlyPeak24h": hourly_peak,
-    }
+    return await admin_payload_service.build_overview_payload()
 
 
 async def build_admin_daily_metrics_payload(days: int = 30, room_code: str | None = None) -> dict:
-    if admin_store is None:
+    if admin_payload_service is None:
         raise RuntimeError("admin_store_unavailable")
-    return await admin_store.query_daily_metrics(days=days, room_code=room_code)
+    return await admin_payload_service.build_daily_metrics_payload(days=days, room_code=room_code)
 
 
 async def build_admin_hourly_metrics_payload(hours: int = 48, room_code: str | None = None) -> dict:
-    if admin_store is None:
+    if admin_payload_service is None:
         raise RuntimeError("admin_store_unavailable")
-    return await admin_store.query_hourly_metrics(hours=hours, room_code=room_code)
+    return await admin_payload_service.build_hourly_metrics_payload(hours=hours, room_code=room_code)
 
 
 async def build_admin_audit_payload(
@@ -479,9 +375,9 @@ async def build_admin_audit_payload(
     actor_types: list[str] | tuple[str, ...] | None = None,
     success: bool | None = None,
 ) -> dict:
-    if admin_store is None:
+    if admin_payload_service is None:
         raise RuntimeError("admin_store_unavailable")
-    return await admin_store.query_audit_events(
+    return await admin_payload_service.build_audit_payload(
         limit=limit,
         before_id=before_id,
         event_type=event_type,
@@ -497,25 +393,23 @@ async def build_admin_bootstrap_payload(
     audit_event_type: str | None = None,
     audit_actor_types: tuple[str, ...] = (),
     audit_success: bool | None = None,
+    daily_days: int = 30,
+    daily_room_code: str | None = None,
+    hourly_hours: int = 48,
+    hourly_room_code: str | None = None,
 ) -> dict:
-    overview, daily_metrics, hourly_metrics, audit = await asyncio.gather(
-        build_admin_overview_payload(),
-        build_admin_daily_metrics_payload(days=30),
-        build_admin_hourly_metrics_payload(hours=48),
-        build_admin_audit_payload(
-            limit=audit_limit,
-            event_type=audit_event_type,
-            actor_types=audit_actor_types,
-            success=audit_success,
-        ),
+    if admin_payload_service is None:
+        raise RuntimeError("admin_store_unavailable")
+    return await admin_payload_service.build_bootstrap_payload(
+        audit_limit=audit_limit,
+        audit_event_type=audit_event_type,
+        audit_actor_types=audit_actor_types,
+        audit_success=audit_success,
+        daily_days=daily_days,
+        daily_room_code=daily_room_code,
+        hourly_hours=hourly_hours,
+        hourly_room_code=hourly_room_code,
     )
-    return {
-        "serverTime": time.time(),
-        "overview": overview,
-        "dailyMetrics": daily_metrics,
-        "hourlyMetrics": hourly_metrics,
-        "audit": audit,
-    }
 
 
 def format_sse_event(event_name: str, payload: dict) -> str:
@@ -523,15 +417,21 @@ def format_sse_event(event_name: str, payload: dict) -> str:
 
 
 def trigger_admin_sse_overview() -> None:
+    if admin_payload_service is not None:
+        admin_payload_service.invalidate("overview")
     asyncio.create_task(admin_sse_hub.broadcast("overview"))
 
 
 def trigger_admin_sse_metrics() -> None:
+    if admin_payload_service is not None:
+        admin_payload_service.invalidate("daily_metrics", "hourly_metrics")
     admin_sse_hub.schedule_broadcast("daily_metrics", delay_sec=1.0)
     admin_sse_hub.schedule_broadcast("hourly_metrics", delay_sec=1.0)
 
 
 def trigger_admin_sse_audit() -> None:
+    if admin_payload_service is not None:
+        admin_payload_service.invalidate("audit")
     admin_sse_hub.schedule_broadcast("audit", delay_sec=1.0)
 
 async def send_packet(websocket: WebSocket, packet, *, channel: str | None = None) -> None:
@@ -902,11 +802,13 @@ async def run_admin_retention_scheduler() -> None:
         try:
             if admin_store is not None:
                 cleanup = await admin_store.cleanup_retention()
+                admin_runtime_stats["lastRetentionCleanup"] = json.dumps(cleanup, ensure_ascii=False)
                 logger.info("Admin retention cleanup completed: %s", cleanup)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.exception("Admin retention cleanup error: %s", exc)
+            admin_runtime_stats["apiErrors"] += 1
             await record_audit_event(
                 event_type="backend_error",
                 actor_type="system",
@@ -923,10 +825,21 @@ async def run_admin_retention_scheduler() -> None:
 # HTTP/WS 入口层：仅做协议收发与调度，不承载核心仲裁逻辑。
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global admin_retention_task, admin_store, broadcast_task
+    global admin_retention_task, admin_store, admin_payload_service, broadcast_task
     admin_store = AdminStore(build_admin_store_config())
     await admin_store.initialize()
+    admin_payload_service = AdminPayloadService(
+        admin_store=admin_store,
+        build_room_overview=build_room_overview,
+        build_connection_details=build_connection_details,
+        get_broadcast_hz=lambda: state.broadcast_hz,
+        get_sse_subscriber_count=admin_sse_hub.subscriber_count,
+        get_observability_payload=get_admin_observability_payload,
+    )
     cleanup = await admin_store.cleanup_retention()
+    admin_runtime_stats["lastRetentionCleanup"] = json.dumps(cleanup, ensure_ascii=False)
+    admin_runtime_stats["apiErrors"] = 0
+    admin_runtime_stats["sseErrors"] = 0
     logger.info(
         "Admin store initialized db=%s timezone=%s cleanup=%s",
         admin_store.masked_db_path,
@@ -958,6 +871,7 @@ async def lifespan(_app: FastAPI):
         if admin_store is not None:
             await admin_store.close()
             admin_store = None
+        admin_payload_service = None
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1441,7 +1355,11 @@ async def admin_overview(request: Request):
         return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
 
     await record_admin_access(request, auth_result, "admin_api_access")
-    return JSONResponse(await build_admin_overview_payload())
+    try:
+        return JSONResponse(await build_admin_overview_payload())
+    except Exception:
+        admin_runtime_stats["apiErrors"] += 1
+        raise
 
 
 @app.get("/admin/api/events")
@@ -1452,6 +1370,10 @@ async def admin_events(
     auditActorType: str | None = None,
     auditActorTypes: list[str] | None = Query(default=None),
     auditSuccess: bool | None = None,
+    dailyDays: int = Query(default=30, ge=1, le=400),
+    dailyRoomCode: str | None = None,
+    hourlyHours: int = Query(default=48, ge=1, le=240),
+    hourlyRoomCode: str | None = None,
 ):
     auth_result = await authenticate_admin_request(request)
     if isinstance(auth_result, JSONResponse):
@@ -1474,16 +1396,28 @@ async def admin_events(
         audit_event_type=audit_event_type,
         audit_actor_types=audit_actor_types,
         audit_success=auditSuccess,
+        daily_days=dailyDays,
+        daily_room_code=normalize_optional_room_code(dailyRoomCode),
+        hourly_hours=hourlyHours,
+        hourly_room_code=normalize_optional_room_code(hourlyRoomCode),
     )
 
     async def event_stream():
         try:
-            bootstrap_payload = await build_admin_bootstrap_payload(
-                audit_limit=subscriber.audit_limit,
-                audit_event_type=subscriber.audit_event_type,
-                audit_actor_types=subscriber.audit_actor_types,
-                audit_success=subscriber.audit_success,
-            )
+            try:
+                bootstrap_payload = await build_admin_bootstrap_payload(
+                    audit_limit=subscriber.audit_limit,
+                    audit_event_type=subscriber.audit_event_type,
+                    audit_actor_types=subscriber.audit_actor_types,
+                    audit_success=subscriber.audit_success,
+                    daily_days=subscriber.daily_days,
+                    daily_room_code=subscriber.daily_room_code,
+                    hourly_hours=subscriber.hourly_hours,
+                    hourly_room_code=subscriber.hourly_room_code,
+                )
+            except Exception:
+                admin_runtime_stats["sseErrors"] += 1
+                raise
             yield format_sse_event("bootstrap", bootstrap_payload)
 
             while True:
@@ -1497,26 +1431,46 @@ async def admin_events(
                     continue
 
                 payload: dict
-                if event_name == "overview":
-                    payload = {"serverTime": time.time(), **(await build_admin_overview_payload())}
-                elif event_name == "daily_metrics":
-                    payload = {"serverTime": time.time(), **(await build_admin_daily_metrics_payload(days=30))}
-                elif event_name == "hourly_metrics":
-                    payload = {"serverTime": time.time(), **(await build_admin_hourly_metrics_payload(hours=48))}
-                elif event_name == "audit":
-                    payload = {
-                        "serverTime": time.time(),
-                        **(
-                            await build_admin_audit_payload(
-                                limit=subscriber.audit_limit,
-                                event_type=subscriber.audit_event_type,
-                                actor_types=subscriber.audit_actor_types,
-                                success=subscriber.audit_success,
-                            )
-                        ),
-                    }
-                else:
-                    continue
+                try:
+                    if event_name == "overview":
+                        payload = {"serverTime": time.time(), **(await build_admin_overview_payload())}
+                    elif event_name == "daily_metrics":
+                        payload = {
+                            "serverTime": time.time(),
+                            **(
+                                await build_admin_daily_metrics_payload(
+                                    days=subscriber.daily_days,
+                                    room_code=subscriber.daily_room_code,
+                                )
+                            ),
+                        }
+                    elif event_name == "hourly_metrics":
+                        payload = {
+                            "serverTime": time.time(),
+                            **(
+                                await build_admin_hourly_metrics_payload(
+                                    hours=subscriber.hourly_hours,
+                                    room_code=subscriber.hourly_room_code,
+                                )
+                            ),
+                        }
+                    elif event_name == "audit":
+                        payload = {
+                            "serverTime": time.time(),
+                            **(
+                                await build_admin_audit_payload(
+                                    limit=subscriber.audit_limit,
+                                    event_type=subscriber.audit_event_type,
+                                    actor_types=subscriber.audit_actor_types,
+                                    success=subscriber.audit_success,
+                                )
+                            ),
+                        }
+                    else:
+                        continue
+                except Exception:
+                    admin_runtime_stats["sseErrors"] += 1
+                    raise
 
                 yield format_sse_event(event_name, payload)
         finally:
@@ -1546,8 +1500,12 @@ async def admin_daily_metrics(
         return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
 
     await record_admin_access(request, auth_result, "admin_api_access")
-    payload = await build_admin_daily_metrics_payload(days=days, room_code=normalize_optional_room_code(roomCode))
-    return JSONResponse(payload)
+    try:
+        payload = await build_admin_daily_metrics_payload(days=days, room_code=normalize_optional_room_code(roomCode))
+        return JSONResponse(payload)
+    except Exception:
+        admin_runtime_stats["apiErrors"] += 1
+        raise
 
 
 @app.get("/admin/api/metrics/hourly")
@@ -1563,8 +1521,12 @@ async def admin_hourly_metrics(
         return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
 
     await record_admin_access(request, auth_result, "admin_api_access")
-    payload = await build_admin_hourly_metrics_payload(hours=hours, room_code=normalize_optional_room_code(roomCode))
-    return JSONResponse(payload)
+    try:
+        payload = await build_admin_hourly_metrics_payload(hours=hours, room_code=normalize_optional_room_code(roomCode))
+        return JSONResponse(payload)
+    except Exception:
+        admin_runtime_stats["apiErrors"] += 1
+        raise
 
 
 @app.get("/admin/api/audit")
@@ -1591,15 +1553,19 @@ async def admin_audit_log(
     ]
     if not normalized_actor_types and isinstance(actorType, str) and actorType.strip():
         normalized_actor_types = [actorType.strip()]
-    payload = await build_admin_audit_payload(
-        limit=limit,
-        before_id=beforeId,
-        event_type=eventType.strip() if isinstance(eventType, str) and eventType.strip() else None,
-        actor_type=actorType.strip() if isinstance(actorType, str) and actorType.strip() else None,
-        actor_types=normalized_actor_types,
-        success=success,
-    )
-    return JSONResponse(payload)
+    try:
+        payload = await build_admin_audit_payload(
+            limit=limit,
+            before_id=beforeId,
+            event_type=eventType.strip() if isinstance(eventType, str) and eventType.strip() else None,
+            actor_type=actorType.strip() if isinstance(actorType, str) and actorType.strip() else None,
+            actor_types=normalized_actor_types,
+            success=success,
+        )
+        return JSONResponse(payload)
+    except Exception:
+        admin_runtime_stats["apiErrors"] += 1
+        raise
 
 
 @app.websocket("/playeresp")

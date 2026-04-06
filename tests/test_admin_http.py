@@ -225,6 +225,7 @@ async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytes
     assert any(item["actorId"] == "player-1" for item in overview_payload["connectionDetails"])
     assert any(item["programVersion"] == "squaremap-script" for item in overview_payload["connectionDetails"])
     assert overview_payload["dbPathMasked"].endswith("/admin-http.db")
+    assert overview_payload["observability"]["sseSubscribers"] >= 0
 
     assert daily_payload["items"][-1]["activePlayers"] == 1
     assert hourly_payload["items"][-1]["activePlayers"] == 1
@@ -234,6 +235,7 @@ async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytes
     assert "player_handshake_success" in audit_types
     assert "web_map_handshake_success" in audit_types
     assert "admin_api_access" in audit_types
+    assert "player_handshake_success" in audit_payload["availableEventTypes"]
 
 
 @pytest.mark.asyncio
@@ -291,6 +293,10 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
             auditActorType=None,
             auditActorTypes=None,
             auditSuccess=None,
+            dailyDays=30,
+            dailyRoomCode=None,
+            hourlyHours=48,
+            hourlyRoomCode=None,
         )
         assert response.status_code == 200
         assert response.media_type == "text/event-stream"
@@ -304,6 +310,7 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         assert bootstrap_payload["dailyMetrics"]["items"]
         assert bootstrap_payload["hourlyMetrics"]["items"]
         assert isinstance(bootstrap_payload["audit"]["items"], list)
+        assert "availableEventTypes" in bootstrap_payload["audit"]
 
         main.state.connections["player-2"] = _connected_websocket_stub()  # type: ignore[assignment]
         main.state.set_player_room("player-2", "room-admin-test")

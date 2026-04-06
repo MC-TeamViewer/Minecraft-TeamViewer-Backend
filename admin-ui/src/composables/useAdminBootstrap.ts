@@ -1,12 +1,12 @@
 import { fetchAudit, fetchDailyMetrics, fetchHourlyMetrics, fetchOverview } from "@/api";
-import type { AuditFilters, BootstrapPayload } from "@/types";
+import type { BootstrapPayload, DashboardFilters } from "@/types";
 
-export async function loadAdminBootstrap(filters: AuditFilters): Promise<BootstrapPayload> {
+export async function loadAdminBootstrap(filters: DashboardFilters): Promise<BootstrapPayload> {
   const [overview, dailyMetrics, hourlyMetrics, audit] = await Promise.all([
     fetchOverview(),
-    fetchDailyMetrics(),
-    fetchHourlyMetrics(),
-    fetchAudit(filters),
+    fetchDailyMetrics(filters.metrics),
+    fetchHourlyMetrics(filters.metrics),
+    fetchAudit(filters.audit),
   ]);
 
   return {

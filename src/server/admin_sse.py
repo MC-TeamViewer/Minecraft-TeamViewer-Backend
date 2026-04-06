@@ -11,6 +11,10 @@ class AdminSseSubscriber:
     audit_event_type: str | None = None
     audit_actor_types: tuple[str, ...] = field(default_factory=tuple)
     audit_success: bool | None = None
+    daily_days: int = 30
+    daily_room_code: str | None = None
+    hourly_hours: int = 48
+    hourly_room_code: str | None = None
 
 
 @dataclass(slots=True)
@@ -33,6 +37,10 @@ class AdminSseHub:
         audit_event_type: str | None = None,
         audit_actor_types: tuple[str, ...] = (),
         audit_success: bool | None = None,
+        daily_days: int = 30,
+        daily_room_code: str | None = None,
+        hourly_hours: int = 48,
+        hourly_room_code: str | None = None,
     ) -> AdminSseSubscriber:
         subscriber = AdminSseSubscriber(
             queue=asyncio.Queue(maxsize=self._queue_size),
@@ -40,6 +48,10 @@ class AdminSseHub:
             audit_event_type=audit_event_type,
             audit_actor_types=audit_actor_types,
             audit_success=audit_success,
+            daily_days=daily_days,
+            daily_room_code=daily_room_code,
+            hourly_hours=hourly_hours,
+            hourly_room_code=hourly_room_code,
         )
         async with self._lock:
             self._subscribers.add(subscriber)
@@ -77,6 +89,9 @@ class AdminSseHub:
 
         async with self._lock:
             self._subscribers.clear()
+
+    def subscriber_count(self) -> int:
+        return len(self._subscribers)
 
     async def _delayed_broadcast(self, event_name: str, delay_sec: float) -> None:
         try:

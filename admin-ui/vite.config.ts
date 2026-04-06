@@ -14,10 +14,14 @@ export default defineConfig({
     assetsDir: "",
     rollupOptions: {
       output: {
-        manualChunks: {
-          vue: ["vue"],
-          "element-plus": ["element-plus"],
-          echarts: ["echarts/core", "echarts/charts", "echarts/components", "echarts/renderers"],
+        manualChunks(id) {
+          if (id.includes("/node_modules/vue/")) {
+            return "vue";
+          }
+          if (id.includes("/node_modules/echarts/")) {
+            return "echarts";
+          }
+          return undefined;
         },
       },
     },

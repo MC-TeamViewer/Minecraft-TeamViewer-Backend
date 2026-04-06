@@ -125,8 +125,26 @@ body {
 }
 
 .chart-host {
+  position: relative;
   width: 100%;
   height: 320px;
+  display: grid;
+  place-items: center;
+}
+
+.chart-placeholder {
+  color: #9ca3af;
+  font-size: 0.92rem;
+}
+
+.chart-placeholder-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(255, 251, 245, 0.82), rgba(255, 248, 239, 0.94));
+  z-index: 1;
 }
 
 .chart-meta {
@@ -181,6 +199,33 @@ body {
   gap: 4px;
 }
 
+.room-overview-expanded-grid {
+  align-items: start;
+}
+
+.room-id-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-height: 188px;
+  overflow: auto;
+  padding-right: 6px;
+}
+
+.room-id-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  max-width: 100%;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(194, 106, 24, 0.08);
+  border: 1px solid rgba(194, 106, 24, 0.14);
+  color: #7c2d12;
+  font-size: 0.82rem;
+  word-break: break-all;
+}
+
 .detail-key {
   color: #9ca3af;
   font-size: 0.82rem;
@@ -200,6 +245,19 @@ body {
   font-size: 0.82rem;
 }
 
+.audit-detail-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.audit-pagination {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+
 .audit-filter-row {
   display: flex;
   flex-wrap: wrap;
@@ -214,6 +272,16 @@ body {
 
 .filter-control {
   min-width: 220px;
+}
+
+.short-filter {
+  min-width: 140px;
+}
+
+.metrics-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
 .section-gap {

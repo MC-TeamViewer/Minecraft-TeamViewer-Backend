@@ -1,9 +1,9 @@
 import { getCurrentInstance, onBeforeUnmount, ref } from "vue";
 
 import type {
-  AuditFilters,
   AuditPayload,
   BootstrapPayload,
+  DashboardFilters,
   LiveStatus,
   MetricsPayload,
   OverviewPayload,
@@ -16,7 +16,7 @@ export interface EventSourceLike {
 }
 
 export interface UseAdminSseOptions {
-  getAuditFilters: () => AuditFilters;
+  getDashboardFilters: () => DashboardFilters;
   onBootstrap: (payload: BootstrapPayload) => void;
   onOverview: (payload: OverviewPayload) => void;
   onDailyMetrics: (payload: MetricsPayload) => void;
@@ -27,17 +27,23 @@ export interface UseAdminSseOptions {
   reconnectDelayMs?: number;
 }
 
-export function buildAdminEventsUrl(filters: AuditFilters, origin = window.location.origin): string {
+export function buildAdminEventsUrl(filters: DashboardFilters, origin = window.location.origin): string {
   const url = new URL("/admin/api/events", origin);
   url.searchParams.set("auditLimit", "100");
-  if (filters.eventType) {
-    url.searchParams.set("auditEventType", filters.eventType);
+  if (filters.audit.eventType) {
+    url.searchParams.set("auditEventType", filters.audit.eventType);
   }
-  for (const actorType of filters.actorTypes) {
+  for (const actorType of filters.audit.actorTypes) {
     url.searchParams.append("auditActorTypes", actorType);
   }
-  if (filters.success) {
-    url.searchParams.set("auditSuccess", filters.success);
+  if (filters.audit.success) {
+    url.searchParams.set("auditSuccess", filters.audit.success);
+  }
+  url.searchParams.set("dailyDays", String(filters.metrics.dailyDays));
+  url.searchParams.set("hourlyHours", String(filters.metrics.hourlyHours));
+  if (filters.metrics.roomCode) {
+    url.searchParams.set("dailyRoomCode", filters.metrics.roomCode);
+    url.searchParams.set("hourlyRoomCode", filters.metrics.roomCode);
   }
   return url.toString();
 }
@@ -61,6 +67,7 @@ export function useAdminSse(options: UseAdminSseOptions) {
   let source: EventSourceLike | null = null;
   let reconnectTimer: number | null = null;
   let stopped = false;
+  let bootstrapWaiters: Array<(received: boolean) => void> = [];
 
   const clearReconnectTimer = () => {
     if (reconnectTimer !== null) {
@@ -73,6 +80,14 @@ export function useAdminSse(options: UseAdminSseOptions) {
     if (source) {
       source.close();
       source = null;
+    }
+  };
+
+  const resolveBootstrapWaiters = (received: boolean) => {
+    const waiters = bootstrapWaiters;
+    bootstrapWaiters = [];
+    for (const waiter of waiters) {
+      waiter(received);
     }
   };
 
@@ -91,7 +106,7 @@ export function useAdminSse(options: UseAdminSseOptions) {
     closeSource();
     status.value = status.value === "reconnecting" ? "reconnecting" : "connecting";
 
-    source = createEventSource(buildAdminEventsUrl(options.getAuditFilters()));
+    source = createEventSource(buildAdminEventsUrl(options.getDashboardFilters()));
 
     source.addEventListener("open", () => {
       status.value = "live";
@@ -100,6 +115,7 @@ export function useAdminSse(options: UseAdminSseOptions) {
       const payload = parsePayload<BootstrapPayload>(event);
       if (payload) {
         options.onBootstrap(payload);
+        resolveBootstrapWaiters(true);
       }
     });
     source.addEventListener("overview", (event) => {
@@ -136,6 +152,7 @@ export function useAdminSse(options: UseAdminSseOptions) {
         return;
       }
       status.value = "reconnecting";
+      resolveBootstrapWaiters(false);
       closeSource();
       scheduleReconnect();
     };
@@ -155,8 +172,23 @@ export function useAdminSse(options: UseAdminSseOptions) {
   const stop = () => {
     stopped = true;
     clearReconnectTimer();
+    resolveBootstrapWaiters(false);
     closeSource();
   };
+
+  const waitForBootstrap = (timeoutMs = 1200) =>
+    new Promise<boolean>((resolve) => {
+      const timer = window.setTimeout(() => {
+        bootstrapWaiters = bootstrapWaiters.filter((item) => item !== waiter);
+        resolve(false);
+      }, timeoutMs);
+
+      const waiter = (received: boolean) => {
+        window.clearTimeout(timer);
+        resolve(received);
+      };
+      bootstrapWaiters.push(waiter);
+    });
 
   if (getCurrentInstance()) {
     onBeforeUnmount(stop);
@@ -168,5 +200,6 @@ export function useAdminSse(options: UseAdminSseOptions) {
     connect,
     restart,
     stop,
+    waitForBootstrap,
   };
 }

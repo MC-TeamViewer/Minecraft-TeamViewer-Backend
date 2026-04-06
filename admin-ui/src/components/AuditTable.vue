@@ -1,9 +1,20 @@
 <script setup lang="ts">
+import ElButton from "element-plus/es/components/button/index";
+import ElCard from "element-plus/es/components/card/index";
+import ElPagination from "element-plus/es/components/pagination/index";
+import ElTag from "element-plus/es/components/tag/index";
+import { ElTable, ElTableColumn } from "element-plus/es/components/table/index";
+import { computed, ref, watch } from "vue";
+
 import type { AuditPayload } from "@/types";
 
-defineProps<{
+const props = defineProps<{
   audit: AuditPayload | null;
 }>();
+
+const currentPage = ref(1);
+const pageSize = 25;
+const prettyExpandedRows = ref<Record<number, boolean>>({});
 
 function formatOccurredAt(value: number): string {
   return new Date(value).toLocaleString("zh-CN", {
@@ -11,12 +22,41 @@ function formatOccurredAt(value: number): string {
   });
 }
 
-function formatDetail(detail: Record<string, unknown>): string {
+function formatDetail(detail: Record<string, unknown>, pretty = true): string {
   try {
-    return JSON.stringify(detail, null, 2);
+    return pretty ? JSON.stringify(detail, null, 2) : JSON.stringify(detail);
   } catch (_error) {
     return "{}";
   }
+}
+
+const pagedItems = computed(() => {
+  const items = props.audit?.items ?? [];
+  const start = (currentPage.value - 1) * pageSize;
+  return items.slice(start, start + pageSize);
+});
+
+watch(
+  () => props.audit?.items,
+  () => {
+    currentPage.value = 1;
+  },
+);
+
+function togglePretty(rowId: number) {
+  prettyExpandedRows.value = {
+    ...prettyExpandedRows.value,
+    [rowId]: !prettyExpandedRows.value[rowId],
+  };
+}
+
+async function copyDetail(detail: Record<string, unknown>) {
+  const text = formatDetail(detail, true);
+  await navigator.clipboard.writeText(text);
+}
+
+function handlePageChange(page: number) {
+  currentPage.value = page;
 }
 </script>
 
@@ -32,7 +72,7 @@ function formatDetail(detail: Record<string, unknown>): string {
     </template>
 
     <el-table
-      :data="audit?.items ?? []"
+      :data="pagedItems"
       border
       row-key="id"
       table-layout="fixed"
@@ -41,7 +81,13 @@ function formatDetail(detail: Record<string, unknown>): string {
     >
       <el-table-column type="expand" width="44">
         <template #default="{ row }">
-          <pre class="audit-detail">{{ formatDetail(row.detail || {}) }}</pre>
+          <div class="audit-detail-toolbar">
+            <el-button text type="primary" @click="copyDetail(row.detail || {})">复制 JSON</el-button>
+            <el-button text @click="togglePretty(row.id)">
+              {{ prettyExpandedRows[row.id] === false ? "格式化查看" : "折叠查看" }}
+            </el-button>
+          </div>
+          <pre class="audit-detail">{{ formatDetail(row.detail || {}, prettyExpandedRows[row.id] !== false) }}</pre>
         </template>
       </el-table-column>
       <el-table-column prop="id" label="ID" width="88" resizable />
@@ -63,5 +109,17 @@ function formatDetail(detail: Record<string, unknown>): string {
       <el-table-column prop="roomCode" label="房间" min-width="140" show-overflow-tooltip resizable />
       <el-table-column prop="remoteAddr" label="地址" min-width="160" show-overflow-tooltip resizable />
     </el-table>
+
+    <div class="audit-pagination">
+      <el-pagination
+        layout="prev, pager, next"
+        :total="audit?.items?.length ?? 0"
+        :page-size="pageSize"
+        :current-page="currentPage"
+        small
+        background
+        @update:current-page="handlePageChange"
+      />
+    </div>
   </el-card>
 </template>

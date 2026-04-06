@@ -2,8 +2,22 @@ import type { EChartsCoreOption } from "echarts/core";
 
 import type { MetricsPayload } from "@/types";
 
+function formatAxisLabel(bucket: string, metrics: MetricsPayload | null): string {
+  if (!bucket) {
+    return "";
+  }
+  if (metrics?.hours != null || bucket.includes("T")) {
+    return bucket.replace("T", " ").slice(5, 16);
+  }
+  if (metrics?.days != null || /^\d{4}-\d{2}-\d{2}$/.test(bucket)) {
+    return bucket.slice(5, 10);
+  }
+  return bucket;
+}
+
 export function buildBarChartOption(metrics: MetricsPayload | null): EChartsCoreOption {
-  const labels = metrics?.items.map((item) => item.label) ?? [];
+  const items = metrics?.items ?? [];
+  const labels = items.map((item) => formatAxisLabel(item.bucket || item.label, metrics));
   const values = metrics?.items.map((item) => item.activePlayers) ?? [];
 
   return {
@@ -20,6 +34,14 @@ export function buildBarChartOption(metrics: MetricsPayload | null): EChartsCore
       trigger: "axis",
       axisPointer: {
         type: "shadow",
+      },
+      formatter(params: unknown) {
+        const firstParam = (Array.isArray(params) ? params[0] : params) as { dataIndex?: number } | undefined;
+        const item = items[firstParam?.dataIndex ?? -1];
+        if (!item) {
+          return "";
+        }
+        return `${item.bucket}<br/>活跃玩家: ${item.activePlayers}`;
       },
     },
     xAxis: {

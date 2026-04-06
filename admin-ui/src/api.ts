@@ -2,6 +2,7 @@ import type {
   AuditFilters,
   AuditPayload,
   MetricsPayload,
+  MetricsFilters,
   OverviewPayload,
 } from "@/types";
 
@@ -43,12 +44,18 @@ export function fetchOverview(): Promise<OverviewPayload> {
   return fetchJson<OverviewPayload>("/admin/api/overview");
 }
 
-export function fetchDailyMetrics(): Promise<MetricsPayload> {
-  return fetchJson<MetricsPayload>("/admin/api/metrics/daily", { days: "30" });
+export function fetchDailyMetrics(filters: MetricsFilters): Promise<MetricsPayload> {
+  return fetchJson<MetricsPayload>("/admin/api/metrics/daily", {
+    days: String(filters.dailyDays),
+    roomCode: filters.roomCode,
+  });
 }
 
-export function fetchHourlyMetrics(): Promise<MetricsPayload> {
-  return fetchJson<MetricsPayload>("/admin/api/metrics/hourly", { hours: "48" });
+export function fetchHourlyMetrics(filters: MetricsFilters): Promise<MetricsPayload> {
+  return fetchJson<MetricsPayload>("/admin/api/metrics/hourly", {
+    hours: String(filters.hourlyHours),
+    roomCode: filters.roomCode,
+  });
 }
 
 export function fetchAudit(filters: AuditFilters, limit = 100): Promise<AuditPayload> {

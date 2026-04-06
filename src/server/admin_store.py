@@ -328,6 +328,13 @@ class AdminStore:
         sql.append("ORDER BY id DESC LIMIT ?")
         params.append(limit)
         rows = await self._fetchall("\n".join(sql), tuple(params))
+        event_type_rows = await self._fetchall(
+            """
+            SELECT DISTINCT event_type
+            FROM audit_events
+            ORDER BY event_type ASC
+            """
+        )
 
         items = []
         for row in rows:
@@ -353,7 +360,12 @@ class AdminStore:
             )
 
         next_before_id = items[-1]["id"] if items else None
-        return {"items": items, "nextBeforeId": next_before_id, "limit": limit}
+        return {
+            "items": items,
+            "nextBeforeId": next_before_id,
+            "limit": limit,
+            "availableEventTypes": [str(row["event_type"]) for row in event_type_rows if row["event_type"]],
+        }
 
     async def cleanup_retention(self) -> dict[str, int]:
         now = self._local_datetime()

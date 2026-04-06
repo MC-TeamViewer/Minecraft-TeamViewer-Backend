@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import ElCard from "element-plus/es/components/card/index";
+import { ElTable, ElTableColumn } from "element-plus/es/components/table/index";
+import { computed, ref } from "vue";
 
 import { connectionColumns } from "@/connectionColumns";
 import type { ConnectionDetail, OverviewPayload } from "@/types";
@@ -9,6 +11,7 @@ const props = defineProps<{
 }>();
 
 const rows = computed(() => props.overview?.connectionDetails ?? []);
+const expandedKeys = ref<string[]>([]);
 
 function formatChannel(value: ConnectionDetail["channel"]): string {
   if (value === "player") {
@@ -18,6 +21,10 @@ function formatChannel(value: ConnectionDetail["channel"]): string {
     return "网页端";
   }
   return value || "-";
+}
+
+function handleExpandChange(row: ConnectionDetail, expandedRows: ConnectionDetail[]) {
+  expandedKeys.value = expandedRows.map((item) => item.actorId);
 }
 </script>
 
@@ -60,10 +67,12 @@ function formatChannel(value: ConnectionDetail["channel"]): string {
       class="admin-table"
       empty-text="暂无连接"
       row-key="actorId"
+      :expand-row-keys="expandedKeys"
+      @expand-change="handleExpandChange"
     >
       <el-table-column type="expand" width="44">
         <template #default="{ row }">
-          <div class="expanded-detail-grid">
+          <div v-if="expandedKeys.includes(row.actorId)" class="expanded-detail-grid">
             <div><span class="detail-key">显示名</span><span>{{ row.displayName || "-" }}</span></div>
             <div><span class="detail-key">房间</span><span>{{ row.roomCode || "-" }}</span></div>
             <div><span class="detail-key">协议版本</span><span>{{ row.protocolVersion || "-" }}</span></div>
