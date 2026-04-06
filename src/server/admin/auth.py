@@ -1,9 +1,10 @@
+from __future__ import annotations
+
 import asyncio
-import base64
-import binascii
 import json
 import os
 import secrets
+from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -13,7 +14,14 @@ from .frontend import admin_ui_ready
 from .models import AdminObservabilityPayload
 from .payloads import AdminPayloadService
 from .proxy_ip import get_request_remote_addr, parse_bool_env
-from .store import AdminStoreConfig
+from .store import (
+    ALLOWED_TRAFFIC_GRANULARITIES,
+    DEFAULT_TRAFFIC_GRANULARITY,
+    AdminStore,
+    AdminStoreConfig,
+)
+
+ADMIN_SESSION_COOKIE_NAME = "teamviewer_admin_session"
 
 
 def parse_positive_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -34,6 +42,10 @@ def build_admin_store_config() -> AdminStoreConfig:
         hourly_retention_days=parse_positive_int_env("TEAMVIEWER_HOURLY_RETENTION_DAYS", 90, minimum=1, maximum=3650),
         daily_retention_days=parse_positive_int_env("TEAMVIEWER_DAILY_RETENTION_DAYS", 400, minimum=1, maximum=3650),
     )
+
+
+def get_admin_session_ttl_sec() -> int:
+    return parse_positive_int_env("TEAMVIEWER_ADMIN_SESSION_TTL_SEC", 12 * 60 * 60, minimum=300, maximum=7 * 24 * 60 * 60)
 
 
 def get_admin_observability_payload() -> AdminObservabilityPayload:
@@ -101,85 +113,174 @@ async def record_player_activity(
         runtime.logger.warning("Failed to persist player activity playerId=%s: %s", player_id, exc)
 
 
-def parse_basic_auth_header(header_value: str | None) -> tuple[str | None, str | None]:
-    if not isinstance(header_value, str):
-        return None, None
+def admin_unauthorized_response(detail: str = "admin_session_required") -> JSONResponse:
+    return JSONResponse({"detail": detail}, status_code=401)
 
-    scheme, _, encoded = header_value.partition(" ")
-    if scheme.lower() != "basic" or not encoded:
-        return None, None
 
-    try:
-        decoded = base64.b64decode(encoded).decode("utf-8")
-    except (binascii.Error, UnicodeDecodeError):
+def parse_login_payload(payload: Any) -> tuple[str | None, str | None]:
+    if not isinstance(payload, dict):
         return None, None
-
-    username, separator, password = decoded.partition(":")
-    if not separator:
+    username = payload.get("username")
+    password = payload.get("password")
+    if not isinstance(username, str) or not isinstance(password, str):
         return None, None
     return username, password
 
 
-def admin_unauthorized_response(detail: str) -> JSONResponse:
-    return JSONResponse(
-        {"detail": detail},
-        status_code=401,
-        headers={"WWW-Authenticate": 'Basic realm="TeamViewRelay Admin"'},
-    )
-
-
-async def authenticate_admin_request(request: Request) -> str | JSONResponse:
+def validate_admin_credentials(username: str | None, password: str | None) -> bool:
     configured_username = os.getenv("TEAMVIEWER_ADMIN_USERNAME", "admin")
     configured_password = os.getenv("TEAMVIEWER_ADMIN_PASSWORD", "admin")
-    remote_addr = get_request_remote_addr(request)
-
-    if not configured_username or not configured_password:
-        await record_audit_event(
-            event_type="admin_auth_failed",
-            actor_type="admin",
-            success=False,
-            remote_addr=remote_addr,
-            detail={"reason": "admin_not_configured", "path": request.url.path},
-        )
-        return JSONResponse({"detail": "admin_not_configured"}, status_code=503)
-
-    username, password = parse_basic_auth_header(request.headers.get("authorization"))
-    auth_ok = (
+    return (
         isinstance(username, str)
         and isinstance(password, str)
+        and bool(configured_username)
+        and bool(configured_password)
         and secrets.compare_digest(username, configured_username)
         and secrets.compare_digest(password, configured_password)
     )
-    if not auth_ok:
-        await record_audit_event(
-            event_type="admin_auth_failed",
-            actor_type="admin",
-            actor_id=username,
-            success=False,
-            remote_addr=remote_addr,
-            detail={"reason": "invalid_credentials", "path": request.url.path},
-        )
-        return admin_unauthorized_response("invalid_admin_credentials")
 
-    await record_audit_event(
-        event_type="admin_auth_success",
-        actor_type="admin",
-        actor_id=username,
-        success=True,
-        remote_addr=remote_addr,
-        detail={"path": request.url.path, "method": request.method},
+
+def is_admin_configured() -> bool:
+    return bool(os.getenv("TEAMVIEWER_ADMIN_USERNAME", "admin")) and bool(os.getenv("TEAMVIEWER_ADMIN_PASSWORD", "admin"))
+
+
+def _request_uses_secure_transport(request: Request) -> bool:
+    if request.url.scheme == "https":
+        return True
+    if not parse_bool_env("TEAMVIEWER_TRUST_PROXY_HEADERS", False):
+        return False
+    forwarded_proto = str(request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+    return forwarded_proto == "https"
+
+
+def build_session_cookie_settings(request: Request, *, max_age_sec: int) -> dict[str, Any]:
+    return {
+        "httponly": True,
+        "samesite": "lax",
+        "secure": _request_uses_secure_transport(request),
+        "max_age": max_age_sec,
+        "path": "/",
+    }
+
+
+def build_admin_session_payload(session: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "sessionId": session["sessionId"],
+        "actorId": session["actorId"],
+        "remoteAddr": session.get("remoteAddr"),
+        "createdAt": int(session["createdAt"]),
+        "lastSeenAt": int(session["lastSeenAt"]),
+        "expiresAt": int(session["expiresAt"]),
+    }
+
+
+async def create_admin_session(request: Request, *, actor_id: str) -> tuple[dict[str, Any], str]:
+    if runtime.admin_store is None:
+        raise RuntimeError("admin_store_unavailable")
+    return await runtime.admin_store.create_admin_session(
+        actor_id=actor_id,
+        remote_addr=get_request_remote_addr(request),
+        ttl_sec=get_admin_session_ttl_sec(),
     )
-    return username
 
 
-async def record_admin_access(request: Request, username: str, access_type: str) -> None:
+def extract_admin_session_token(request: Request) -> str | None:
+    raw_value = request.cookies.get(ADMIN_SESSION_COOKIE_NAME)
+    if isinstance(raw_value, str) and raw_value.strip():
+        return raw_value.strip()
+    return None
+
+
+async def authenticate_admin_request(request: Request) -> dict[str, Any] | JSONResponse:
+    if runtime.admin_store is None:
+        return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
+
+    raw_token = extract_admin_session_token(request)
+    if raw_token is None:
+        return admin_unauthorized_response()
+
+    session = await runtime.admin_store.get_admin_session_by_token(raw_token)
+    if session is None:
+        return admin_unauthorized_response()
+
+    now_ms = runtime.admin_store.timestamp_ms()
+    ended_at = session.get("endedAt")
+    if ended_at is not None:
+        return admin_unauthorized_response("admin_session_ended")
+
+    if int(session["expiresAt"]) <= now_ms:
+        ended = await runtime.admin_store.end_admin_session(session["sessionId"], reason="expired")
+        if ended is not None:
+            await record_audit_event(
+                event_type="admin_session_ended",
+                actor_type="admin",
+                actor_id=ended["actorId"],
+                success=True,
+                remote_addr=ended.get("remoteAddr"),
+                detail={"sessionId": ended["sessionId"], "reason": "expired"},
+            )
+        return admin_unauthorized_response("admin_session_expired")
+
+    touched = await runtime.admin_store.touch_admin_session(
+        session["sessionId"],
+        ttl_sec=get_admin_session_ttl_sec(),
+    )
+    if touched is None:
+        return admin_unauthorized_response()
+    return touched
+
+
+async def end_admin_session(
+    request: Request,
+    session: dict[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any] | None:
+    if runtime.admin_store is None:
+        return None
+    ended = await runtime.admin_store.end_admin_session(session["sessionId"], reason=reason)
+    if ended is None:
+        return None
+    await record_audit_event(
+        event_type="admin_session_ended",
+        actor_type="admin",
+        actor_id=ended["actorId"],
+        success=True,
+        remote_addr=get_request_remote_addr(request),
+        detail={"sessionId": ended["sessionId"], "reason": reason},
+    )
+    return ended
+
+
+async def expire_admin_sessions() -> int:
+    if runtime.admin_store is None:
+        return 0
+    expired = await runtime.admin_store.expire_admin_sessions()
+    for session in expired:
+        await record_audit_event(
+            event_type="admin_session_ended",
+            actor_type="admin",
+            actor_id=session["actorId"],
+            success=True,
+            remote_addr=session.get("remoteAddr"),
+            detail={"sessionId": session["sessionId"], "reason": "expired"},
+        )
+    return len(expired)
+
+
+async def record_admin_access(request: Request, session: dict[str, Any], access_type: str) -> None:
     await record_audit_event(
         event_type=access_type,
         actor_type="admin",
-        actor_id=username,
+        actor_id=session["actorId"],
         success=True,
         remote_addr=get_request_remote_addr(request),
-        detail={"path": request.url.path, "method": request.method, "query": str(request.url.query or "")},
+        detail={
+            "sessionId": session["sessionId"],
+            "path": request.url.path,
+            "method": request.method,
+            "query": str(request.url.query or ""),
+        },
     )
 
 
@@ -285,6 +386,42 @@ async def build_admin_hourly_metrics_payload(hours: int = 48, room_code: str | N
     return await ensure_admin_payload_service().build_hourly_metrics_payload(hours=hours, room_code=room_code)
 
 
+async def build_admin_live_traffic_payload() -> dict:
+    return await ensure_admin_payload_service().build_live_traffic_payload()
+
+
+async def build_admin_hourly_traffic_payload(hours: int = 48) -> dict:
+    return await ensure_admin_payload_service().build_hourly_traffic_payload(hours=hours)
+
+
+async def build_admin_daily_traffic_payload(days: int = 30) -> dict:
+    return await ensure_admin_payload_service().build_daily_traffic_payload(days=days)
+
+
+def validate_traffic_history_params(range_preset: str, granularity: str) -> tuple[str, str]:
+    return AdminStore.normalize_traffic_history_params(range_preset, granularity)
+
+
+def traffic_range_options() -> tuple[str, ...]:
+    return tuple(ALLOWED_TRAFFIC_GRANULARITIES.keys())
+
+
+def traffic_granularity_options(range_preset: str) -> tuple[str, ...]:
+    return ALLOWED_TRAFFIC_GRANULARITIES.get(range_preset, ())
+
+
+def default_traffic_granularity(range_preset: str) -> str:
+    return DEFAULT_TRAFFIC_GRANULARITY.get(range_preset, "1h")
+
+
+async def build_admin_traffic_history_payload(range_preset: str = "48h", granularity: str = "1h") -> dict:
+    normalized_range, normalized_granularity = validate_traffic_history_params(range_preset, granularity)
+    return await ensure_admin_payload_service().build_traffic_history_payload(
+        range_preset=normalized_range,
+        granularity=normalized_granularity,
+    )
+
+
 async def build_admin_audit_payload(
     *,
     limit: int = 100,
@@ -314,6 +451,8 @@ async def build_admin_bootstrap_payload(
     daily_room_code: str | None = None,
     hourly_hours: int = 48,
     hourly_room_code: str | None = None,
+    traffic_range: str = "48h",
+    traffic_granularity: str = "1h",
 ) -> dict:
     return await ensure_admin_payload_service().build_bootstrap_payload(
         audit_limit=audit_limit,
@@ -324,6 +463,8 @@ async def build_admin_bootstrap_payload(
         daily_room_code=daily_room_code,
         hourly_hours=hourly_hours,
         hourly_room_code=hourly_room_code,
+        traffic_range=traffic_range,
+        traffic_granularity=traffic_granularity,
     )
 
 

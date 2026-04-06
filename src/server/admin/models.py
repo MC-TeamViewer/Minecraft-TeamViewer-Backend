@@ -66,6 +66,61 @@ class AdminObservabilityPayload(TypedDict):
     trustProxyHeaders: bool
 
 
+class LiveTrafficPayload(TypedDict):
+    sampleWindowSec: int
+    playerIngressBps: float
+    playerEgressBps: float
+    webMapIngressBps: float
+    webMapEgressBps: float
+    totalIngressBps: float
+    totalEgressBps: float
+    serverTime: NotRequired[float]
+
+
+class TrafficBucketItem(TypedDict):
+    bucket: str
+    label: str
+    playerIngressBytes: int
+    playerEgressBytes: int
+    webMapIngressBytes: int
+    webMapEgressBytes: int
+    totalIngressBytes: int
+    totalEgressBytes: int
+    totalBytes: int
+
+
+class TrafficMetricsPayload(TypedDict):
+    timezone: str
+    items: list[TrafficBucketItem]
+    totalIngressBytes: int
+    totalEgressBytes: int
+    totalBytes: int
+    days: NotRequired[int]
+    hours: NotRequired[int]
+    serverTime: NotRequired[float]
+
+
+class TrafficHistoryPayload(TypedDict):
+    timezone: str
+    range: str
+    granularity: str
+    bucketSeconds: int
+    items: list[TrafficBucketItem]
+    totalIngressBytes: int
+    totalEgressBytes: int
+    totalBytes: int
+    serverTime: NotRequired[float]
+
+
+class AdminSessionPayload(TypedDict):
+    sessionId: str
+    actorId: str
+    remoteAddr: str | None
+    createdAt: int
+    lastSeenAt: int
+    expiresAt: int
+
+
 class OverviewPayload(TypedDict):
     playerConnections: int
     webMapConnections: int
@@ -85,5 +140,6 @@ class BootstrapPayload(TypedDict):
     overview: OverviewPayload
     dailyMetrics: MetricsPayload
     hourlyMetrics: MetricsPayload
+    liveTraffic: LiveTrafficPayload
+    trafficHistory: TrafficHistoryPayload
     audit: AuditPayload
-

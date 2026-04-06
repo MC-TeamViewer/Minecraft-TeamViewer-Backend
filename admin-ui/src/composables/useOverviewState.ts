@@ -15,9 +15,14 @@ export function useOverviewState() {
     return rooms.map((item) => item.roomCode).filter(Boolean);
   });
 
+  function resetOverview() {
+    overview.value = null;
+  }
+
   return {
     overview,
     roomOptions,
     applyOverview,
+    resetOverview,
   };
 }

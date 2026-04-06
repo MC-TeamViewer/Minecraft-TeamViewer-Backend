@@ -5,8 +5,10 @@ import type {
   BootstrapPayload,
   DashboardFilters,
   LiveStatus,
+  LiveTrafficPayload,
   MetricsPayload,
   OverviewPayload,
+  TrafficHistoryPayload,
 } from "@/types";
 
 export interface EventSourceLike {
@@ -21,8 +23,11 @@ export interface UseAdminSseOptions {
   onOverview: (payload: OverviewPayload) => void;
   onDailyMetrics: (payload: MetricsPayload) => void;
   onHourlyMetrics: (payload: MetricsPayload) => void;
+  onLiveTraffic: (payload: LiveTrafficPayload) => void;
+  onTrafficHistory: (payload: TrafficHistoryPayload) => void;
   onAudit: (payload: AuditPayload) => void;
   onHeartbeat?: (serverTime: number | undefined) => void;
+  onError?: () => void | Promise<void>;
   createEventSource?: (url: string) => EventSourceLike;
   reconnectDelayMs?: number;
 }
@@ -45,6 +50,8 @@ export function buildAdminEventsUrl(filters: DashboardFilters, origin = window.l
     url.searchParams.set("dailyRoomCode", filters.metrics.roomCode);
     url.searchParams.set("hourlyRoomCode", filters.metrics.roomCode);
   }
+  url.searchParams.set("trafficRange", filters.traffic.range);
+  url.searchParams.set("trafficGranularity", filters.traffic.granularity);
   return url.toString();
 }
 
@@ -136,6 +143,18 @@ export function useAdminSse(options: UseAdminSseOptions) {
         options.onHourlyMetrics(payload);
       }
     });
+    source.addEventListener("traffic_live", (event) => {
+      const payload = parsePayload<LiveTrafficPayload>(event);
+      if (payload) {
+        options.onLiveTraffic(payload);
+      }
+    });
+    source.addEventListener("traffic_history", (event) => {
+      const payload = parsePayload<TrafficHistoryPayload>(event);
+      if (payload) {
+        options.onTrafficHistory(payload);
+      }
+    });
     source.addEventListener("audit", (event) => {
       const payload = parsePayload<AuditPayload>(event);
       if (payload) {
@@ -154,6 +173,7 @@ export function useAdminSse(options: UseAdminSseOptions) {
       status.value = "reconnecting";
       resolveBootstrapWaiters(false);
       closeSource();
+      void options.onError?.();
       scheduleReconnect();
     };
   };

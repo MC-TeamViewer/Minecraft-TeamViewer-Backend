@@ -4,6 +4,7 @@ import msgpack
 from fastapi import WebSocket, WebSocketDisconnect
 
 from ..app import runtime
+from ..admin.traffic import infer_websocket_traffic_channel, record_websocket_payload_traffic, send_tracked_websocket_bytes
 from ..core.protocol import (
     BattleMapObservationPacket,
     EntitiesPatchPacket,
@@ -35,9 +36,9 @@ async def _raw_send_packet(websocket: WebSocket, packet, *, channel: str | None 
         else:
             body = packet.model_dump(exclude_none=True)
         body["channel"] = channel
-        await websocket.send_bytes(runtime.message_codec.encode(body))
+        await send_tracked_websocket_bytes(websocket, runtime.message_codec.encode(body), channel=channel)
         return
-    await websocket.send_bytes(runtime.message_codec.encode(packet))
+    await send_tracked_websocket_bytes(websocket, runtime.message_codec.encode(packet), channel=channel)
 
 
 def _resolve_send_packet():
@@ -57,7 +58,7 @@ async def send_packet(websocket: WebSocket, packet, *, channel: str | None = Non
 
 
 async def send_legacy_messagepack_packet(websocket: WebSocket, packet: dict) -> None:
-    await websocket.send_bytes(msgpack.packb(packet, use_bin_type=True))
+    await send_tracked_websocket_bytes(websocket, msgpack.packb(packet, use_bin_type=True))
 
 
 def describe_websocket(websocket: WebSocket) -> str:
@@ -119,6 +120,15 @@ async def receive_payload(websocket: WebSocket, *, allow_legacy_handshake: bool 
         payload = message.get("text")
     if payload is None:
         raise PacketDecodeError("invalid_payload", "payload must be bytes")
+
+    traffic_channel = infer_websocket_traffic_channel(websocket)
+    if traffic_channel is not None:
+        await record_websocket_payload_traffic(
+            websocket=websocket,
+            direction="ingress",
+            payload=payload,
+            channel=traffic_channel,
+        )
 
     try:
         return runtime.message_codec.decode(payload)

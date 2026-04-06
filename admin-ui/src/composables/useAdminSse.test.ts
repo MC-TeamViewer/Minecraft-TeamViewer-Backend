@@ -1,6 +1,6 @@
 import { effectScope } from "vue";
 
-import { DEFAULT_AUDIT_FILTERS, DEFAULT_METRICS_FILTERS } from "@/types";
+import { DEFAULT_AUDIT_FILTERS, DEFAULT_METRICS_FILTERS, DEFAULT_TRAFFIC_FILTERS } from "@/types";
 import { buildAdminEventsUrl, useAdminSse, type EventSourceLike } from "@/composables/useAdminSse";
 
 class MockEventSource implements EventSourceLike {
@@ -47,6 +47,7 @@ describe("buildAdminEventsUrl", () => {
         {
           audit: { ...DEFAULT_AUDIT_FILTERS, actorTypes: ["player", "system"], success: "false" },
           metrics: { ...DEFAULT_METRICS_FILTERS, roomCode: "room-a", dailyDays: 14, hourlyHours: 24 },
+          traffic: { range: "24h", granularity: "15m" },
         },
         "http://testserver",
       ),
@@ -56,6 +57,8 @@ describe("buildAdminEventsUrl", () => {
     expect(url.searchParams.get("auditSuccess")).toBe("false");
     expect(url.searchParams.get("dailyRoomCode")).toBe("room-a");
     expect(url.searchParams.get("dailyDays")).toBe("14");
+    expect(url.searchParams.get("trafficRange")).toBe("24h");
+    expect(url.searchParams.get("trafficGranularity")).toBe("15m");
   });
 });
 
@@ -74,6 +77,8 @@ describe("useAdminSse", () => {
     const onOverview = vi.fn();
     const onDailyMetrics = vi.fn();
     const onHourlyMetrics = vi.fn();
+    const onLiveTraffic = vi.fn();
+    const onTrafficHistory = vi.fn();
     const onAudit = vi.fn();
 
     const scope = effectScope();
@@ -82,11 +87,14 @@ describe("useAdminSse", () => {
         getDashboardFilters: () => ({
           audit: DEFAULT_AUDIT_FILTERS,
           metrics: DEFAULT_METRICS_FILTERS,
+          traffic: DEFAULT_TRAFFIC_FILTERS,
         }),
         onBootstrap,
         onOverview,
         onDailyMetrics,
         onHourlyMetrics,
+        onLiveTraffic,
+        onTrafficHistory,
         onAudit,
         createEventSource: (url) => new MockEventSource(url),
         reconnectDelayMs: 2000,
@@ -116,6 +124,25 @@ describe("useAdminSse", () => {
       },
       dailyMetrics: { timezone: "UTC", roomCode: null, items: [] },
       hourlyMetrics: { timezone: "UTC", roomCode: null, items: [] },
+      liveTraffic: {
+        sampleWindowSec: 10,
+        playerIngressBps: 0,
+        playerEgressBps: 0,
+        webMapIngressBps: 0,
+        webMapEgressBps: 0,
+        totalIngressBps: 0,
+        totalEgressBps: 0,
+      },
+      trafficHistory: {
+        timezone: "UTC",
+        range: "48h",
+        granularity: "1h",
+        bucketSeconds: 3600,
+        totalIngressBytes: 0,
+        totalEgressBytes: 0,
+        totalBytes: 0,
+        items: [],
+      },
       audit: { items: [], nextBeforeId: null, limit: 100, availableEventTypes: [] },
     });
     await expect(bootstrapPromise).resolves.toBe(true);

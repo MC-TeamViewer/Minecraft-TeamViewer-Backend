@@ -15,6 +15,8 @@ class AdminSseSubscriber:
     daily_room_code: str | None = None
     hourly_hours: int = 48
     hourly_room_code: str | None = None
+    traffic_range: str = "48h"
+    traffic_granularity: str = "1h"
 
 
 @dataclass(slots=True)
@@ -41,6 +43,8 @@ class AdminSseHub:
         daily_room_code: str | None = None,
         hourly_hours: int = 48,
         hourly_room_code: str | None = None,
+        traffic_range: str = "48h",
+        traffic_granularity: str = "1h",
     ) -> AdminSseSubscriber:
         subscriber = AdminSseSubscriber(
             queue=asyncio.Queue(maxsize=self._queue_size),
@@ -52,6 +56,8 @@ class AdminSseHub:
             daily_room_code=daily_room_code,
             hourly_hours=hourly_hours,
             hourly_room_code=hourly_room_code,
+            traffic_range=traffic_range,
+            traffic_granularity=traffic_granularity,
         )
         async with self._lock:
             self._subscribers.add(subscriber)

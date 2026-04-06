@@ -10,8 +10,10 @@ from .models import (
     AuditPayload,
     BootstrapPayload,
     ConnectionDetailItem,
+    LiveTrafficPayload,
     MetricsPayload,
     OverviewPayload,
+    TrafficHistoryPayload,
     RoomOverviewItem,
 )
 from .store import AdminStore
@@ -30,6 +32,7 @@ class AdminPayloadService:
         admin_store: AdminStore,
         build_room_overview: Callable[[], list[RoomOverviewItem]],
         build_connection_details: Callable[[], list[ConnectionDetailItem]],
+        build_live_traffic: Callable[[], Awaitable[LiveTrafficPayload]],
         get_broadcast_hz: Callable[[], float],
         get_sse_subscriber_count: Callable[[], int],
         get_observability_payload: Callable[[], AdminObservabilityPayload],
@@ -37,6 +40,7 @@ class AdminPayloadService:
         self._store = admin_store
         self._build_room_overview = build_room_overview
         self._build_connection_details = build_connection_details
+        self._build_live_traffic = build_live_traffic
         self._get_broadcast_hz = get_broadcast_hz
         self._get_sse_subscriber_count = get_sse_subscriber_count
         self._get_observability_payload = get_observability_payload
@@ -77,8 +81,7 @@ class AdminPayloadService:
                 },
             }
 
-        payload = await self._get_cached_payload(("overview", ()), ttl_sec=1.0, builder=builder)
-        return payload
+        return await self._get_cached_payload(("overview", ()), ttl_sec=1.0, builder=builder)
 
     async def build_daily_metrics_payload(self, *, days: int = 30, room_code: str | None = None) -> MetricsPayload:
         return await self._get_cached_payload(
@@ -94,6 +97,39 @@ class AdminPayloadService:
             builder=lambda: self._store.query_hourly_metrics(hours=hours, room_code=room_code),
         )
 
+    async def build_live_traffic_payload(self) -> LiveTrafficPayload:
+        return await self._get_cached_payload(
+            ("live_traffic", ()),
+            ttl_sec=1.0,
+            builder=self._build_live_traffic,
+        )
+
+    async def build_hourly_traffic_payload(self, *, hours: int = 48) -> dict[str, Any]:
+        return await self._get_cached_payload(
+            ("hourly_traffic", (("hours", hours),)),
+            ttl_sec=1.0,
+            builder=lambda: self._store.query_hourly_traffic(hours=hours),
+        )
+
+    async def build_daily_traffic_payload(self, *, days: int = 30) -> dict[str, Any]:
+        return await self._get_cached_payload(
+            ("daily_traffic", (("days", days),)),
+            ttl_sec=1.0,
+            builder=lambda: self._store.query_daily_traffic(days=days),
+        )
+
+    async def build_traffic_history_payload(
+        self,
+        *,
+        range_preset: str = "48h",
+        granularity: str = "1h",
+    ) -> TrafficHistoryPayload:
+        return await self._get_cached_payload(
+            ("traffic_history", (("range", range_preset), ("granularity", granularity))),
+            ttl_sec=1.0,
+            builder=lambda: self._store.query_traffic_history(range_preset=range_preset, granularity=granularity),
+        )
+
     async def build_audit_payload(
         self,
         *,
@@ -107,7 +143,7 @@ class AdminPayloadService:
         normalized_actor_types = tuple(item for item in (actor_types or []) if isinstance(item, str) and item)
 
         async def builder() -> AuditPayload:
-            payload = await self._store.query_audit_events(
+            return await self._store.query_audit_events(
                 limit=limit,
                 before_id=before_id,
                 event_type=event_type,
@@ -115,7 +151,6 @@ class AdminPayloadService:
                 actor_types=normalized_actor_types,
                 success=success,
             )
-            return payload
 
         return await self._get_cached_payload(
             (
@@ -144,11 +179,15 @@ class AdminPayloadService:
         daily_room_code: str | None = None,
         hourly_hours: int = 48,
         hourly_room_code: str | None = None,
+        traffic_range: str = "48h",
+        traffic_granularity: str = "1h",
     ) -> BootstrapPayload:
-        overview, daily_metrics, hourly_metrics, audit = await asyncio.gather(
+        overview, daily_metrics, hourly_metrics, live_traffic, traffic_history, audit = await asyncio.gather(
             self.build_overview_payload(),
             self.build_daily_metrics_payload(days=daily_days, room_code=daily_room_code),
             self.build_hourly_metrics_payload(hours=hourly_hours, room_code=hourly_room_code),
+            self.build_live_traffic_payload(),
+            self.build_traffic_history_payload(range_preset=traffic_range, granularity=traffic_granularity),
             self.build_audit_payload(
                 limit=audit_limit,
                 event_type=audit_event_type,
@@ -161,6 +200,8 @@ class AdminPayloadService:
             "overview": overview,
             "dailyMetrics": daily_metrics,
             "hourlyMetrics": hourly_metrics,
+            "liveTraffic": live_traffic,
+            "trafficHistory": traffic_history,
             "audit": audit,
         }
 

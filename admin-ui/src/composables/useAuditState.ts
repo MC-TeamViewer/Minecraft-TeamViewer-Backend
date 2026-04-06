@@ -12,9 +12,15 @@ export function useAuditState() {
     eventTypes.value = payload.availableEventTypes ?? [];
   }
 
+  function resetAudit() {
+    auditPayload.value = null;
+    eventTypes.value = [];
+  }
+
   return {
     auditPayload,
     eventTypes,
     applyAudit,
+    resetAudit,
   };
 }

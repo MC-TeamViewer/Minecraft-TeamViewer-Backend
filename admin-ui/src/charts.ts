@@ -1,18 +1,36 @@
 import type { EChartsCoreOption } from "echarts/core";
 
-import type { MetricsPayload } from "@/types";
+import type { MetricsPayload, TrafficHistoryPayload } from "@/types";
 
-function formatAxisLabel(bucket: string, metrics: MetricsPayload | null): string {
+function formatAxisLabel(bucket: string, metrics: MetricsPayload | TrafficHistoryPayload | null): string {
   if (!bucket) {
     return "";
   }
-  if (metrics?.hours != null || bucket.includes("T")) {
+  const hasHours = metrics != null && "hours" in metrics && metrics.hours != null;
+  const hasDays = metrics != null && "days" in metrics && metrics.days != null;
+  if (hasHours || bucket.includes("T")) {
     return bucket.replace("T", " ").slice(5, 16);
   }
-  if (metrics?.days != null || /^\d{4}-\d{2}-\d{2}$/.test(bucket)) {
+  if (hasDays || /^\d{4}-\d{2}-\d{2}$/.test(bucket)) {
     return bucket.slice(5, 10);
   }
   return bucket;
+}
+
+export function formatByteValue(value: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let amount = Math.max(0, Number(value) || 0);
+  let index = 0;
+  while (amount >= 1024 && index < units.length - 1) {
+    amount /= 1024;
+    index += 1;
+  }
+  const fixed = amount >= 100 || index === 0 ? 0 : amount >= 10 ? 1 : 2;
+  return `${amount.toFixed(fixed)} ${units[index]}`;
+}
+
+export function formatRateValue(value: number): string {
+  return `${formatByteValue(value)}/s`;
 }
 
 export function buildBarChartOption(metrics: MetricsPayload | null): EChartsCoreOption {
@@ -76,6 +94,100 @@ export function buildBarChartOption(metrics: MetricsPayload | null): EChartsCore
         itemStyle: {
           borderRadius: [8, 8, 0, 0],
         },
+      },
+    ],
+  };
+}
+
+export function buildTrafficChartOption(metrics: TrafficHistoryPayload | null): EChartsCoreOption {
+  const items = metrics?.items ?? [];
+  const labels = items.map((item) => formatAxisLabel(item.bucket || item.label, metrics));
+
+  return {
+    animationDuration: 220,
+    color: ["#c26a18", "#92400e", "#0f766e", "#1d4ed8"],
+    grid: {
+      left: 18,
+      right: 16,
+      top: 24,
+      bottom: 18,
+      containLabel: true,
+    },
+    legend: {
+      top: 0,
+      textStyle: {
+        color: "#6b7280",
+      },
+    },
+    tooltip: {
+      trigger: "axis",
+      formatter(params: unknown) {
+        const entries = (Array.isArray(params) ? params : [params]) as Array<{ seriesName?: string; value?: number }>;
+        const index = Number((entries[0] as { dataIndex?: number } | undefined)?.dataIndex ?? -1);
+        const item = items[index];
+        if (!item) {
+          return "";
+        }
+        const lines = [
+          item.bucket,
+          `总流量: ${formatByteValue(item.totalBytes)}`,
+        ];
+        for (const entry of entries) {
+          if (!entry.seriesName) {
+            continue;
+          }
+          lines.push(`${entry.seriesName}: ${formatByteValue(Number(entry.value ?? 0))}`);
+        }
+        return lines.join("<br/>");
+      },
+    },
+    xAxis: {
+      type: "category",
+      data: labels,
+      axisLabel: {
+        hideOverlap: true,
+        interval: "auto",
+        color: "#6b7280",
+      },
+    },
+    yAxis: {
+      type: "value",
+      axisLabel: {
+        color: "#6b7280",
+        formatter(value: number) {
+          return formatByteValue(value);
+        },
+      },
+      splitLine: {
+        lineStyle: {
+          color: "rgba(120, 53, 15, 0.12)",
+        },
+      },
+    },
+    series: [
+      {
+        name: "游戏端入站",
+        type: "line",
+        smooth: true,
+        data: items.map((item) => item.playerIngressBytes),
+      },
+      {
+        name: "游戏端出站",
+        type: "line",
+        smooth: true,
+        data: items.map((item) => item.playerEgressBytes),
+      },
+      {
+        name: "网页端入站",
+        type: "line",
+        smooth: true,
+        data: items.map((item) => item.webMapIngressBytes),
+      },
+      {
+        name: "网页端出站",
+        type: "line",
+        smooth: true,
+        data: items.map((item) => item.webMapEgressBytes),
       },
     ],
   };

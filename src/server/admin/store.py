@@ -1,12 +1,49 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import secrets
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+TRAFFIC_RANGE_SECONDS = {
+    "1h": 60 * 60,
+    "6h": 6 * 60 * 60,
+    "24h": 24 * 60 * 60,
+    "48h": 48 * 60 * 60,
+    "7d": 7 * 24 * 60 * 60,
+    "30d": 30 * 24 * 60 * 60,
+}
+
+TRAFFIC_GRANULARITY_SECONDS = {
+    "1m": 60,
+    "5m": 5 * 60,
+    "15m": 15 * 60,
+    "1h": 60 * 60,
+    "1d": 24 * 60 * 60,
+}
+
+ALLOWED_TRAFFIC_GRANULARITIES = {
+    "1h": ("1m", "5m"),
+    "6h": ("1m", "5m", "15m"),
+    "24h": ("5m", "15m", "1h"),
+    "48h": ("15m", "1h"),
+    "7d": ("1h", "1d"),
+    "30d": ("1d",),
+}
+
+DEFAULT_TRAFFIC_GRANULARITY = {
+    "1h": "1m",
+    "6h": "5m",
+    "24h": "15m",
+    "48h": "1h",
+    "7d": "1h",
+    "30d": "1d",
+}
 
 
 @dataclass(slots=True)
@@ -65,6 +102,42 @@ class AdminStore:
                 detail_json TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                session_id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                actor_id TEXT NOT NULL,
+                remote_addr TEXT,
+                created_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                end_reason TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS hourly_traffic_bytes (
+                local_hour TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                PRIMARY KEY (local_hour, channel, direction)
+            );
+
+            CREATE TABLE IF NOT EXISTS minute_traffic_bytes (
+                local_minute TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                PRIMARY KEY (local_minute, channel, direction)
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_traffic_bytes (
+                local_date TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                PRIMARY KEY (local_date, channel, direction)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_daily_player_activity_date
                 ON daily_player_activity (local_date);
 
@@ -82,6 +155,12 @@ class AdminStore:
 
             CREATE INDEX IF NOT EXISTS idx_audit_events_filters
                 ON audit_events (event_type, actor_type, success, id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_admin_sessions_token_hash
+                ON admin_sessions (token_hash);
+
+            CREATE INDEX IF NOT EXISTS idx_admin_sessions_expiry
+                ON admin_sessions (expires_at, ended_at);
             """
         )
         self._db.commit()
@@ -91,6 +170,12 @@ class AdminStore:
             return
         self._db.close()
         self._db = None
+
+    def local_datetime(self, value: float | None = None) -> datetime:
+        return self._local_datetime(value)
+
+    def timestamp_ms(self, value: float | None = None) -> int:
+        return self._to_timestamp_ms(value)
 
     async def record_player_activity(
         self,
@@ -187,13 +272,244 @@ class AdminStore:
                 ),
             )
 
+    async def create_admin_session(
+        self,
+        *,
+        actor_id: str,
+        remote_addr: str | None,
+        ttl_sec: int,
+        occurred_at: float | None = None,
+    ) -> tuple[dict[str, Any], str]:
+        raw_token = secrets.token_urlsafe(32)
+        session_id = secrets.token_hex(8)
+        stamp_ms = self._to_timestamp_ms(occurred_at)
+        expires_at = stamp_ms + max(1, int(ttl_sec)) * 1000
+        token_hash = self.hash_session_token(raw_token)
+
+        async with self._lock:
+            self._execute(
+                """
+                INSERT INTO admin_sessions (
+                    session_id,
+                    token_hash,
+                    actor_id,
+                    remote_addr,
+                    created_at,
+                    last_seen_at,
+                    expires_at,
+                    ended_at,
+                    end_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (session_id, token_hash, actor_id, remote_addr, stamp_ms, stamp_ms, expires_at),
+            )
+
+        return (
+            {
+                "sessionId": session_id,
+                "actorId": actor_id,
+                "remoteAddr": remote_addr,
+                "createdAt": stamp_ms,
+                "lastSeenAt": stamp_ms,
+                "expiresAt": expires_at,
+                "endedAt": None,
+                "endReason": None,
+            },
+            raw_token,
+        )
+
+    async def get_admin_session_by_token(self, raw_token: str) -> dict[str, Any] | None:
+        if not isinstance(raw_token, str) or not raw_token:
+            return None
+        token_hash = self.hash_session_token(raw_token)
+        row = await self._fetchone(
+            """
+            SELECT
+                session_id,
+                actor_id,
+                remote_addr,
+                created_at,
+                last_seen_at,
+                expires_at,
+                ended_at,
+                end_reason
+            FROM admin_sessions
+            WHERE token_hash = ?
+            LIMIT 1
+            """,
+            (token_hash,),
+        )
+        if row is None:
+            return None
+        return self._serialize_admin_session_row(row)
+
+    async def touch_admin_session(
+        self,
+        session_id: str,
+        *,
+        ttl_sec: int,
+        occurred_at: float | None = None,
+    ) -> dict[str, Any] | None:
+        stamp_ms = self._to_timestamp_ms(occurred_at)
+        expires_at = stamp_ms + max(1, int(ttl_sec)) * 1000
+        async with self._lock:
+            self._execute(
+                """
+                UPDATE admin_sessions
+                SET last_seen_at = ?, expires_at = ?
+                WHERE session_id = ? AND ended_at IS NULL
+                """,
+                (stamp_ms, expires_at, session_id),
+            )
+        return await self.get_admin_session_by_id(session_id)
+
+    async def get_admin_session_by_id(self, session_id: str) -> dict[str, Any] | None:
+        row = await self._fetchone(
+            """
+            SELECT
+                session_id,
+                actor_id,
+                remote_addr,
+                created_at,
+                last_seen_at,
+                expires_at,
+                ended_at,
+                end_reason
+            FROM admin_sessions
+            WHERE session_id = ?
+            LIMIT 1
+            """,
+            (session_id,),
+        )
+        if row is None:
+            return None
+        return self._serialize_admin_session_row(row)
+
+    async def end_admin_session(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+        occurred_at: float | None = None,
+    ) -> dict[str, Any] | None:
+        current = await self.get_admin_session_by_id(session_id)
+        if current is None or current.get("endedAt") is not None:
+            return None
+
+        stamp_ms = self._to_timestamp_ms(occurred_at)
+        async with self._lock:
+            self._execute(
+                """
+                UPDATE admin_sessions
+                SET ended_at = ?, end_reason = ?
+                WHERE session_id = ? AND ended_at IS NULL
+                """,
+                (stamp_ms, reason, session_id),
+            )
+        ended = await self.get_admin_session_by_id(session_id)
+        return ended
+
+    async def expire_admin_sessions(self, *, occurred_at: float | None = None) -> list[dict[str, Any]]:
+        stamp_ms = self._to_timestamp_ms(occurred_at)
+        rows = await self._fetchall(
+            """
+            SELECT
+                session_id,
+                actor_id,
+                remote_addr,
+                created_at,
+                last_seen_at,
+                expires_at,
+                ended_at,
+                end_reason
+            FROM admin_sessions
+            WHERE ended_at IS NULL AND expires_at <= ?
+            ORDER BY expires_at ASC
+            """,
+            (stamp_ms,),
+        )
+        if not rows:
+            return []
+
+        async with self._lock:
+            for row in rows:
+                self._execute(
+                    """
+                    UPDATE admin_sessions
+                    SET ended_at = ?, end_reason = 'expired'
+                    WHERE session_id = ? AND ended_at IS NULL
+                    """,
+                    (stamp_ms, row["session_id"]),
+                )
+        return [
+            {
+                **self._serialize_admin_session_row(row),
+                "endedAt": stamp_ms,
+                "endReason": "expired",
+            }
+            for row in rows
+        ]
+
+    async def apply_traffic_increments(
+        self,
+        *,
+        minute_increments: dict[tuple[str, str, str], int],
+        hourly_increments: dict[tuple[str, str, str], int],
+        daily_increments: dict[tuple[str, str, str], int],
+    ) -> None:
+        statements: list[tuple[str, tuple[Any, ...]]] = []
+        for (local_minute, channel, direction), amount in minute_increments.items():
+            if int(amount) <= 0:
+                continue
+            statements.append(
+                (
+                    """
+                    INSERT INTO minute_traffic_bytes (local_minute, channel, direction, bytes)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(local_minute, channel, direction) DO UPDATE SET
+                        bytes = bytes + excluded.bytes
+                    """,
+                    (local_minute, channel, direction, int(amount)),
+                )
+            )
+        for (local_hour, channel, direction), amount in hourly_increments.items():
+            if int(amount) <= 0:
+                continue
+            statements.append(
+                (
+                    """
+                    INSERT INTO hourly_traffic_bytes (local_hour, channel, direction, bytes)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(local_hour, channel, direction) DO UPDATE SET
+                        bytes = bytes + excluded.bytes
+                    """,
+                    (local_hour, channel, direction, int(amount)),
+                )
+            )
+        for (local_date, channel, direction), amount in daily_increments.items():
+            if int(amount) <= 0:
+                continue
+            statements.append(
+                (
+                    """
+                    INSERT INTO daily_traffic_bytes (local_date, channel, direction, bytes)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(local_date, channel, direction) DO UPDATE SET
+                        bytes = bytes + excluded.bytes
+                    """,
+                    (local_date, channel, direction, int(amount)),
+                )
+            )
+        if not statements:
+            return
+
+        async with self._lock:
+            self._execute_many(statements)
+
     async def query_daily_metrics(self, *, days: int, room_code: str | None = None) -> dict[str, Any]:
         end_dt = self._local_datetime()
         start_dt = (end_dt - timedelta(days=max(days - 1, 0))).replace(hour=0, minute=0, second=0, microsecond=0)
-        labels = [
-            (start_dt + timedelta(days=index)).strftime("%Y-%m-%d")
-            for index in range(days)
-        ]
+        labels = [(start_dt + timedelta(days=index)).strftime("%Y-%m-%d") for index in range(days)]
         counts = {label: 0 for label in labels}
 
         if room_code:
@@ -226,19 +542,13 @@ class AdminStore:
             "timezone": self.timezone_label,
             "roomCode": room_code,
             "days": days,
-            "items": [
-                {"bucket": label, "label": label, "activePlayers": counts[label]}
-                for label in labels
-            ],
+            "items": [{"bucket": label, "label": label, "activePlayers": counts[label]} for label in labels],
         }
 
     async def query_hourly_metrics(self, *, hours: int, room_code: str | None = None) -> dict[str, Any]:
         end_dt = self._local_datetime().replace(minute=0, second=0, microsecond=0)
         start_dt = end_dt - timedelta(hours=max(hours - 1, 0))
-        labels = [
-            (start_dt + timedelta(hours=index)).strftime("%Y-%m-%dT%H:00:00")
-            for index in range(hours)
-        ]
+        labels = [(start_dt + timedelta(hours=index)).strftime("%Y-%m-%dT%H:00:00") for index in range(hours)]
         counts = {label: 0 for label in labels}
 
         if room_code:
@@ -271,11 +581,63 @@ class AdminStore:
             "timezone": self.timezone_label,
             "roomCode": room_code,
             "hours": hours,
-            "items": [
-                {"bucket": label, "label": label, "activePlayers": counts[label]}
-                for label in labels
-            ],
+            "items": [{"bucket": label, "label": label, "activePlayers": counts[label]} for label in labels],
         }
+
+    async def query_hourly_traffic(self, *, hours: int) -> dict[str, Any]:
+        end_dt = self._local_datetime().replace(minute=0, second=0, microsecond=0)
+        start_dt = end_dt - timedelta(hours=max(hours - 1, 0))
+        labels = [(start_dt + timedelta(hours=index)).strftime("%Y-%m-%dT%H:00:00") for index in range(hours)]
+        rows = await self._fetchall(
+            """
+            SELECT local_hour, channel, direction, bytes
+            FROM hourly_traffic_bytes
+            WHERE local_hour BETWEEN ? AND ?
+            ORDER BY local_hour ASC
+            """,
+            (labels[0], labels[-1]),
+        )
+        return self._build_traffic_payload(labels=labels, rows=rows, hours=hours)
+
+    async def query_daily_traffic(self, *, days: int) -> dict[str, Any]:
+        end_dt = self._local_datetime()
+        start_dt = (end_dt - timedelta(days=max(days - 1, 0))).replace(hour=0, minute=0, second=0, microsecond=0)
+        labels = [(start_dt + timedelta(days=index)).strftime("%Y-%m-%d") for index in range(days)]
+        rows = await self._fetchall(
+            """
+            SELECT local_date, channel, direction, bytes
+            FROM daily_traffic_bytes
+            WHERE local_date BETWEEN ? AND ?
+            ORDER BY local_date ASC
+            """,
+            (labels[0], labels[-1]),
+        )
+        return self._build_traffic_payload(labels=labels, rows=rows, days=days)
+
+    async def query_traffic_history(self, *, range_preset: str, granularity: str) -> dict[str, Any]:
+        normalized_range, normalized_granularity = self.normalize_traffic_history_params(range_preset, granularity)
+        bucket_seconds = TRAFFIC_GRANULARITY_SECONDS[normalized_granularity]
+        bucket_count = TRAFFIC_RANGE_SECONDS[normalized_range] // bucket_seconds
+        if normalized_granularity in {"1m", "5m", "15m"}:
+            return await self._query_minute_traffic_history(
+                range_preset=normalized_range,
+                granularity=normalized_granularity,
+                bucket_seconds=bucket_seconds,
+                bucket_count=bucket_count,
+            )
+        if normalized_granularity == "1h":
+            return await self._query_hourly_traffic_history(
+                range_preset=normalized_range,
+                granularity=normalized_granularity,
+                bucket_seconds=bucket_seconds,
+                bucket_count=bucket_count,
+            )
+        return await self._query_daily_traffic_history(
+            range_preset=normalized_range,
+            granularity=normalized_granularity,
+            bucket_seconds=bucket_seconds,
+            bucket_count=bucket_count,
+        )
 
     async def query_audit_events(
         self,
@@ -371,13 +733,22 @@ class AdminStore:
         now = self._local_datetime()
         daily_cutoff = (now - timedelta(days=max(self.config.daily_retention_days, 1))).strftime("%Y-%m-%d")
         hourly_cutoff = (now - timedelta(days=max(self.config.hourly_retention_days, 1))).strftime("%Y-%m-%dT%H:00:00")
+        minute_cutoff = (now - timedelta(days=max(self.config.hourly_retention_days, 1))).strftime("%Y-%m-%dT%H:%M:00")
         audit_cutoff = (now - timedelta(days=max(self.config.audit_retention_days, 1))).strftime("%Y-%m-%d")
+        session_cutoff_ms = int(
+            (
+                now - timedelta(days=max(self.config.audit_retention_days, 1))
+            ).astimezone(timezone.utc).timestamp()
+            * 1000
+        )
 
         async with self._lock:
             return self._cleanup_retention_sync(
-                daily_cutoff,
-                hourly_cutoff,
-                audit_cutoff,
+                daily_cutoff=daily_cutoff,
+                hourly_cutoff=hourly_cutoff,
+                minute_cutoff=minute_cutoff,
+                audit_cutoff=audit_cutoff,
+                session_cutoff_ms=session_cutoff_ms,
             )
 
     @property
@@ -399,9 +770,22 @@ class AdminStore:
             return f".../{parent_name}/{path.name}"
         return f".../{path.name}"
 
+    @staticmethod
+    def hash_session_token(raw_token: str) -> str:
+        return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
     async def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         async with self._lock:
             return self._fetchall_sync(sql, params)
+
+    async def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
+        async with self._lock:
+            db = self._require_db()
+            cursor = db.execute(sql, params)
+            try:
+                return cursor.fetchone()
+            finally:
+                cursor.close()
 
     def _fetchall_sync(self, sql: str, params: tuple[Any, ...]) -> list[sqlite3.Row]:
         db = self._require_db()
@@ -426,30 +810,276 @@ class AdminStore:
 
     def _cleanup_retention_sync(
         self,
+        *,
         daily_cutoff: str,
         hourly_cutoff: str,
+        minute_cutoff: str,
         audit_cutoff: str,
+        session_cutoff_ms: int,
     ) -> dict[str, int]:
         db = self._require_db()
         daily_cursor = db.execute("DELETE FROM daily_player_activity WHERE local_date < ?", (daily_cutoff,))
         hourly_cursor = db.execute("DELETE FROM hourly_player_activity WHERE local_hour < ?", (hourly_cutoff,))
+        minute_traffic_cursor = db.execute("DELETE FROM minute_traffic_bytes WHERE local_minute < ?", (minute_cutoff,))
+        hourly_traffic_cursor = db.execute("DELETE FROM hourly_traffic_bytes WHERE local_hour < ?", (hourly_cutoff,))
+        daily_traffic_cursor = db.execute("DELETE FROM daily_traffic_bytes WHERE local_date < ?", (daily_cutoff,))
         audit_cursor = db.execute("DELETE FROM audit_events WHERE local_date < ?", (audit_cutoff,))
+        session_cursor = db.execute(
+            """
+            DELETE FROM admin_sessions
+            WHERE COALESCE(ended_at, expires_at) < ?
+            """,
+            (session_cutoff_ms,),
+        )
         try:
             db.commit()
             return {
                 "dailyDeleted": int(daily_cursor.rowcount or 0),
                 "hourlyDeleted": int(hourly_cursor.rowcount or 0),
+                "minuteTrafficDeleted": int(minute_traffic_cursor.rowcount or 0),
+                "hourlyTrafficDeleted": int(hourly_traffic_cursor.rowcount or 0),
+                "dailyTrafficDeleted": int(daily_traffic_cursor.rowcount or 0),
                 "auditDeleted": int(audit_cursor.rowcount or 0),
+                "sessionDeleted": int(session_cursor.rowcount or 0),
             }
         finally:
             daily_cursor.close()
             hourly_cursor.close()
+            minute_traffic_cursor.close()
+            hourly_traffic_cursor.close()
+            daily_traffic_cursor.close()
             audit_cursor.close()
+            session_cursor.close()
 
     def _require_db(self) -> sqlite3.Connection:
         if self._db is None:
             raise RuntimeError("AdminStore is not initialized")
         return self._db
+
+    @classmethod
+    def normalize_traffic_history_params(cls, range_preset: str, granularity: str) -> tuple[str, str]:
+        normalized_range = str(range_preset or "").strip()
+        normalized_granularity = str(granularity or "").strip()
+        allowed = ALLOWED_TRAFFIC_GRANULARITIES.get(normalized_range)
+        if allowed is None or normalized_granularity not in allowed:
+            raise ValueError("invalid_traffic_granularity")
+        return normalized_range, normalized_granularity
+
+    async def _query_minute_traffic_history(
+        self,
+        *,
+        range_preset: str,
+        granularity: str,
+        bucket_seconds: int,
+        bucket_count: int,
+    ) -> dict[str, Any]:
+        current_minute = self._local_datetime().replace(second=0, microsecond=0)
+        end_bucket = self._floor_datetime(current_minute, bucket_seconds)
+        start_bucket = end_bucket - timedelta(seconds=bucket_seconds * max(bucket_count - 1, 0))
+        query_start = start_bucket.strftime("%Y-%m-%dT%H:%M:00")
+        query_end = current_minute.strftime("%Y-%m-%dT%H:%M:00")
+        labels = self._build_traffic_labels(start_bucket=start_bucket, bucket_count=bucket_count, bucket_seconds=bucket_seconds)
+        rows = await self._fetchall(
+            """
+            SELECT local_minute, channel, direction, bytes
+            FROM minute_traffic_bytes
+            WHERE local_minute BETWEEN ? AND ?
+            ORDER BY local_minute ASC
+            """,
+            (query_start, query_end),
+        )
+        aggregated: list[dict[str, Any]] = []
+        grouped: dict[tuple[str, str, str], int] = {}
+        for row in rows:
+            minute_dt = datetime.strptime(str(row["local_minute"]), "%Y-%m-%dT%H:%M:00")
+            bucket_dt = self._floor_datetime(minute_dt, bucket_seconds)
+            bucket_label = self._format_traffic_bucket_label(bucket_dt, bucket_seconds)
+            key = (bucket_label, str(row["channel"]), str(row["direction"]))
+            grouped[key] = grouped.get(key, 0) + int(row["bytes"] or 0)
+        for (bucket_label, channel, direction), amount in grouped.items():
+            aggregated.append(
+                {
+                    "local_hour": bucket_label,
+                    "channel": channel,
+                    "direction": direction,
+                    "bytes": amount,
+                }
+            )
+        return self._build_traffic_payload(
+            labels=labels,
+            rows=aggregated,
+            range_preset=range_preset,
+            granularity=granularity,
+            bucket_seconds=bucket_seconds,
+        )
+
+    async def _query_hourly_traffic_history(
+        self,
+        *,
+        range_preset: str,
+        granularity: str,
+        bucket_seconds: int,
+        bucket_count: int,
+    ) -> dict[str, Any]:
+        end_dt = self._local_datetime().replace(minute=0, second=0, microsecond=0)
+        start_dt = end_dt - timedelta(hours=max(bucket_count - 1, 0))
+        labels = self._build_traffic_labels(start_bucket=start_dt, bucket_count=bucket_count, bucket_seconds=bucket_seconds)
+        rows = await self._fetchall(
+            """
+            SELECT local_hour, channel, direction, bytes
+            FROM hourly_traffic_bytes
+            WHERE local_hour BETWEEN ? AND ?
+            ORDER BY local_hour ASC
+            """,
+            (labels[0], labels[-1]),
+        )
+        return self._build_traffic_payload(
+            labels=labels,
+            rows=rows,
+            range_preset=range_preset,
+            granularity=granularity,
+            bucket_seconds=bucket_seconds,
+        )
+
+    async def _query_daily_traffic_history(
+        self,
+        *,
+        range_preset: str,
+        granularity: str,
+        bucket_seconds: int,
+        bucket_count: int,
+    ) -> dict[str, Any]:
+        end_dt = self._local_datetime().replace(hour=0, minute=0, second=0, microsecond=0)
+        start_dt = end_dt - timedelta(days=max(bucket_count - 1, 0))
+        labels = self._build_traffic_labels(start_bucket=start_dt, bucket_count=bucket_count, bucket_seconds=bucket_seconds)
+        rows = await self._fetchall(
+            """
+            SELECT local_date, channel, direction, bytes
+            FROM daily_traffic_bytes
+            WHERE local_date BETWEEN ? AND ?
+            ORDER BY local_date ASC
+            """,
+            (labels[0], labels[-1]),
+        )
+        return self._build_traffic_payload(
+            labels=labels,
+            rows=rows,
+            range_preset=range_preset,
+            granularity=granularity,
+            bucket_seconds=bucket_seconds,
+        )
+
+    def _build_traffic_payload(
+        self,
+        *,
+        labels: list[str],
+        rows: list[sqlite3.Row] | list[dict[str, Any]],
+        hours: int | None = None,
+        days: int | None = None,
+        range_preset: str | None = None,
+        granularity: str | None = None,
+        bucket_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        items = {
+            label: {
+                "bucket": label,
+                "label": label,
+                "playerIngressBytes": 0,
+                "playerEgressBytes": 0,
+                "webMapIngressBytes": 0,
+                "webMapEgressBytes": 0,
+                "totalIngressBytes": 0,
+                "totalEgressBytes": 0,
+                "totalBytes": 0,
+            }
+            for label in labels
+        }
+        total_ingress = 0
+        total_egress = 0
+
+        for row in rows:
+            label = str(row["local_hour"] if "local_hour" in row.keys() else row["local_date"])
+            if label not in items:
+                continue
+            channel = str(row["channel"])
+            direction = str(row["direction"])
+            amount = int(row["bytes"] or 0)
+            series_key = self._traffic_series_key(channel, direction)
+            if series_key is None:
+                continue
+            item = items[label]
+            item[series_key] += amount
+            if direction == "ingress":
+                item["totalIngressBytes"] += amount
+                total_ingress += amount
+            else:
+                item["totalEgressBytes"] += amount
+                total_egress += amount
+            item["totalBytes"] += amount
+
+        payload: dict[str, Any] = {
+            "timezone": self.timezone_label,
+            "items": [items[label] for label in labels],
+            "totalIngressBytes": total_ingress,
+            "totalEgressBytes": total_egress,
+            "totalBytes": total_ingress + total_egress,
+        }
+        if hours is not None:
+            payload["hours"] = hours
+        if days is not None:
+            payload["days"] = days
+        if range_preset is not None:
+            payload["range"] = range_preset
+        if granularity is not None:
+            payload["granularity"] = granularity
+        if bucket_seconds is not None:
+            payload["bucketSeconds"] = bucket_seconds
+        return payload
+
+    @staticmethod
+    def _floor_datetime(value: datetime, bucket_seconds: int) -> datetime:
+        if bucket_seconds >= 24 * 60 * 60:
+            return value.replace(hour=0, minute=0, second=0, microsecond=0)
+        if bucket_seconds >= 60 * 60:
+            return value.replace(minute=0, second=0, microsecond=0)
+        bucket_minutes = max(bucket_seconds // 60, 1)
+        floored_minute = (value.minute // bucket_minutes) * bucket_minutes
+        return value.replace(minute=floored_minute, second=0, microsecond=0)
+
+    def _build_traffic_labels(self, *, start_bucket: datetime, bucket_count: int, bucket_seconds: int) -> list[str]:
+        return [
+            self._format_traffic_bucket_label(start_bucket + timedelta(seconds=bucket_seconds * index), bucket_seconds)
+            for index in range(bucket_count)
+        ]
+
+    @staticmethod
+    def _format_traffic_bucket_label(value: datetime, bucket_seconds: int) -> str:
+        if bucket_seconds >= 24 * 60 * 60:
+            return value.strftime("%Y-%m-%d")
+        return value.strftime("%Y-%m-%dT%H:%M:00")
+
+    @staticmethod
+    def _traffic_series_key(channel: str, direction: str) -> str | None:
+        mapping = {
+            ("player", "ingress"): "playerIngressBytes",
+            ("player", "egress"): "playerEgressBytes",
+            ("web_map", "ingress"): "webMapIngressBytes",
+            ("web_map", "egress"): "webMapEgressBytes",
+        }
+        return mapping.get((channel, direction))
+
+    @staticmethod
+    def _serialize_admin_session_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "sessionId": str(row["session_id"]),
+            "actorId": str(row["actor_id"]),
+            "remoteAddr": row["remote_addr"],
+            "createdAt": int(row["created_at"]),
+            "lastSeenAt": int(row["last_seen_at"]),
+            "expiresAt": int(row["expires_at"]),
+            "endedAt": int(row["ended_at"]) if row["ended_at"] is not None else None,
+            "endReason": row["end_reason"],
+        }
 
     @staticmethod
     def _to_timestamp_ms(value: float | None) -> int:

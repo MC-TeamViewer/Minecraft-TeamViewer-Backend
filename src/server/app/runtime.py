@@ -3,6 +3,7 @@ import logging
 import os
 
 from ..admin.sse import AdminSseHub
+from ..admin.traffic import TrafficStatsService
 from ..core.broadcaster import Broadcaster
 from ..core.codec import ProtobufMessageCodec
 from ..state import ServerState
@@ -42,7 +43,9 @@ broadcaster = Broadcaster(state)
 broadcast_task: asyncio.Task | None = None
 admin_store = None
 admin_payload_service = None
+admin_traffic_service: TrafficStatsService | None = None
 admin_retention_task: asyncio.Task | None = None
+admin_traffic_flush_task: asyncio.Task | None = None
 admin_sse_hub = AdminSseHub()
 web_map_connection_meta: dict[str, dict] = {}
 admin_runtime_stats = {

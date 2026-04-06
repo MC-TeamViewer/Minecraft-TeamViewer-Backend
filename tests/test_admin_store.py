@@ -88,7 +88,7 @@ async def test_audit_query_supports_filters_and_pagination(tmp_path: Path) -> No
             actor_type="admin",
             actor_id="admin",
             success=False,
-            detail={"path": "/admin"},
+            detail={"path": "/admin/api/session/login"},
         )
         await store.record_audit_event(
             event_type="web_map_handshake_success",
@@ -108,5 +108,82 @@ async def test_audit_query_supports_filters_and_pagination(tmp_path: Path) -> No
         assert page_one["items"][0]["id"] > page_one["items"][1]["id"]
         assert page_two["items"]
         assert page_two["items"][0]["id"] < page_one["items"][-1]["id"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_sessions_support_lookup_touch_and_expire(tmp_path: Path) -> None:
+    store = AdminStore(AdminStoreConfig(db_path=str(tmp_path / "session.db")))
+    await store.initialize()
+    try:
+        session, raw_token = await store.create_admin_session(actor_id="admin", remote_addr="127.0.0.1", ttl_sec=3600)
+        loaded = await store.get_admin_session_by_token(raw_token)
+        assert loaded is not None
+        assert loaded["sessionId"] == session["sessionId"]
+
+        touched = await store.touch_admin_session(session["sessionId"], ttl_sec=7200)
+        assert touched is not None
+        assert touched["expiresAt"] > loaded["expiresAt"]
+
+        store._execute(  # noqa: SLF001
+            "UPDATE admin_sessions SET expires_at = 1 WHERE session_id = ?",
+            (session["sessionId"],),
+        )
+        expired = await store.expire_admin_sessions()
+        assert len(expired) == 1
+        assert expired[0]["sessionId"] == session["sessionId"]
+        assert expired[0]["endReason"] == "expired"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_traffic_queries_zero_fill_and_sum_totals(tmp_path: Path) -> None:
+    store = AdminStore(AdminStoreConfig(db_path=str(tmp_path / "traffic.db")))
+    await store.initialize()
+    try:
+        now_local = datetime.now().astimezone().replace(second=0, microsecond=0)
+        current_minute = now_local.strftime("%Y-%m-%dT%H:%M:00")
+        current_5m = now_local.replace(minute=(now_local.minute // 5) * 5).strftime("%Y-%m-%dT%H:%M:00")
+        current_hour = now_local.replace(minute=0).strftime("%Y-%m-%dT%H:00:00")
+        current_day = now_local.strftime("%Y-%m-%d")
+        await store.apply_traffic_increments(
+            minute_increments={
+                (current_minute, "player", "ingress"): 1200,
+                (current_minute, "player", "egress"): 800,
+                (current_minute, "web_map", "egress"): 400,
+            },
+            hourly_increments={
+                (current_hour, "player", "ingress"): 1200,
+                (current_hour, "player", "egress"): 800,
+                (current_hour, "web_map", "egress"): 400,
+            },
+            daily_increments={
+                (current_day, "player", "ingress"): 1200,
+                (current_day, "player", "egress"): 800,
+                (current_day, "web_map", "egress"): 400,
+            },
+        )
+
+        hourly = await store.query_hourly_traffic(hours=2)
+        daily = await store.query_daily_traffic(days=2)
+        history_1m = await store.query_traffic_history(range_preset="1h", granularity="1m")
+        history_5m = await store.query_traffic_history(range_preset="6h", granularity="5m")
+
+        assert hourly["items"][-1]["playerIngressBytes"] == 1200
+        assert hourly["items"][-1]["totalBytes"] == 2400
+        assert hourly["totalIngressBytes"] == 1200
+        assert hourly["totalEgressBytes"] == 1200
+        assert hourly["items"][0]["totalBytes"] == 0
+
+        assert daily["items"][-1]["totalBytes"] == 2400
+        assert daily["totalBytes"] == 2400
+        assert history_1m["range"] == "1h"
+        assert history_1m["granularity"] == "1m"
+        assert history_1m["items"][-1]["totalBytes"] == 2400
+        assert history_5m["range"] == "6h"
+        assert history_5m["granularity"] == "5m"
+        assert any(item["bucket"] == current_5m and item["totalBytes"] == 2400 for item in history_5m["items"])
     finally:
         await store.close()

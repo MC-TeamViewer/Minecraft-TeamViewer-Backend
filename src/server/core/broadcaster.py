@@ -3,6 +3,7 @@ import time
 
 from fastapi import WebSocketDisconnect
 
+from ..admin.traffic import send_tracked_websocket_bytes
 from .codec import ProtobufMessageCodec
 from .protocol import DigestPacket, PatchPacket, RefreshRequestOutboundPacket, ReportRateHintPacket, SnapshotFullPacket
 from ..state import ServerState
@@ -38,6 +39,9 @@ class Broadcaster:
             encoded = self._encode_message(packet)
             cache[cache_key] = encoded
         return encoded
+
+    async def _send_encoded(self, ws, payload: bytes, *, channel: str) -> None:
+        await send_tracked_websocket_bytes(ws, payload, channel=channel)
 
     def _build_full_message(
         self,
@@ -252,7 +256,7 @@ class Broadcaster:
             extra={"server_time": time.time()},
         )
 
-        await ws.send_bytes(self._encode_message(message))
+        await self._send_encoded(ws, self._encode_message(message), channel="web_map")
         self._web_map_last_states[web_map_id] = view_state
 
     def _build_visible_state_for_player(self, player_id: str) -> dict:
@@ -286,7 +290,7 @@ class Broadcaster:
         sync_view_state = self._build_player_sync_view_state(visible)
         sync_view_state["playerMarks"] = dict(self.state.player_marks)
         message = self._build_full_message(sync_view_state)
-        await ws.send_bytes(self._encode_message(message))
+        await self._send_encoded(ws, self._encode_message(message), channel="player")
 
     async def maybe_send_digest(self, player_id: str, visible_state: dict | None = None) -> None:
         """按节流周期发送摘要，帮助客户端做状态一致性检测。"""
@@ -312,7 +316,7 @@ class Broadcaster:
         message = DigestPacket(
             hashes=hashes,
         )
-        await ws.send_bytes(self._encode_message(message))
+        await self._send_encoded(ws, self._encode_message(message), channel="player")
 
     async def broadcast_web_map_updates(self, force_full: bool = False) -> None:
         """向网页地图观察端广播增量（必要时全量）。"""
@@ -355,7 +359,7 @@ class Broadcaster:
                         )
                         encoded = self._encode_message(message)
                         encoded_full_by_room[room_key] = encoded
-                    await ws.send_bytes(encoded)
+                    await self._send_encoded(ws, encoded, channel="web_map")
                 else:
                     patch_state = self._compute_web_map_patch(previous_state, current_state)
                     if self._has_web_map_patch_changes(patch_state):
@@ -365,7 +369,7 @@ class Broadcaster:
                             channel="web_map",
                             extra={"server_time": time.time()},
                         )
-                        await ws.send_bytes(self._encode_message(message))
+                        await self._send_encoded(ws, self._encode_message(message), channel="web_map")
 
                 self._web_map_last_states[web_map_id] = current_state
             except WebSocketDisconnect as e:
@@ -433,14 +437,14 @@ class Broadcaster:
                         sync_view_state = self._build_player_sync_view_state(visible)
                         sync_view_state["playerMarks"] = dict(self.state.player_marks)
                         full_msg = self._build_full_message(sync_view_state)
-                        await ws.send_bytes(self._encode_message(full_msg))
+                        await self._send_encoded(ws, self._encode_message(full_msg), channel="player")
                     await self.maybe_send_digest(player_id, visible)
                 elif force_full_to_delta:
                     sync_view_state = self._build_player_sync_view_state(self._build_global_player_sync_node_state())
                     sync_view_state["playerMarks"] = dict(self.state.player_marks)
                     full_msg = self._build_full_message(sync_view_state)
                     encoded = self._encode_message_once(full_msg, encoded_cache, "global_player_full")
-                    await ws.send_bytes(encoded)
+                    await self._send_encoded(ws, encoded, channel="player")
                 elif changed:
                     patch_state = {
                         "players": changes["players"],
@@ -450,7 +454,7 @@ class Broadcaster:
                     }
                     patch_msg = self._build_patch_message(patch_state)
                     encoded = self._encode_message_once(patch_msg, encoded_cache, "global_player_patch")
-                    await ws.send_bytes(encoded)
+                    await self._send_encoded(ws, encoded, channel="player")
 
                 if not requires_scoped:
                     await self.maybe_send_digest(player_id)
@@ -530,7 +534,7 @@ class Broadcaster:
             battleChunks=battle_chunks,
         )
         try:
-            await ws.send_bytes(self._encode_message(message))
+            await self._send_encoded(ws, self._encode_message(message), channel="player")
             self.state.mark_refresh_request_sent(source_id, now)
             logger.debug(
                 "Sent refresh_req "
@@ -577,7 +581,7 @@ class Broadcaster:
                 if encoded is None:
                     encoded = self._encode_message(packet)
                     encoded_cache[cache_key] = encoded
-                await ws.send_bytes(encoded)
+                await self._send_encoded(ws, encoded, channel="player")
             except Exception as e:
                 logger.warning(
                     "Error sending report_rate_hint to player=%s state=(%s): %s",

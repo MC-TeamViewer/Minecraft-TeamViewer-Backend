@@ -1,11 +1,20 @@
-import { fetchAudit, fetchDailyMetrics, fetchHourlyMetrics, fetchOverview } from "@/api";
+import {
+  fetchAudit,
+  fetchDailyMetrics,
+  fetchHourlyMetrics,
+  fetchLiveTraffic,
+  fetchOverview,
+  fetchTrafficHistory,
+} from "@/api";
 import type { BootstrapPayload, DashboardFilters } from "@/types";
 
 export async function loadAdminBootstrap(filters: DashboardFilters): Promise<BootstrapPayload> {
-  const [overview, dailyMetrics, hourlyMetrics, audit] = await Promise.all([
+  const [overview, dailyMetrics, hourlyMetrics, liveTraffic, trafficHistory, audit] = await Promise.all([
     fetchOverview(),
     fetchDailyMetrics(filters.metrics),
     fetchHourlyMetrics(filters.metrics),
+    fetchLiveTraffic(),
+    fetchTrafficHistory(filters.traffic),
     fetchAudit(filters.audit),
   ]);
 
@@ -14,6 +23,8 @@ export async function loadAdminBootstrap(filters: DashboardFilters): Promise<Boo
     overview,
     dailyMetrics,
     hourlyMetrics,
+    liveTraffic,
+    trafficHistory,
     audit,
   };
 }

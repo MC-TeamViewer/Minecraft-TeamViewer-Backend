@@ -4,6 +4,7 @@ import "element-plus/es/components/button/style/css";
 import "element-plus/es/components/card/style/css";
 import "element-plus/es/components/checkbox-button/style/css";
 import "element-plus/es/components/checkbox-group/style/css";
+import "element-plus/es/components/input/style/css";
 import "element-plus/es/components/option/style/css";
 import "element-plus/es/components/pagination/style/css";
 import "element-plus/es/components/segmented/style/css";

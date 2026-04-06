@@ -6,17 +6,37 @@ import ElSkeleton from "element-plus/es/components/skeleton/index";
 import ElTag from "element-plus/es/components/tag/index";
 import { computed, defineAsyncComponent, onMounted, ref, watch } from "vue";
 
-import { fetchAudit, fetchDailyMetrics, fetchHourlyMetrics } from "@/api";
+import {
+  ApiError,
+  fetchAudit,
+  fetchDailyMetrics,
+  fetchHourlyMetrics,
+  fetchSession,
+  fetchTrafficHistory,
+  loginSession,
+  logoutSession,
+} from "@/api";
+import LiveTrafficCards from "@/components/LiveTrafficCards.vue";
+import LoginPanel from "@/components/LoginPanel.vue";
 import MetricChartCard from "@/components/MetricChartCard.vue";
 import MetricsToolbar from "@/components/MetricsToolbar.vue";
 import OverviewCards from "@/components/OverviewCards.vue";
+import TrafficChartCard from "@/components/TrafficChartCard.vue";
+import TrafficToolbar from "@/components/TrafficToolbar.vue";
 import { loadAdminBootstrap } from "@/composables/useAdminBootstrap";
 import { useAdminSse } from "@/composables/useAdminSse";
 import { useAuditState } from "@/composables/useAuditState";
 import { useMetricsState } from "@/composables/useMetricsState";
 import { useOverviewState } from "@/composables/useOverviewState";
-import type { AuditFilters as AuditFiltersModel, BootstrapPayload, DashboardFilters, MetricsFilters } from "@/types";
-import { DEFAULT_AUDIT_FILTERS, DEFAULT_METRICS_FILTERS } from "@/types";
+import type {
+  AdminSessionPayload,
+  AuditFilters as AuditFiltersModel,
+  BootstrapPayload,
+  DashboardFilters,
+  MetricsFilters,
+  TrafficFilters,
+} from "@/types";
+import { DEFAULT_AUDIT_FILTERS, DEFAULT_METRICS_FILTERS, DEFAULT_TRAFFIC_FILTERS } from "@/types";
 
 const RoomOverviewTable = defineAsyncComponent(() => import("@/components/RoomOverviewTable.vue"));
 const ConnectionStatusTable = defineAsyncComponent(() => import("@/components/ConnectionStatusTable.vue"));
@@ -25,24 +45,53 @@ const AuditTable = defineAsyncComponent(() => import("@/components/AuditTable.vu
 
 const auditFilters = ref<AuditFiltersModel>({ ...DEFAULT_AUDIT_FILTERS });
 const metricsFilters = ref<MetricsFilters>({ ...DEFAULT_METRICS_FILTERS });
+const trafficFilters = ref<TrafficFilters>({ ...DEFAULT_TRAFFIC_FILTERS });
+const session = ref<AdminSessionPayload | null>(null);
+const sessionLoading = ref(true);
+const loginLoading = ref(false);
+const loginError = ref<string | null>(null);
 const isLoading = ref(true);
 const loadError = ref<string | null>(null);
 const dailyMetricsLoading = ref(false);
 const hourlyMetricsLoading = ref(false);
+const trafficHistoryLoading = ref(false);
 let metricsRefreshVersion = 0;
+let trafficRefreshVersion = 0;
 
-const { overview, roomOptions, applyOverview } = useOverviewState();
-const { dailyMetrics, hourlyMetrics, applyDailyMetrics, applyHourlyMetrics } = useMetricsState();
-const { auditPayload, eventTypes, applyAudit } = useAuditState();
+const { overview, roomOptions, applyOverview, resetOverview } = useOverviewState();
+const {
+  dailyMetrics,
+  hourlyMetrics,
+  liveTraffic,
+  trafficHistory,
+  applyDailyMetrics,
+  applyHourlyMetrics,
+  applyLiveTraffic,
+  applyTrafficHistory,
+  resetMetrics,
+} = useMetricsState();
+const { auditPayload, eventTypes, applyAudit, resetAudit } = useAuditState();
 
 const dashboardFilters = computed<DashboardFilters>(() => ({
   audit: auditFilters.value,
   metrics: metricsFilters.value,
+  traffic: trafficFilters.value,
 }));
 
 function markLoaded() {
   isLoading.value = false;
   loadError.value = null;
+}
+
+function resetDashboard() {
+  resetOverview();
+  resetMetrics();
+  resetAudit();
+  isLoading.value = true;
+  loadError.value = null;
+  dailyMetricsLoading.value = false;
+  hourlyMetricsLoading.value = false;
+  trafficHistoryLoading.value = false;
 }
 
 function matchesDailyFilters(payload: { days?: number; roomCode?: string | null }) {
@@ -59,17 +108,49 @@ function applyBootstrap(payload: BootstrapPayload) {
   applyOverview(payload.overview);
   applyDailyMetrics(payload.dailyMetrics);
   applyHourlyMetrics(payload.hourlyMetrics);
+  applyLiveTraffic(payload.liveTraffic);
+  applyTrafficHistory(payload.trafficHistory);
   applyAudit(payload.audit);
   dailyMetricsLoading.value = false;
   hourlyMetricsLoading.value = false;
+  trafficHistoryLoading.value = false;
   markLoaded();
 }
 
-async function fallbackBootstrap() {
+function resolveErrorMessage(error: unknown, fallback = "request_failed"): string {
+  if (error instanceof ApiError) {
+    return `${fallback}:${error.status}`;
+  }
+  return error instanceof Error ? error.message : fallback;
+}
+
+async function handleUnauthorizedState() {
+  stop();
+  session.value = null;
+  loginError.value = "会话已失效，请重新登录。";
+  resetDashboard();
+  sessionLoading.value = false;
+}
+
+async function guardApiCall(action: () => Promise<void>, fallbackMessage: string) {
   try {
-    applyBootstrap(await loadAdminBootstrap(dashboardFilters.value));
+    await action();
+    return true;
   } catch (error) {
-    loadError.value = error instanceof Error ? error.message : "bootstrap_failed";
+    if (error instanceof ApiError && error.status === 401) {
+      await handleUnauthorizedState();
+      return false;
+    }
+    loadError.value = resolveErrorMessage(error, fallbackMessage);
+    return false;
+  }
+}
+
+async function fallbackBootstrap() {
+  const ok = await guardApiCall(async () => {
+    applyBootstrap(await loadAdminBootstrap(dashboardFilters.value));
+  }, "bootstrap_failed");
+  if (!ok) {
     isLoading.value = false;
   }
 }
@@ -79,7 +160,7 @@ async function refreshMetricsOnly() {
   const nextFilters = { ...metricsFilters.value };
   dailyMetricsLoading.value = true;
   hourlyMetricsLoading.value = true;
-  try {
+  const ok = await guardApiCall(async () => {
     const [daily, hourly] = await Promise.all([
       fetchDailyMetrics(nextFilters),
       fetchHourlyMetrics(nextFilters),
@@ -89,19 +170,67 @@ async function refreshMetricsOnly() {
     }
     applyDailyMetrics(daily);
     applyHourlyMetrics(hourly);
-  } finally {
-    if (refreshVersion === metricsRefreshVersion) {
-      dailyMetricsLoading.value = false;
-      hourlyMetricsLoading.value = false;
+  }, "metrics_refresh_failed");
+  if (!ok && refreshVersion === metricsRefreshVersion) {
+    dailyMetricsLoading.value = false;
+    hourlyMetricsLoading.value = false;
+    return;
+  }
+  if (refreshVersion === metricsRefreshVersion) {
+    dailyMetricsLoading.value = false;
+    hourlyMetricsLoading.value = false;
+  }
+}
+
+async function refreshTrafficOnly() {
+  const refreshVersion = ++trafficRefreshVersion;
+  const nextFilters = { ...trafficFilters.value };
+  trafficHistoryLoading.value = true;
+  const ok = await guardApiCall(async () => {
+    const history = await fetchTrafficHistory(nextFilters);
+    if (refreshVersion !== trafficRefreshVersion) {
+      return;
     }
+    applyTrafficHistory(history);
+  }, "traffic_refresh_failed");
+  if (!ok && refreshVersion === trafficRefreshVersion) {
+    trafficHistoryLoading.value = false;
+    return;
+  }
+  if (refreshVersion === trafficRefreshVersion) {
+    trafficHistoryLoading.value = false;
   }
 }
 
 async function refreshAuditOnly() {
-  applyAudit(await fetchAudit(auditFilters.value));
+  await guardApiCall(async () => {
+    applyAudit(await fetchAudit(auditFilters.value));
+  }, "audit_refresh_failed");
 }
 
-const { status, lastHeartbeatAt, connect, restart, waitForBootstrap } = useAdminSse({
+async function hydrateSession() {
+  sessionLoading.value = true;
+  loginError.value = null;
+  try {
+    session.value = await fetchSession();
+  } catch (error) {
+    if (!(error instanceof ApiError && error.status === 401)) {
+      loginError.value = resolveErrorMessage(error, "session_check_failed");
+    }
+    session.value = null;
+  } finally {
+    sessionLoading.value = false;
+  }
+}
+
+const {
+  status,
+  lastHeartbeatAt,
+  connect,
+  restart,
+  stop,
+  waitForBootstrap,
+} = useAdminSse({
   getDashboardFilters: () => dashboardFilters.value,
   onBootstrap: applyBootstrap,
   onOverview: (payload) => {
@@ -122,16 +251,50 @@ const { status, lastHeartbeatAt, connect, restart, waitForBootstrap } = useAdmin
     applyHourlyMetrics(payload);
     hourlyMetricsLoading.value = false;
   },
+  onLiveTraffic: applyLiveTraffic,
+  onTrafficHistory: (payload) => {
+    if (payload.range !== trafficFilters.value.range || payload.granularity !== trafficFilters.value.granularity) {
+      return;
+    }
+    applyTrafficHistory(payload);
+    trafficHistoryLoading.value = false;
+  },
   onAudit: applyAudit,
+  onError: async () => {
+    try {
+      await fetchSession();
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        await handleUnauthorizedState();
+      }
+    }
+  },
 });
+
+async function activateDashboard() {
+  if (!session.value) {
+    return;
+  }
+  resetDashboard();
+  connect();
+  const receivedBootstrap = await waitForBootstrap(1200);
+  if (!receivedBootstrap) {
+    await fallbackBootstrap();
+  }
+}
 
 watch(
   auditFilters,
   async () => {
+    if (!session.value) {
+      return;
+    }
     try {
       await refreshAuditOnly();
     } finally {
-      restart();
+      if (session.value) {
+        restart();
+      }
     }
   },
   { deep: true },
@@ -140,20 +303,43 @@ watch(
 watch(
   metricsFilters,
   async () => {
+    if (!session.value) {
+      return;
+    }
     try {
       await refreshMetricsOnly();
     } finally {
-      restart();
+      if (session.value) {
+        restart();
+      }
+    }
+  },
+  { deep: true },
+);
+
+watch(
+  trafficFilters,
+  async () => {
+    if (!session.value) {
+      return;
+    }
+    try {
+      await refreshTrafficOnly();
+    } finally {
+      if (session.value) {
+        restart();
+      }
     }
   },
   { deep: true },
 );
 
 onMounted(async () => {
-  connect();
-  const receivedBootstrap = await waitForBootstrap(1200);
-  if (!receivedBootstrap) {
-    await fallbackBootstrap();
+  await hydrateSession();
+  if (session.value) {
+    await activateDashboard();
+  } else {
+    isLoading.value = false;
   }
 });
 
@@ -169,8 +355,11 @@ const liveStatusLabel = computed(() => {
 
 const dailyChartKey = computed(() => `daily:${metricsFilters.value.dailyDays}:${metricsFilters.value.roomCode || "global"}`);
 const hourlyChartKey = computed(() => `hourly:${metricsFilters.value.hourlyHours}:${metricsFilters.value.roomCode || "global"}`);
+const trafficChartKey = computed(() => `traffic:${trafficFilters.value.range}:${trafficFilters.value.granularity}`);
 
 const heroTags = computed(() => [
+  `管理员 ${session.value?.actorId ?? "-"}`,
+  `会话 ${session.value?.sessionId ?? "-"}`,
   `时区 ${overview.value?.timezone ?? "-"}`,
   `数据库 ${overview.value?.dbPathMasked ?? "-"}`,
   `广播 ${overview.value?.broadcastHz ?? "-"} Hz`,
@@ -184,11 +373,40 @@ const heroTags = computed(() => [
 ]);
 
 async function handleManualRefresh() {
+  if (!session.value) {
+    return;
+  }
   restart();
   const receivedBootstrap = await waitForBootstrap(1200);
   if (!receivedBootstrap) {
     await fallbackBootstrap();
   }
+}
+
+async function handleLogin(payload: { username: string; password: string }) {
+  loginLoading.value = true;
+  loginError.value = null;
+  try {
+    session.value = await loginSession(payload.username, payload.password);
+    await activateDashboard();
+  } catch (error) {
+    loginError.value = resolveErrorMessage(error, "login_failed");
+  } finally {
+    loginLoading.value = false;
+  }
+}
+
+async function handleLogout() {
+  try {
+    await logoutSession();
+  } catch (_error) {
+    // Ignore logout errors locally; session will be cleared anyway.
+  }
+  stop();
+  session.value = null;
+  loginError.value = null;
+  resetDashboard();
+  isLoading.value = false;
 }
 
 function updateAuditFilters(value: AuditFiltersModel) {
@@ -198,22 +416,36 @@ function updateAuditFilters(value: AuditFiltersModel) {
 function updateMetricsFilters(value: MetricsFilters) {
   metricsFilters.value = value;
 }
+
+function updateTrafficFilters(value: TrafficFilters) {
+  trafficFilters.value = value;
+}
 </script>
 
 <template>
-  <div class="app-shell">
+  <el-skeleton v-if="sessionLoading" :rows="8" animated class="surface-card app-loading-shell" />
+
+  <LoginPanel
+    v-else-if="!session"
+    :loading="loginLoading"
+    :error-message="loginError"
+    @login="handleLogin"
+  />
+
+  <div v-else class="app-shell">
     <header class="hero-panel">
       <div>
         <span class="hero-eyebrow">只读后台</span>
         <h1>TeamViewRelay Admin</h1>
         <p>
-          统一查看在线概况、房间状态、连接详情、最近 DAU、小时活跃，以及实时审计日志。
+          统一查看在线概况、实时网速、自定义粒度历史流量、最近 DAU、小时活跃，以及实时审计日志。
         </p>
       </div>
       <div class="hero-actions">
         <el-tag :type="status === 'live' ? 'success' : status === 'reconnecting' ? 'warning' : 'info'" round>
           {{ liveStatusLabel }}
         </el-tag>
+        <el-button @click="handleLogout">退出登录</el-button>
         <el-button type="primary" @click="handleManualRefresh">刷新全页</el-button>
       </div>
       <div class="hero-tag-row">
@@ -234,6 +466,21 @@ function updateMetricsFilters(value: MetricsFilters) {
 
     <template v-else>
       <OverviewCards :overview="overview" />
+      <LiveTrafficCards :traffic="liveTraffic" />
+
+      <el-card shadow="never" class="surface-card">
+        <TrafficToolbar
+          :model-value="trafficFilters"
+          @update:model-value="updateTrafficFilters"
+        />
+      </el-card>
+
+      <TrafficChartCard
+        :key="trafficChartKey"
+        title="历史流量"
+        description="按所选范围与粒度汇总核心业务 WebSocket 双向流量。"
+        :metrics="trafficHistory"
+      />
 
       <el-card shadow="never" class="surface-card">
         <MetricsToolbar
@@ -267,18 +514,11 @@ function updateMetricsFilters(value: MetricsFilters) {
         <AuditFilters
           :model-value="auditFilters"
           :event-types="eventTypes"
-          @update:model-value="updateAuditFilters"
           @refresh="refreshAuditOnly"
+          @update:model-value="updateAuditFilters"
         />
         <AuditTable :audit="auditPayload" />
       </section>
     </template>
   </div>
 </template>
-
-<style scoped>
-.audit-stack {
-  display: grid;
-  gap: 16px;
-}
-</style>

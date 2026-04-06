@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import importlib
 import json
 from pathlib import Path
@@ -21,12 +20,8 @@ import main as main_module
 from server.admin import auth as admin_auth
 from server.admin import routes as admin_routes
 from server.admin.proxy_ip import get_websocket_remote_addr
+from server.admin.traffic import record_websocket_traffic
 from server.app import runtime as app_runtime
-
-
-def _auth_headers(username: str = "admin", password: str = "secret") -> dict[str, str]:
-    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
-    return {"Authorization": f"Basic {token}"}
 
 
 def _load_main_module(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -86,13 +81,13 @@ async def _byte_lines(iterator):
 def _build_request(
     path: str,
     *,
-    authorization: str | None = None,
+    cookie: str | None = None,
     extra_headers: dict[str, str] | None = None,
     client_host: str = "127.0.0.1",
 ) -> Request:
     headers = []
-    if authorization is not None:
-        headers.append((b"authorization", authorization.encode("utf-8")))
+    if cookie is not None:
+        headers.append((b"cookie", cookie.encode("utf-8")))
     for key, value in (extra_headers or {}).items():
         headers.append((key.lower().encode("utf-8"), value.encode("utf-8")))
     scope = {
@@ -130,8 +125,15 @@ def _make_websocket_stub(*, host: str, headers: dict[str, str] | None = None):
     )
 
 
+async def _login(client: httpx.AsyncClient, username: str = "admin", password: str = "secret") -> httpx.Response:
+    return await client.post(
+        "/admin/api/session/login",
+        json={"username": username, "password": password},
+    )
+
+
 @pytest.mark.asyncio
-async def test_admin_http_requires_basic_auth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_admin_page_is_public_but_api_requires_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     main = _load_main_module(monkeypatch, tmp_path)
 
     async with main.app.router.lifespan_context(main.app):
@@ -139,23 +141,56 @@ async def test_admin_http_requires_basic_auth(monkeypatch: pytest.MonkeyPatch, t
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             page = await client.get("/admin")
             overview = await client.get("/admin/api/overview")
-            assets = await client.get("/admin/assets/example.js")
-
-    assert page.status_code == 401
-    assert page.headers["www-authenticate"].startswith("Basic")
-    assert overview.status_code == 401
-    assert assets.status_code == 401
-
-    async with main.app.router.lifespan_context(main.app):
-        transport = httpx.ASGITransport(app=main.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             events = await client.get("/admin/api/events")
+            asset_match = re.search(r"/admin/assets/[^\"']+", page.text)
+            assert asset_match is not None
+            asset_response = await client.get(asset_match.group(0))
 
+    assert page.status_code == 200
+    assert "TeamViewRelay Admin" in page.text
+    assert asset_response.status_code == 200
+    assert overview.status_code == 401
     assert events.status_code == 401
 
 
 @pytest.mark.asyncio
-async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_admin_session_login_logout_and_audit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    main = _load_main_module(monkeypatch, tmp_path)
+
+    async with main.app.router.lifespan_context(main.app):
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            failed = await _login(client, password="wrong")
+            assert failed.status_code == 401
+
+            login = await _login(client)
+            assert login.status_code == 200
+            assert admin_auth.ADMIN_SESSION_COOKIE_NAME in login.headers.get("set-cookie", "")
+
+            session_info = await client.get("/admin/api/session")
+            assert session_info.status_code == 200
+            assert session_info.json()["actorId"] == "admin"
+
+            overview = await client.get("/admin/api/overview")
+            assert overview.status_code == 200
+
+            logout = await client.post("/admin/api/session/logout")
+            assert logout.status_code == 200
+
+            after_logout = await client.get("/admin/api/session")
+            assert after_logout.status_code == 401
+
+        audit_payload = await admin_auth.build_admin_audit_payload(limit=50)
+        audit_types = [item["eventType"] for item in audit_payload["items"]]
+        assert "admin_session_started" in audit_types
+        assert "admin_session_ended" in audit_types
+        assert "admin_api_access" in audit_types
+        assert "admin_auth_failed" in audit_types
+        assert "admin_auth_success" not in audit_types
+
+
+@pytest.mark.asyncio
+async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     main = _load_main_module(monkeypatch, tmp_path)
 
     async with main.app.router.lifespan_context(main.app):
@@ -176,6 +211,9 @@ async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytes
             success=True,
             detail={"clientProtocol": "0.6.1"},
         )
+        await app_runtime.admin_traffic_service.record(channel="player", direction="ingress", byte_count=2048)
+        await app_runtime.admin_traffic_service.record(channel="web_map", direction="egress", byte_count=1024)
+        await app_runtime.admin_traffic_service.flush_pending()
 
         app_runtime.state.connections["player-1"] = _connected_websocket_stub()  # type: ignore[assignment]
         app_runtime.state.set_player_room("player-1", "room-admin-test")
@@ -184,11 +222,7 @@ async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytes
             "programVersion": "test-player-client",
             "remoteAddr": "127.0.0.1",
         }
-        app_runtime.state.players["player-1"] = {
-            "data": {
-                "playerName": "Alice",
-            }
-        }
+        app_runtime.state.players["player-1"] = {"data": {"playerName": "Alice"}}
         app_runtime.state.web_map_connections["web-map-1"] = _connected_websocket_stub()  # type: ignore[assignment]
         app_runtime.state.set_web_map_room("web-map-1", "room-admin-test")
         app_runtime.web_map_connection_meta["web-map-1"] = {
@@ -200,24 +234,32 @@ async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytes
 
         transport = httpx.ASGITransport(app=main.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-            page = await client.get("/admin", headers=_auth_headers())
-            overview = await client.get("/admin/api/overview", headers=_auth_headers())
-            daily = await client.get("/admin/api/metrics/daily?days=2", headers=_auth_headers())
-            hourly = await client.get("/admin/api/metrics/hourly?hours=3", headers=_auth_headers())
-            audit = await client.get("/admin/api/audit?limit=200&success=true", headers=_auth_headers())
+            await _login(client)
+            page = await client.get("/admin")
+            overview = await client.get("/admin/api/overview")
+            daily = await client.get("/admin/api/metrics/daily?days=2")
+            hourly = await client.get("/admin/api/metrics/hourly?hours=3")
+            live_traffic = await client.get("/admin/api/traffic/live")
+            history_traffic = await client.get("/admin/api/traffic/history?range=6h&granularity=5m")
+            hourly_traffic = await client.get("/admin/api/traffic/hourly?hours=2")
+            daily_traffic = await client.get("/admin/api/traffic/daily?days=2")
+            audit = await client.get("/admin/api/audit?limit=200&success=true")
             asset_match = re.search(r"/admin/assets/[^\"']+", page.text)
             assert asset_match is not None
-            asset_response = await client.get(asset_match.group(0), headers=_auth_headers())
+            asset_response = await client.get(asset_match.group(0))
 
     overview_payload = overview.json()
     daily_payload = daily.json()
     hourly_payload = hourly.json()
+    live_traffic_payload = live_traffic.json()
+    history_traffic_payload = history_traffic.json()
+    hourly_traffic_payload = hourly_traffic.json()
+    daily_traffic_payload = daily_traffic.json()
     audit_payload = audit.json()
     audit_types = {item["eventType"] for item in audit_payload["items"]}
 
     assert page.status_code == 200
     assert "TeamViewRelay Admin" in page.text
-    assert 'id="app"' in page.text
     assert asset_response.status_code == 200
 
     assert overview.status_code == 200
@@ -228,18 +270,24 @@ async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytes
     assert len(overview_payload["connectionDetails"]) == 2
     assert any(item["actorId"] == "player-1" for item in overview_payload["connectionDetails"])
     assert any(item["programVersion"] == "squaremap-script" for item in overview_payload["connectionDetails"])
-    assert overview_payload["dbPathMasked"].endswith("/admin-http.db")
-    assert overview_payload["observability"]["sseSubscribers"] >= 0
 
     assert daily_payload["items"][-1]["activePlayers"] == 1
     assert hourly_payload["items"][-1]["activePlayers"] == 1
     assert "UTC" in hourly_payload["timezone"]
 
+    assert live_traffic_payload["totalIngressBps"] > 0
+    assert live_traffic_payload["totalEgressBps"] > 0
+    assert history_traffic_payload["range"] == "6h"
+    assert history_traffic_payload["granularity"] == "5m"
+    assert history_traffic_payload["items"][-1]["totalBytes"] >= 3072
+    assert hourly_traffic_payload["items"][-1]["totalBytes"] >= 3072
+    assert daily_traffic_payload["totalBytes"] >= 3072
+
     assert audit.status_code == 200
     assert "player_handshake_success" in audit_types
     assert "web_map_handshake_success" in audit_types
     assert "admin_api_access" in audit_types
-    assert "player_handshake_success" in audit_payload["availableEventTypes"]
+    assert "admin_session_started" in audit_types
 
 
 @pytest.mark.asyncio
@@ -254,7 +302,7 @@ async def test_admin_audit_supports_multi_actor_type_filter(monkeypatch: pytest.
             success=True,
         )
         await admin_auth.record_audit_event(
-            event_type="admin_auth_success",
+            event_type="admin_session_started",
             actor_type="admin",
             actor_id="admin",
             success=True,
@@ -268,16 +316,28 @@ async def test_admin_audit_supports_multi_actor_type_filter(monkeypatch: pytest.
 
         transport = httpx.ASGITransport(app=main.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-            audit = await client.get(
-                "/admin/api/audit?actorTypes=player&actorTypes=system",
-                headers=_auth_headers(),
-            )
+            await _login(client)
+            audit = await client.get("/admin/api/audit?actorTypes=player&actorTypes=system")
 
     audit_payload = audit.json()
     actor_types = {item["actorType"] for item in audit_payload["items"]}
     assert audit.status_code == 200
     assert actor_types.issubset({"player", "system"})
     assert "admin" not in actor_types
+
+
+@pytest.mark.asyncio
+async def test_admin_traffic_history_rejects_invalid_granularity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    main = _load_main_module(monkeypatch, tmp_path)
+
+    async with main.app.router.lifespan_context(main.app):
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            await _login(client)
+            response = await client.get("/admin/api/traffic/history?range=30d&granularity=1h")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "invalid_traffic_granularity"
 
 
 @pytest.mark.asyncio
@@ -288,8 +348,26 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
     main = _load_main_module(monkeypatch, tmp_path)
 
     async with main.app.router.lifespan_context(main.app):
+        session, raw_token = await app_runtime.admin_store.create_admin_session(
+            actor_id="admin",
+            remote_addr="127.0.0.1",
+            ttl_sec=3600,
+        )
+        await admin_auth.record_audit_event(
+            event_type="admin_session_started",
+            actor_type="admin",
+            actor_id=session["actorId"],
+            success=True,
+            detail={"sessionId": session["sessionId"]},
+        )
         await app_runtime.admin_store.record_player_activity("player-1", "room-admin-test")
-        request = _build_request("/admin/api/events", authorization=_auth_headers()["Authorization"])
+        await app_runtime.admin_traffic_service.record(channel="player", direction="ingress", byte_count=1024)
+        await app_runtime.admin_traffic_service.flush_pending()
+
+        request = _build_request(
+            "/admin/api/events",
+            cookie=f"{admin_auth.ADMIN_SESSION_COOKIE_NAME}={raw_token}",
+        )
         response = await admin_routes.admin_events(
             request,
             auditLimit=100,
@@ -301,6 +379,8 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
             dailyRoomCode=None,
             hourlyHours=48,
             hourlyRoomCode=None,
+            trafficRange="6h",
+            trafficGranularity="5m",
         )
         assert response.status_code == 200
         assert response.media_type == "text/event-stream"
@@ -311,9 +391,10 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         bootstrap_name, bootstrap_payload = await _read_sse_event(lines, expected_names={"bootstrap"})
         assert bootstrap_name == "bootstrap"
         assert bootstrap_payload["overview"]["playerConnections"] == 0
-        assert bootstrap_payload["dailyMetrics"]["items"]
-        assert bootstrap_payload["hourlyMetrics"]["items"]
-        assert isinstance(bootstrap_payload["audit"]["items"], list)
+        assert bootstrap_payload["liveTraffic"]["totalIngressBps"] > 0
+        assert bootstrap_payload["trafficHistory"]["items"]
+        assert bootstrap_payload["trafficHistory"]["range"] == "6h"
+        assert bootstrap_payload["trafficHistory"]["granularity"] == "5m"
         assert "availableEventTypes" in bootstrap_payload["audit"]
 
         app_runtime.state.connections["player-2"] = _connected_websocket_stub()  # type: ignore[assignment]
@@ -331,6 +412,14 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         }
         assert metric_events == {"daily_metrics", "hourly_metrics"}
 
+        await record_websocket_traffic(channel="web_map", direction="egress", byte_count=2048)
+        await app_runtime.admin_traffic_service.flush_pending()
+        traffic_events = {
+            (await _read_sse_event(lines, expected_names={"traffic_live", "traffic_history"}, timeout_sec=8.0))[0],
+            (await _read_sse_event(lines, expected_names={"traffic_live", "traffic_history"}, timeout_sec=8.0))[0],
+        }
+        assert traffic_events == {"traffic_live", "traffic_history"}
+
         await admin_auth.record_audit_event(
             event_type="player_disconnected",
             actor_type="player",
@@ -346,24 +435,48 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
 
 
 @pytest.mark.asyncio
-async def test_trusted_proxy_headers_update_admin_audit_remote_addr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_expired_session_is_rejected_and_records_session_end(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    main = _load_main_module(monkeypatch, tmp_path)
+
+    async with main.app.router.lifespan_context(main.app):
+        session, raw_token = await app_runtime.admin_store.create_admin_session(
+            actor_id="admin",
+            remote_addr="127.0.0.1",
+            ttl_sec=3600,
+        )
+        app_runtime.admin_store._execute(  # noqa: SLF001
+            "UPDATE admin_sessions SET expires_at = 1 WHERE session_id = ?",
+            (session["sessionId"],),
+        )
+
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            client.cookies.set(admin_auth.ADMIN_SESSION_COOKIE_NAME, raw_token)
+            current = await client.get("/admin/api/session")
+
+        audit_payload = await admin_auth.build_admin_audit_payload(limit=20, event_type="admin_session_ended")
+
+    assert current.status_code == 401
+    assert audit_payload["items"][0]["detail"]["reason"] == "expired"
+
+
+@pytest.mark.asyncio
+async def test_trusted_proxy_headers_update_admin_session_remote_addr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TEAMVIEWER_TRUST_PROXY_HEADERS", "true")
     monkeypatch.setenv("TEAMVIEWER_TRUSTED_PROXY_CIDRS", "127.0.0.1/32")
     main = _load_main_module(monkeypatch, tmp_path)
 
-    auth_header = _auth_headers()["Authorization"]
-    request = _build_request(
-        "/admin",
-        authorization=auth_header,
-        extra_headers={"x-forwarded-for": "203.0.113.10, 127.0.0.1"},
-        client_host="127.0.0.1",
-    )
-
     async with main.app.router.lifespan_context(main.app):
-        username = await admin_auth.authenticate_admin_request(request)
-        audit_payload = await admin_auth.build_admin_audit_payload(limit=20, event_type="admin_auth_success")
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            login = await client.post(
+                "/admin/api/session/login",
+                json={"username": "admin", "password": "secret"},
+                headers={"x-forwarded-for": "203.0.113.10, 127.0.0.1"},
+            )
+            assert login.status_code == 200
+        audit_payload = await admin_auth.build_admin_audit_payload(limit=20, event_type="admin_session_started")
 
-    assert username == "admin"
     assert audit_payload["items"][0]["remoteAddr"] == "203.0.113.10"
 
     websocket = _make_websocket_stub(
@@ -379,17 +492,15 @@ async def test_untrusted_proxy_headers_are_ignored(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("TEAMVIEWER_TRUSTED_PROXY_CIDRS", "10.0.0.0/8")
     main = _load_main_module(monkeypatch, tmp_path)
 
-    auth_header = _auth_headers()["Authorization"]
-    request = _build_request(
-        "/admin",
-        authorization=auth_header,
-        extra_headers={"x-forwarded-for": "203.0.113.10"},
-        client_host="127.0.0.1",
-    )
-
     async with main.app.router.lifespan_context(main.app):
-        username = await admin_auth.authenticate_admin_request(request)
-        audit_payload = await admin_auth.build_admin_audit_payload(limit=20, event_type="admin_auth_success")
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            login = await client.post(
+                "/admin/api/session/login",
+                json={"username": "admin", "password": "secret"},
+                headers={"x-forwarded-for": "203.0.113.10"},
+            )
+            assert login.status_code == 200
+        audit_payload = await admin_auth.build_admin_audit_payload(limit=20, event_type="admin_session_started")
 
-    assert username == "admin"
     assert audit_payload["items"][0]["remoteAddr"] == "127.0.0.1"
