@@ -1,6 +1,11 @@
 import type { EChartsCoreOption } from "echarts/core";
 
-import type { MetricsPayload, TrafficHistoryPayload, TrafficLayer } from "@/types";
+import type {
+  MetricsPayload,
+  TrafficHistoryPayload,
+  TrafficHistoryDisplayMode,
+  TrafficMixedViewMode,
+} from "@/types";
 
 function formatAxisLabel(bucket: string, metrics: MetricsPayload | TrafficHistoryPayload | null): string {
   if (!bucket) {
@@ -99,14 +104,163 @@ export function buildBarChartOption(metrics: MetricsPayload | null): EChartsCore
   };
 }
 
-export function buildTrafficChartOption(metrics: TrafficHistoryPayload | null, layer: TrafficLayer): EChartsCoreOption {
-  const layerMetrics = metrics?.[layer];
-  const items = layerMetrics?.items ?? [];
+export function buildTrafficChartOption(
+  metrics: TrafficHistoryPayload | null,
+  mode: TrafficHistoryDisplayMode,
+  mixedView: TrafficMixedViewMode = "total",
+): EChartsCoreOption {
+  const items =
+    mode === "mixed"
+      ? metrics?.application.items ?? metrics?.wire.items ?? []
+      : metrics?.[mode]?.items ?? [];
   const labels = items.map((item) => formatAxisLabel(item.bucket || item.label, metrics));
+  const series =
+    mode === "mixed" && mixedView === "total"
+      ? [
+          {
+            name: "应用层总流量",
+            type: "line",
+            smooth: true,
+            color: "#c26a18",
+            lineStyle: {
+              width: 3,
+            },
+            data: metrics?.application.items.map((item) => item.totalBytes) ?? [],
+          },
+          {
+            name: "传输层总流量",
+            type: "line",
+            smooth: true,
+            color: "#1d4ed8",
+            lineStyle: {
+              width: 3,
+              type: "dashed",
+            },
+            data: metrics?.wire.items.map((item) => item.totalBytes) ?? [],
+          },
+        ]
+      : mode === "mixed"
+      ? [
+          {
+            name: "应用层 游戏端入站",
+            type: "line",
+            smooth: true,
+            color: "#c26a18",
+            lineStyle: {
+              width: 3,
+            },
+            data: metrics?.application.items.map((item) => item.playerIngressBytes) ?? [],
+          },
+          {
+            name: "传输层 游戏端入站",
+            type: "line",
+            smooth: true,
+            color: "#c26a18",
+            lineStyle: {
+              width: 3,
+              type: "dashed",
+            },
+            data: metrics?.wire.items.map((item) => item.playerIngressBytes) ?? [],
+          },
+          {
+            name: "应用层 游戏端出站",
+            type: "line",
+            smooth: true,
+            color: "#92400e",
+            lineStyle: {
+              width: 3,
+            },
+            data: metrics?.application.items.map((item) => item.playerEgressBytes) ?? [],
+          },
+          {
+            name: "传输层 游戏端出站",
+            type: "line",
+            smooth: true,
+            color: "#92400e",
+            lineStyle: {
+              width: 3,
+              type: "dashed",
+            },
+            data: metrics?.wire.items.map((item) => item.playerEgressBytes) ?? [],
+          },
+          {
+            name: "应用层 网页端入站",
+            type: "line",
+            smooth: true,
+            color: "#0f766e",
+            lineStyle: {
+              width: 3,
+            },
+            data: metrics?.application.items.map((item) => item.webMapIngressBytes) ?? [],
+          },
+          {
+            name: "传输层 网页端入站",
+            type: "line",
+            smooth: true,
+            color: "#0f766e",
+            lineStyle: {
+              width: 3,
+              type: "dashed",
+            },
+            data: metrics?.wire.items.map((item) => item.webMapIngressBytes) ?? [],
+          },
+          {
+            name: "应用层 网页端出站",
+            type: "line",
+            smooth: true,
+            color: "#1d4ed8",
+            lineStyle: {
+              width: 3,
+            },
+            data: metrics?.application.items.map((item) => item.webMapEgressBytes) ?? [],
+          },
+          {
+            name: "传输层 网页端出站",
+            type: "line",
+            smooth: true,
+            color: "#1d4ed8",
+            lineStyle: {
+              width: 3,
+              type: "dashed",
+            },
+            data: metrics?.wire.items.map((item) => item.webMapEgressBytes) ?? [],
+          },
+        ]
+      : [
+          {
+            name: "游戏端入站",
+            type: "line",
+            smooth: true,
+            data: items.map((item) => item.playerIngressBytes),
+          },
+          {
+            name: "游戏端出站",
+            type: "line",
+            smooth: true,
+            data: items.map((item) => item.playerEgressBytes),
+          },
+          {
+            name: "网页端入站",
+            type: "line",
+            smooth: true,
+            data: items.map((item) => item.webMapIngressBytes),
+          },
+          {
+            name: "网页端出站",
+            type: "line",
+            smooth: true,
+            data: items.map((item) => item.webMapEgressBytes),
+          },
+        ];
 
   return {
     animationDuration: 220,
-    color: ["#c26a18", "#92400e", "#0f766e", "#1d4ed8"],
+    color:
+      mode === "mixed" && mixedView === "total"
+        ? ["#c26a18", "#1d4ed8"]
+        : mode === "mixed"
+        ? ["#c26a18", "#c26a18", "#92400e", "#92400e", "#0f766e", "#0f766e", "#1d4ed8", "#1d4ed8"]
+        : ["#c26a18", "#92400e", "#0f766e", "#1d4ed8"],
     grid: {
       left: 18,
       right: 16,
@@ -131,8 +285,28 @@ export function buildTrafficChartOption(metrics: TrafficHistoryPayload | null, l
         }
         const lines = [
           item.bucket,
-          `总流量: ${formatByteValue(item.totalBytes)}`,
         ];
+        if (mode === "mixed") {
+          lines.push(`应用层总流量: ${formatByteValue(metrics?.application.items[index]?.totalBytes ?? 0)}`);
+          lines.push(`传输层总流量: ${formatByteValue(metrics?.wire.items[index]?.totalBytes ?? 0)}`);
+          if (mixedView === "total") {
+            for (const entry of entries) {
+              if (!entry.seriesName) {
+                continue;
+              }
+              lines.push(`${entry.seriesName}: ${formatByteValue(Number(entry.value ?? 0))}`);
+            }
+            return lines.join("<br/>");
+          }
+          for (const entry of entries) {
+            if (!entry.seriesName) {
+              continue;
+            }
+            lines.push(`${entry.seriesName}: ${formatByteValue(Number(entry.value ?? 0))}`);
+          }
+          return lines.join("<br/>");
+        }
+        lines.push(`总流量: ${formatByteValue(item.totalBytes)}`);
         for (const entry of entries) {
           if (!entry.seriesName) {
             continue;
@@ -165,31 +339,6 @@ export function buildTrafficChartOption(metrics: TrafficHistoryPayload | null, l
         },
       },
     },
-    series: [
-      {
-        name: "游戏端入站",
-        type: "line",
-        smooth: true,
-        data: items.map((item) => item.playerIngressBytes),
-      },
-      {
-        name: "游戏端出站",
-        type: "line",
-        smooth: true,
-        data: items.map((item) => item.playerEgressBytes),
-      },
-      {
-        name: "网页端入站",
-        type: "line",
-        smooth: true,
-        data: items.map((item) => item.webMapIngressBytes),
-      },
-      {
-        name: "网页端出站",
-        type: "line",
-        smooth: true,
-        data: items.map((item) => item.webMapEgressBytes),
-      },
-    ],
+    series,
   };
 }

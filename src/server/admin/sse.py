@@ -12,11 +12,14 @@ class AdminSseSubscriber:
     audit_actor_types: tuple[str, ...] = field(default_factory=tuple)
     audit_success: bool | None = None
     daily_days: int = 30
+    daily_start_date: str | None = None
     daily_room_code: str | None = None
     hourly_hours: int = 48
+    hourly_start_at: str | None = None
     hourly_room_code: str | None = None
     traffic_range: str = "48h"
     traffic_granularity: str = "1h"
+    traffic_start_at: str | None = None
 
 
 @dataclass(slots=True)
@@ -40,11 +43,14 @@ class AdminSseHub:
         audit_actor_types: tuple[str, ...] = (),
         audit_success: bool | None = None,
         daily_days: int = 30,
+        daily_start_date: str | None = None,
         daily_room_code: str | None = None,
         hourly_hours: int = 48,
+        hourly_start_at: str | None = None,
         hourly_room_code: str | None = None,
         traffic_range: str = "48h",
         traffic_granularity: str = "1h",
+        traffic_start_at: str | None = None,
     ) -> AdminSseSubscriber:
         subscriber = AdminSseSubscriber(
             queue=asyncio.Queue(maxsize=self._queue_size),
@@ -53,11 +59,14 @@ class AdminSseHub:
             audit_actor_types=audit_actor_types,
             audit_success=audit_success,
             daily_days=daily_days,
+            daily_start_date=daily_start_date,
             daily_room_code=daily_room_code,
             hourly_hours=hourly_hours,
+            hourly_start_at=hourly_start_at,
             hourly_room_code=hourly_room_code,
             traffic_range=traffic_range,
             traffic_granularity=traffic_granularity,
+            traffic_start_at=traffic_start_at,
         )
         async with self._lock:
             self._subscribers.add(subscriber)

@@ -72,6 +72,46 @@ async def test_metrics_queries_support_global_distinct_and_room_filter(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_metrics_queries_support_explicit_start_date_and_start_at(tmp_path: Path) -> None:
+    store = AdminStore(AdminStoreConfig(db_path=str(tmp_path / "metrics-start.db")))
+    await store.initialize()
+    try:
+        base = _local_base(8, 37)
+        start_date = (base - timedelta(days=2)).strftime("%Y-%m-%d")
+
+        await store.record_player_activity("player-1", "room-a", occurred_at=(base - timedelta(days=1)).timestamp())
+        await store.record_player_activity("player-2", "room-a", occurred_at=base.timestamp())
+        await store.record_player_activity("player-3", "room-a", occurred_at=(base + timedelta(hours=1)).timestamp())
+
+        daily = await store.query_daily_metrics_with_start(days=4, room_code="room-a", start_date=start_date)
+        hourly = await store.query_hourly_metrics_with_start(
+            hours=4,
+            room_code="room-a",
+            start_at=base.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+
+        assert daily["startDate"] == start_date
+        assert [item["bucket"] for item in daily["items"]] == [
+            start_date,
+            (base - timedelta(days=1)).strftime("%Y-%m-%d"),
+            base.strftime("%Y-%m-%d"),
+            (base + timedelta(days=1)).strftime("%Y-%m-%d"),
+        ]
+        assert [item["activePlayers"] for item in daily["items"]] == [0, 1, 2, 0]
+
+        assert hourly["startAt"] == base.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:00:00")
+        assert [item["bucket"] for item in hourly["items"]] == [
+            base.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:00:00"),
+            (base.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:00:00"),
+            (base.replace(minute=0, second=0, microsecond=0) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:00:00"),
+            (base.replace(minute=0, second=0, microsecond=0) + timedelta(hours=3)).strftime("%Y-%m-%dT%H:00:00"),
+        ]
+        assert [item["activePlayers"] for item in hourly["items"]] == [1, 1, 0, 0]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_audit_query_supports_filters_and_pagination(tmp_path: Path) -> None:
     store = AdminStore(AdminStoreConfig(db_path=str(tmp_path / "audit.db")))
     await store.initialize()
@@ -196,5 +236,41 @@ async def test_traffic_queries_zero_fill_and_sum_totals(tmp_path: Path) -> None:
         assert wire_hourly["items"][-1]["totalBytes"] == 1600
         assert wire_hourly["items"][-1]["webMapEgressBytes"] == 0
         assert wire_history_1m["items"][-1]["totalBytes"] == 1600
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_traffic_history_supports_explicit_start_at(tmp_path: Path) -> None:
+    store = AdminStore(AdminStoreConfig(db_path=str(tmp_path / "traffic-start.db")))
+    await store.initialize()
+    try:
+        start_dt = _local_base(11, 7)
+        aligned_start = start_dt.replace(minute=5, second=0, microsecond=0)
+        bucket_minute = (aligned_start + timedelta(minutes=12)).replace(second=0, microsecond=0)
+
+        await store.apply_traffic_increments(
+            minute_increments={
+                ("application", bucket_minute.strftime("%Y-%m-%dT%H:%M:00"), "player", "ingress"): 1024,
+                ("application", bucket_minute.strftime("%Y-%m-%dT%H:%M:00"), "web_map", "egress"): 256,
+            },
+            hourly_increments={},
+            daily_increments={},
+        )
+
+        history = await store.query_traffic_history(
+            range_preset="1h",
+            granularity="5m",
+            start_at=start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+
+        assert history["startAt"] == aligned_start.strftime("%Y-%m-%dT%H:%M:%S")
+        assert history["bucketSeconds"] == 300
+        assert history["items"][0]["bucket"] == aligned_start.strftime("%Y-%m-%dT%H:%M:00")
+        target_bucket = (aligned_start + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:00")
+        matched = next(item for item in history["items"] if item["bucket"] == target_bucket)
+        assert matched["playerIngressBytes"] == 1024
+        assert matched["webMapEgressBytes"] == 256
+        assert history["totalBytes"] == 1280
     finally:
         await store.close()

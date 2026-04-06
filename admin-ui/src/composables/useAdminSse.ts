@@ -46,12 +46,21 @@ export function buildAdminEventsUrl(filters: DashboardFilters, origin = window.l
   }
   url.searchParams.set("dailyDays", String(filters.metrics.dailyDays));
   url.searchParams.set("hourlyHours", String(filters.metrics.hourlyHours));
+  if (filters.metrics.dailyStartDate) {
+    url.searchParams.set("dailyStartDate", filters.metrics.dailyStartDate);
+  }
+  if (filters.metrics.hourlyStartAt) {
+    url.searchParams.set("hourlyStartAt", filters.metrics.hourlyStartAt);
+  }
   if (filters.metrics.roomCode) {
     url.searchParams.set("dailyRoomCode", filters.metrics.roomCode);
     url.searchParams.set("hourlyRoomCode", filters.metrics.roomCode);
   }
   url.searchParams.set("trafficRange", filters.traffic.range);
   url.searchParams.set("trafficGranularity", filters.traffic.granularity);
+  if (filters.traffic.startAt) {
+    url.searchParams.set("trafficStartAt", filters.traffic.startAt);
+  }
   return url.toString();
 }
 

@@ -92,6 +92,7 @@ export function fetchDailyMetrics(filters: MetricsFilters): Promise<MetricsPaylo
   return requestJson<MetricsPayload>("/admin/api/metrics/daily", {
     params: {
       days: String(filters.dailyDays),
+      startDate: filters.dailyStartDate,
       roomCode: filters.roomCode,
     },
   });
@@ -101,6 +102,7 @@ export function fetchHourlyMetrics(filters: MetricsFilters): Promise<MetricsPayl
   return requestJson<MetricsPayload>("/admin/api/metrics/hourly", {
     params: {
       hours: String(filters.hourlyHours),
+      startAt: filters.hourlyStartAt,
       roomCode: filters.roomCode,
     },
   });
@@ -115,6 +117,7 @@ export function fetchTrafficHistory(filters: TrafficFilters): Promise<TrafficHis
     params: {
       range: filters.range,
       granularity: filters.granularity,
+      startAt: filters.startAt,
     },
   });
 }

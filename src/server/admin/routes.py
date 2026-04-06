@@ -6,6 +6,7 @@ from fastapi import Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from ..app import runtime
+from .store import AdminStore
 from .auth import (
     ADMIN_SESSION_COOKIE_NAME,
     admin_ui_unavailable_response,
@@ -53,6 +54,20 @@ async def admin_assets(_request: Request, asset_path: str):
         return JSONResponse({"detail": "not_found"}, status_code=404)
 
     return FileResponse(Path(asset_file))
+
+
+def _normalize_daily_start_date_or_response(value: str | None) -> tuple[str | None, None] | tuple[None, JSONResponse]:
+    try:
+        return AdminStore.normalize_local_date(value), None
+    except ValueError:
+        return None, JSONResponse({"detail": "invalid_start_date"}, status_code=422)
+
+
+def _normalize_local_start_at_or_response(value: str | None) -> tuple[str | None, None] | tuple[None, JSONResponse]:
+    try:
+        return AdminStore.normalize_local_datetime(value), None
+    except ValueError:
+        return None, JSONResponse({"detail": "invalid_start_at"}, status_code=422)
 
 
 async def admin_session_login(request: Request):
@@ -145,11 +160,14 @@ async def admin_events(
     auditActorTypes: list[str] | None = Query(default=None),
     auditSuccess: bool | None = None,
     dailyDays: int = Query(default=30, ge=1, le=400),
+    dailyStartDate: str | None = None,
     dailyRoomCode: str | None = None,
     hourlyHours: int = Query(default=48, ge=1, le=240),
+    hourlyStartAt: str | None = None,
     hourlyRoomCode: str | None = None,
     trafficRange: str = Query(default="48h"),
     trafficGranularity: str | None = Query(default=None),
+    trafficStartAt: str | None = None,
 ):
     auth_result = await authenticate_admin_request(request)
     if isinstance(auth_result, JSONResponse):
@@ -165,6 +183,15 @@ async def admin_events(
         )
     except ValueError:
         return JSONResponse({"detail": "invalid_traffic_granularity"}, status_code=422)
+    normalized_daily_start_date, daily_error = _normalize_daily_start_date_or_response(dailyStartDate)
+    if daily_error is not None:
+        return daily_error
+    normalized_hourly_start_at, hourly_error = _normalize_local_start_at_or_response(hourlyStartAt)
+    if hourly_error is not None:
+        return hourly_error
+    normalized_traffic_start_at, traffic_start_error = _normalize_local_start_at_or_response(trafficStartAt)
+    if traffic_start_error is not None:
+        return traffic_start_error
 
     await record_admin_access(request, auth_result, "admin_sse_connect")
     audit_event_type = auditEventType.strip() if isinstance(auditEventType, str) and auditEventType.strip() else None
@@ -178,11 +205,14 @@ async def admin_events(
         audit_actor_types=audit_actor_types,
         audit_success=auditSuccess,
         daily_days=dailyDays,
+        daily_start_date=normalized_daily_start_date,
         daily_room_code=normalize_optional_room_code(dailyRoomCode),
         hourly_hours=hourlyHours,
+        hourly_start_at=normalized_hourly_start_at,
         hourly_room_code=normalize_optional_room_code(hourlyRoomCode),
         traffic_range=normalized_traffic_range,
         traffic_granularity=normalized_traffic_granularity,
+        traffic_start_at=normalized_traffic_start_at,
     )
 
     async def event_stream():
@@ -194,11 +224,14 @@ async def admin_events(
                     audit_actor_types=subscriber.audit_actor_types,
                     audit_success=subscriber.audit_success,
                     daily_days=subscriber.daily_days,
+                    daily_start_date=subscriber.daily_start_date,
                     daily_room_code=subscriber.daily_room_code,
                     hourly_hours=subscriber.hourly_hours,
+                    hourly_start_at=subscriber.hourly_start_at,
                     hourly_room_code=subscriber.hourly_room_code,
                     traffic_range=subscriber.traffic_range,
                     traffic_granularity=subscriber.traffic_granularity,
+                    traffic_start_at=subscriber.traffic_start_at,
                 )
             except Exception:
                 runtime.admin_runtime_stats["sseErrors"] += 1
@@ -225,6 +258,7 @@ async def admin_events(
                                 await build_admin_daily_metrics_payload(
                                     days=subscriber.daily_days,
                                     room_code=subscriber.daily_room_code,
+                                    start_date=subscriber.daily_start_date,
                                 )
                             ),
                         }
@@ -235,6 +269,7 @@ async def admin_events(
                                 await build_admin_hourly_metrics_payload(
                                     hours=subscriber.hourly_hours,
                                     room_code=subscriber.hourly_room_code,
+                                    start_at=subscriber.hourly_start_at,
                                 )
                             ),
                         }
@@ -247,6 +282,7 @@ async def admin_events(
                                 await build_admin_traffic_history_payload(
                                     range_preset=subscriber.traffic_range,
                                     granularity=subscriber.traffic_granularity,
+                                    start_at=subscriber.traffic_start_at,
                                 )
                             ),
                         }
@@ -286,6 +322,7 @@ async def admin_events(
 async def admin_daily_metrics(
     request: Request,
     days: int = Query(default=30, ge=1, le=400),
+    startDate: str | None = None,
     roomCode: str | None = None,
 ):
     auth_result = await authenticate_admin_request(request)
@@ -295,8 +332,15 @@ async def admin_daily_metrics(
         return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
 
     await record_admin_access(request, auth_result, "admin_api_access")
+    normalized_start_date, start_error = _normalize_daily_start_date_or_response(startDate)
+    if start_error is not None:
+        return start_error
     try:
-        payload = await build_admin_daily_metrics_payload(days=days, room_code=normalize_optional_room_code(roomCode))
+        payload = await build_admin_daily_metrics_payload(
+            days=days,
+            room_code=normalize_optional_room_code(roomCode),
+            start_date=normalized_start_date,
+        )
         return JSONResponse(payload)
     except Exception:
         runtime.admin_runtime_stats["apiErrors"] += 1
@@ -306,6 +350,7 @@ async def admin_daily_metrics(
 async def admin_hourly_metrics(
     request: Request,
     hours: int = Query(default=48, ge=1, le=240),
+    startAt: str | None = None,
     roomCode: str | None = None,
 ):
     auth_result = await authenticate_admin_request(request)
@@ -315,8 +360,15 @@ async def admin_hourly_metrics(
         return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
 
     await record_admin_access(request, auth_result, "admin_api_access")
+    normalized_start_at, start_error = _normalize_local_start_at_or_response(startAt)
+    if start_error is not None:
+        return start_error
     try:
-        payload = await build_admin_hourly_metrics_payload(hours=hours, room_code=normalize_optional_room_code(roomCode))
+        payload = await build_admin_hourly_metrics_payload(
+            hours=hours,
+            room_code=normalize_optional_room_code(roomCode),
+            start_at=normalized_start_at,
+        )
         return JSONResponse(payload)
     except Exception:
         runtime.admin_runtime_stats["apiErrors"] += 1
@@ -339,6 +391,7 @@ async def admin_traffic_history(
     request: Request,
     range: str = Query(default="48h"),
     granularity: str | None = Query(default=None),
+    startAt: str | None = None,
 ):
     auth_result = await authenticate_admin_request(request)
     if isinstance(auth_result, JSONResponse):
@@ -346,9 +399,20 @@ async def admin_traffic_history(
     await record_admin_access(request, auth_result, "admin_api_access")
     resolved_granularity = granularity or default_traffic_granularity(range)
     try:
-        return JSONResponse(await build_admin_traffic_history_payload(range_preset=range, granularity=resolved_granularity))
+        normalized_range, normalized_granularity = validate_traffic_history_params(range, resolved_granularity)
     except ValueError:
         return JSONResponse({"detail": "invalid_traffic_granularity"}, status_code=422)
+    normalized_start_at, start_error = _normalize_local_start_at_or_response(startAt)
+    if start_error is not None:
+        return start_error
+    try:
+        return JSONResponse(
+            await build_admin_traffic_history_payload(
+                range_preset=normalized_range,
+                granularity=normalized_granularity,
+                start_at=normalized_start_at,
+            )
+        )
     except Exception:
         runtime.admin_runtime_stats["apiErrors"] += 1
         raise

@@ -46,8 +46,15 @@ describe("buildAdminEventsUrl", () => {
       buildAdminEventsUrl(
         {
           audit: { ...DEFAULT_AUDIT_FILTERS, actorTypes: ["player", "system"], success: "false" },
-          metrics: { ...DEFAULT_METRICS_FILTERS, roomCode: "room-a", dailyDays: 14, hourlyHours: 24 },
-          traffic: { range: "24h", granularity: "15m" },
+          metrics: {
+            ...DEFAULT_METRICS_FILTERS,
+            roomCode: "room-a",
+            dailyDays: 14,
+            hourlyHours: 24,
+            dailyStartDate: "2026-04-01",
+            hourlyStartAt: "2026-04-01T08:00:00",
+          },
+          traffic: { range: "24h", granularity: "15m", startAt: "2026-04-01T09:15:00" },
         },
         "http://testserver",
       ),
@@ -57,8 +64,11 @@ describe("buildAdminEventsUrl", () => {
     expect(url.searchParams.get("auditSuccess")).toBe("false");
     expect(url.searchParams.get("dailyRoomCode")).toBe("room-a");
     expect(url.searchParams.get("dailyDays")).toBe("14");
+    expect(url.searchParams.get("dailyStartDate")).toBe("2026-04-01");
+    expect(url.searchParams.get("hourlyStartAt")).toBe("2026-04-01T08:00:00");
     expect(url.searchParams.get("trafficRange")).toBe("24h");
     expect(url.searchParams.get("trafficGranularity")).toBe("15m");
+    expect(url.searchParams.get("trafficStartAt")).toBe("2026-04-01T09:15:00");
   });
 });
 

@@ -516,8 +516,21 @@ class AdminStore:
             self._execute_many(statements)
 
     async def query_daily_metrics(self, *, days: int, room_code: str | None = None) -> dict[str, Any]:
-        end_dt = self._local_datetime()
-        start_dt = (end_dt - timedelta(days=max(days - 1, 0))).replace(hour=0, minute=0, second=0, microsecond=0)
+        return await self.query_daily_metrics_with_start(days=days, room_code=room_code, start_date=None)
+
+    async def query_daily_metrics_with_start(
+        self,
+        *,
+        days: int,
+        room_code: str | None = None,
+        start_date: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_start_date = self.normalize_local_date(start_date)
+        if normalized_start_date is not None:
+            start_dt = datetime.strptime(normalized_start_date, "%Y-%m-%d")
+        else:
+            end_dt = self._local_datetime()
+            start_dt = (end_dt - timedelta(days=max(days - 1, 0))).replace(hour=0, minute=0, second=0, microsecond=0)
         labels = [(start_dt + timedelta(days=index)).strftime("%Y-%m-%d") for index in range(days)]
         counts = {label: 0 for label in labels}
 
@@ -551,12 +564,29 @@ class AdminStore:
             "timezone": self.timezone_label,
             "roomCode": room_code,
             "days": days,
+            "startDate": normalized_start_date,
             "items": [{"bucket": label, "label": label, "activePlayers": counts[label]} for label in labels],
         }
 
     async def query_hourly_metrics(self, *, hours: int, room_code: str | None = None) -> dict[str, Any]:
-        end_dt = self._local_datetime().replace(minute=0, second=0, microsecond=0)
-        start_dt = end_dt - timedelta(hours=max(hours - 1, 0))
+        return await self.query_hourly_metrics_with_start(hours=hours, room_code=room_code, start_at=None)
+
+    async def query_hourly_metrics_with_start(
+        self,
+        *,
+        hours: int,
+        room_code: str | None = None,
+        start_at: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_start_at = self.normalize_local_datetime(start_at)
+        if normalized_start_at is not None:
+            start_dt = self._floor_datetime(
+                datetime.strptime(normalized_start_at, "%Y-%m-%dT%H:%M:%S"),
+                60 * 60,
+            )
+        else:
+            end_dt = self._local_datetime().replace(minute=0, second=0, microsecond=0)
+            start_dt = end_dt - timedelta(hours=max(hours - 1, 0))
         labels = [(start_dt + timedelta(hours=index)).strftime("%Y-%m-%dT%H:00:00") for index in range(hours)]
         counts = {label: 0 for label in labels}
 
@@ -590,6 +620,7 @@ class AdminStore:
             "timezone": self.timezone_label,
             "roomCode": room_code,
             "hours": hours,
+            "startAt": self._format_local_datetime(start_dt) if normalized_start_at is not None else None,
             "items": [{"bucket": label, "label": label, "activePlayers": counts[label]} for label in labels],
         }
 
@@ -631,10 +662,12 @@ class AdminStore:
         range_preset: str,
         granularity: str,
         scope: str = "application",
+        start_at: str | None = None,
     ) -> dict[str, Any]:
         normalized_range, normalized_granularity = self.normalize_traffic_history_params(range_preset, granularity)
         bucket_seconds = TRAFFIC_GRANULARITY_SECONDS[normalized_granularity]
         bucket_count = TRAFFIC_RANGE_SECONDS[normalized_range] // bucket_seconds
+        normalized_start_at = self.normalize_local_datetime(start_at)
         if normalized_granularity in {"1m", "5m", "15m"}:
             return await self._query_minute_traffic_history(
                 scope=scope,
@@ -642,6 +675,7 @@ class AdminStore:
                 granularity=normalized_granularity,
                 bucket_seconds=bucket_seconds,
                 bucket_count=bucket_count,
+                start_at=normalized_start_at,
             )
         if normalized_granularity == "1h":
             return await self._query_hourly_traffic_history(
@@ -650,6 +684,7 @@ class AdminStore:
                 granularity=normalized_granularity,
                 bucket_seconds=bucket_seconds,
                 bucket_count=bucket_count,
+                start_at=normalized_start_at,
             )
         return await self._query_daily_traffic_history(
             scope=scope,
@@ -657,6 +692,7 @@ class AdminStore:
             granularity=normalized_granularity,
             bucket_seconds=bucket_seconds,
             bucket_count=bucket_count,
+            start_at=normalized_start_at,
         )
 
     async def query_audit_events(
@@ -937,12 +973,22 @@ class AdminStore:
         granularity: str,
         bucket_seconds: int,
         bucket_count: int,
+        start_at: str | None = None,
     ) -> dict[str, Any]:
-        current_minute = self._local_datetime().replace(second=0, microsecond=0)
-        end_bucket = self._floor_datetime(current_minute, bucket_seconds)
-        start_bucket = end_bucket - timedelta(seconds=bucket_seconds * max(bucket_count - 1, 0))
+        if start_at is not None:
+            start_bucket = self._floor_datetime(
+                datetime.strptime(start_at, "%Y-%m-%dT%H:%M:%S"),
+                bucket_seconds,
+            )
+            end_bucket = start_bucket + timedelta(seconds=bucket_seconds * max(bucket_count - 1, 0))
+            query_end_dt = end_bucket + timedelta(seconds=max(bucket_seconds - 60, 0))
+        else:
+            current_minute = self._local_datetime().replace(second=0, microsecond=0)
+            end_bucket = self._floor_datetime(current_minute, bucket_seconds)
+            start_bucket = end_bucket - timedelta(seconds=bucket_seconds * max(bucket_count - 1, 0))
+            query_end_dt = current_minute
         query_start = start_bucket.strftime("%Y-%m-%dT%H:%M:00")
-        query_end = current_minute.strftime("%Y-%m-%dT%H:%M:00")
+        query_end = query_end_dt.strftime("%Y-%m-%dT%H:%M:00")
         labels = self._build_traffic_labels(start_bucket=start_bucket, bucket_count=bucket_count, bucket_seconds=bucket_seconds)
         table_name = self._traffic_table_name(scope=scope, bucket_kind="minute")
         rows = await self._fetchall(
@@ -977,6 +1023,7 @@ class AdminStore:
             range_preset=range_preset,
             granularity=granularity,
             bucket_seconds=bucket_seconds,
+            start_at=self._format_local_datetime(start_bucket) if start_at is not None else None,
         )
 
     async def _query_hourly_traffic_history(
@@ -987,9 +1034,16 @@ class AdminStore:
         granularity: str,
         bucket_seconds: int,
         bucket_count: int,
+        start_at: str | None = None,
     ) -> dict[str, Any]:
-        end_dt = self._local_datetime().replace(minute=0, second=0, microsecond=0)
-        start_dt = end_dt - timedelta(hours=max(bucket_count - 1, 0))
+        if start_at is not None:
+            start_dt = self._floor_datetime(
+                datetime.strptime(start_at, "%Y-%m-%dT%H:%M:%S"),
+                bucket_seconds,
+            )
+        else:
+            end_dt = self._local_datetime().replace(minute=0, second=0, microsecond=0)
+            start_dt = end_dt - timedelta(hours=max(bucket_count - 1, 0))
         labels = self._build_traffic_labels(start_bucket=start_dt, bucket_count=bucket_count, bucket_seconds=bucket_seconds)
         table_name = self._traffic_table_name(scope=scope, bucket_kind="hourly")
         rows = await self._fetchall(
@@ -1007,6 +1061,7 @@ class AdminStore:
             range_preset=range_preset,
             granularity=granularity,
             bucket_seconds=bucket_seconds,
+            start_at=self._format_local_datetime(start_dt) if start_at is not None else None,
         )
 
     async def _query_daily_traffic_history(
@@ -1017,9 +1072,16 @@ class AdminStore:
         granularity: str,
         bucket_seconds: int,
         bucket_count: int,
+        start_at: str | None = None,
     ) -> dict[str, Any]:
-        end_dt = self._local_datetime().replace(hour=0, minute=0, second=0, microsecond=0)
-        start_dt = end_dt - timedelta(days=max(bucket_count - 1, 0))
+        if start_at is not None:
+            start_dt = self._floor_datetime(
+                datetime.strptime(start_at, "%Y-%m-%dT%H:%M:%S"),
+                bucket_seconds,
+            )
+        else:
+            end_dt = self._local_datetime().replace(hour=0, minute=0, second=0, microsecond=0)
+            start_dt = end_dt - timedelta(days=max(bucket_count - 1, 0))
         labels = self._build_traffic_labels(start_bucket=start_dt, bucket_count=bucket_count, bucket_seconds=bucket_seconds)
         table_name = self._traffic_table_name(scope=scope, bucket_kind="daily")
         rows = await self._fetchall(
@@ -1037,6 +1099,7 @@ class AdminStore:
             range_preset=range_preset,
             granularity=granularity,
             bucket_seconds=bucket_seconds,
+            start_at=self._format_local_datetime(start_dt) if start_at is not None else None,
         )
 
     def _build_traffic_payload(
@@ -1049,6 +1112,7 @@ class AdminStore:
         range_preset: str | None = None,
         granularity: str | None = None,
         bucket_seconds: int | None = None,
+        start_at: str | None = None,
     ) -> dict[str, Any]:
         items = {
             label: {
@@ -1104,6 +1168,8 @@ class AdminStore:
             payload["granularity"] = granularity
         if bucket_seconds is not None:
             payload["bucketSeconds"] = bucket_seconds
+        if start_at is not None:
+            payload["startAt"] = start_at
         return payload
 
     @staticmethod
@@ -1123,10 +1189,37 @@ class AdminStore:
         ]
 
     @staticmethod
+    def normalize_local_date(value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return datetime.strptime(text, "%Y-%m-%d").strftime("%Y-%m-%d")
+
+    @staticmethod
+    def normalize_local_datetime(value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is not None:
+            local_tz = datetime.now().astimezone().tzinfo
+            dt = dt.astimezone(local_tz)
+        return dt.replace(tzinfo=None, microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+
+    @staticmethod
     def _format_traffic_bucket_label(value: datetime, bucket_seconds: int) -> str:
         if bucket_seconds >= 24 * 60 * 60:
             return value.strftime("%Y-%m-%d")
         return value.strftime("%Y-%m-%dT%H:%M:00")
+
+    @staticmethod
+    def _format_local_datetime(value: datetime) -> str:
+        return value.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
 
     @staticmethod
     def _traffic_series_key(channel: str, direction: str) -> str | None:

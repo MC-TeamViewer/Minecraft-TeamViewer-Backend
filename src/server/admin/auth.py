@@ -378,12 +378,28 @@ async def build_admin_overview_payload() -> dict:
     return await ensure_admin_payload_service().build_overview_payload()
 
 
-async def build_admin_daily_metrics_payload(days: int = 30, room_code: str | None = None) -> dict:
-    return await ensure_admin_payload_service().build_daily_metrics_payload(days=days, room_code=room_code)
+async def build_admin_daily_metrics_payload(
+    days: int = 30,
+    room_code: str | None = None,
+    start_date: str | None = None,
+) -> dict:
+    return await ensure_admin_payload_service().build_daily_metrics_payload(
+        days=days,
+        room_code=room_code,
+        start_date=start_date,
+    )
 
 
-async def build_admin_hourly_metrics_payload(hours: int = 48, room_code: str | None = None) -> dict:
-    return await ensure_admin_payload_service().build_hourly_metrics_payload(hours=hours, room_code=room_code)
+async def build_admin_hourly_metrics_payload(
+    hours: int = 48,
+    room_code: str | None = None,
+    start_at: str | None = None,
+) -> dict:
+    return await ensure_admin_payload_service().build_hourly_metrics_payload(
+        hours=hours,
+        room_code=room_code,
+        start_at=start_at,
+    )
 
 
 async def build_admin_live_traffic_payload() -> dict:
@@ -414,11 +430,16 @@ def default_traffic_granularity(range_preset: str) -> str:
     return DEFAULT_TRAFFIC_GRANULARITY.get(range_preset, "1h")
 
 
-async def build_admin_traffic_history_payload(range_preset: str = "48h", granularity: str = "1h") -> dict:
+async def build_admin_traffic_history_payload(
+    range_preset: str = "48h",
+    granularity: str = "1h",
+    start_at: str | None = None,
+) -> dict:
     normalized_range, normalized_granularity = validate_traffic_history_params(range_preset, granularity)
     return await ensure_admin_payload_service().build_traffic_history_payload(
         range_preset=normalized_range,
         granularity=normalized_granularity,
+        start_at=start_at,
     )
 
 
@@ -448,11 +469,14 @@ async def build_admin_bootstrap_payload(
     audit_actor_types: tuple[str, ...] = (),
     audit_success: bool | None = None,
     daily_days: int = 30,
+    daily_start_date: str | None = None,
     daily_room_code: str | None = None,
     hourly_hours: int = 48,
+    hourly_start_at: str | None = None,
     hourly_room_code: str | None = None,
     traffic_range: str = "48h",
     traffic_granularity: str = "1h",
+    traffic_start_at: str | None = None,
 ) -> dict:
     return await ensure_admin_payload_service().build_bootstrap_payload(
         audit_limit=audit_limit,
@@ -460,11 +484,14 @@ async def build_admin_bootstrap_payload(
         audit_actor_types=audit_actor_types,
         audit_success=audit_success,
         daily_days=daily_days,
+        daily_start_date=daily_start_date,
         daily_room_code=daily_room_code,
         hourly_hours=hourly_hours,
+        hourly_start_at=hourly_start_at,
         hourly_room_code=hourly_room_code,
         traffic_range=traffic_range,
         traffic_granularity=traffic_granularity,
+        traffic_start_at=traffic_start_at,
     )
 
 

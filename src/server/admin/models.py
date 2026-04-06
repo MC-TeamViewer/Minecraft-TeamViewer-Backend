@@ -33,6 +33,8 @@ class MetricsPayload(TypedDict):
     items: list[MetricItem]
     days: NotRequired[int]
     hours: NotRequired[int]
+    startDate: NotRequired[str | None]
+    startAt: NotRequired[str | None]
     serverTime: NotRequired[float]
 
 
@@ -118,6 +120,7 @@ class TrafficHistoryPayload(TypedDict):
     range: str
     granularity: str
     bucketSeconds: int
+    startAt: NotRequired[str | None]
     selectedLayer: str
     application: TrafficLayerHistoryPayload
     wire: TrafficLayerHistoryPayload

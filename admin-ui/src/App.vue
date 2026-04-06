@@ -28,6 +28,7 @@ import { useAdminSse } from "@/composables/useAdminSse";
 import { useAuditState } from "@/composables/useAuditState";
 import { useMetricsState } from "@/composables/useMetricsState";
 import { useOverviewState } from "@/composables/useOverviewState";
+import { formatDisplayDate, formatDisplayDateTime } from "@/time";
 import type {
   AdminSessionPayload,
   AuditFilters as AuditFiltersModel,
@@ -35,9 +36,16 @@ import type {
   DashboardFilters,
   MetricsFilters,
   TrafficFilters,
+  TrafficHistoryDisplayMode,
   TrafficLayer,
+  TrafficMixedViewMode,
 } from "@/types";
-import { DEFAULT_AUDIT_FILTERS, DEFAULT_METRICS_FILTERS, DEFAULT_TRAFFIC_FILTERS } from "@/types";
+import {
+  DEFAULT_AUDIT_FILTERS,
+  DEFAULT_METRICS_FILTERS,
+  DEFAULT_TRAFFIC_FILTERS,
+  TRAFFIC_RANGE_OPTIONS,
+} from "@/types";
 
 const RoomOverviewTable = defineAsyncComponent(() => import("@/components/RoomOverviewTable.vue"));
 const ConnectionStatusTable = defineAsyncComponent(() => import("@/components/ConnectionStatusTable.vue"));
@@ -47,7 +55,9 @@ const AuditTable = defineAsyncComponent(() => import("@/components/AuditTable.vu
 const auditFilters = ref<AuditFiltersModel>({ ...DEFAULT_AUDIT_FILTERS });
 const metricsFilters = ref<MetricsFilters>({ ...DEFAULT_METRICS_FILTERS });
 const trafficFilters = ref<TrafficFilters>({ ...DEFAULT_TRAFFIC_FILTERS });
-const trafficLayer = ref<TrafficLayer>("application");
+const liveTrafficLayer = ref<TrafficLayer>("application");
+const historyTrafficMode = ref<TrafficHistoryDisplayMode>("application");
+const historyTrafficMixedView = ref<TrafficMixedViewMode>("total");
 const session = ref<AdminSessionPayload | null>(null);
 const sessionLoading = ref(true);
 const loginLoading = ref(false);
@@ -96,23 +106,43 @@ function resetDashboard() {
   trafficHistoryLoading.value = false;
 }
 
-function matchesDailyFilters(payload: { days?: number; roomCode?: string | null }) {
+function matchesDailyFilters(payload: { days?: number; roomCode?: string | null; startDate?: string | null }) {
   return (payload.days ?? DEFAULT_METRICS_FILTERS.dailyDays) === metricsFilters.value.dailyDays
-    && (payload.roomCode ?? "") === metricsFilters.value.roomCode;
+    && (payload.roomCode ?? "") === metricsFilters.value.roomCode
+    && (payload.startDate ?? "") === metricsFilters.value.dailyStartDate;
 }
 
-function matchesHourlyFilters(payload: { hours?: number; roomCode?: string | null }) {
+function matchesHourlyFilters(payload: { hours?: number; roomCode?: string | null; startAt?: string | null }) {
   return (payload.hours ?? DEFAULT_METRICS_FILTERS.hourlyHours) === metricsFilters.value.hourlyHours
-    && (payload.roomCode ?? "") === metricsFilters.value.roomCode;
+    && (payload.roomCode ?? "") === metricsFilters.value.roomCode
+    && (payload.startAt ?? "") === metricsFilters.value.hourlyStartAt;
+}
+
+function matchesTrafficFilters(payload: {
+  range?: string;
+  granularity?: string;
+  startAt?: string | null;
+}) {
+  return payload.range === trafficFilters.value.range
+    && payload.granularity === trafficFilters.value.granularity
+    && (payload.startAt ?? "") === trafficFilters.value.startAt;
 }
 
 function applyBootstrap(payload: BootstrapPayload) {
+  const hadLiveTraffic = liveTraffic.value != null;
+  const hadTrafficHistory = trafficHistory.value != null;
   applyOverview(payload.overview);
   applyDailyMetrics(payload.dailyMetrics);
   applyHourlyMetrics(payload.hourlyMetrics);
   applyLiveTraffic(payload.liveTraffic);
   applyTrafficHistory(payload.trafficHistory);
-  trafficLayer.value = payload.trafficHistory.selectedLayer ?? payload.liveTraffic.selectedLayer ?? "application";
+  if (!hadLiveTraffic) {
+    liveTrafficLayer.value = payload.liveTraffic.selectedLayer ?? "application";
+  }
+  if (!hadTrafficHistory) {
+    historyTrafficMode.value = payload.trafficHistory.selectedLayer ?? payload.liveTraffic.selectedLayer ?? "application";
+    historyTrafficMixedView.value = "total";
+  }
   applyAudit(payload.audit);
   dailyMetricsLoading.value = false;
   hourlyMetricsLoading.value = false;
@@ -256,7 +286,7 @@ const {
   },
   onLiveTraffic: applyLiveTraffic,
   onTrafficHistory: (payload) => {
-    if (payload.range !== trafficFilters.value.range || payload.granularity !== trafficFilters.value.granularity) {
+    if (!matchesTrafficFilters(payload)) {
       return;
     }
     applyTrafficHistory(payload);
@@ -356,10 +386,33 @@ const liveStatusLabel = computed(() => {
   return "Connecting";
 });
 
-const dailyChartKey = computed(() => `daily:${metricsFilters.value.dailyDays}:${metricsFilters.value.roomCode || "global"}`);
-const hourlyChartKey = computed(() => `hourly:${metricsFilters.value.hourlyHours}:${metricsFilters.value.roomCode || "global"}`);
+const dailyChartTitle = computed(() =>
+  metricsFilters.value.dailyStartDate
+    ? `自 ${formatDisplayDate(metricsFilters.value.dailyStartDate)} 起 ${metricsFilters.value.dailyDays} 天 DAU`
+    : `最近 ${metricsFilters.value.dailyDays} 天 DAU`,
+);
+const hourlyChartTitle = computed(() =>
+  metricsFilters.value.hourlyStartAt
+    ? `自 ${formatDisplayDateTime(metricsFilters.value.hourlyStartAt)} 起 ${metricsFilters.value.hourlyHours} 小时活跃`
+    : `最近 ${metricsFilters.value.hourlyHours} 小时活跃`,
+);
+const trafficChartTitle = computed(() => {
+  const rangeLabel = TRAFFIC_RANGE_OPTIONS.find((item) => item.value === trafficFilters.value.range)?.label ?? "历史流量";
+  if (trafficFilters.value.startAt) {
+    return `自 ${formatDisplayDateTime(trafficFilters.value.startAt)} 起 ${rangeLabel.replace(/^最近\s*/, "")}流量`;
+  }
+  return rangeLabel.replace(/^最近\s*/, "最近 ") + "流量";
+});
+
+const dailyChartKey = computed(
+  () => `daily:${metricsFilters.value.dailyDays}:${metricsFilters.value.roomCode || "global"}:${metricsFilters.value.dailyStartDate || "recent"}`,
+);
+const hourlyChartKey = computed(
+  () => `hourly:${metricsFilters.value.hourlyHours}:${metricsFilters.value.roomCode || "global"}:${metricsFilters.value.hourlyStartAt || "recent"}`,
+);
 const trafficChartKey = computed(
-  () => `traffic:${trafficFilters.value.range}:${trafficFilters.value.granularity}:${trafficLayer.value}`,
+  () =>
+    `traffic:${trafficFilters.value.range}:${trafficFilters.value.granularity}:${trafficFilters.value.startAt || "recent"}:${historyTrafficMode.value}:${historyTrafficMixedView.value}`,
 );
 
 const heroTags = computed(() => [
@@ -426,8 +479,19 @@ function updateTrafficFilters(value: TrafficFilters) {
   trafficFilters.value = value;
 }
 
-function updateTrafficLayer(value: TrafficLayer) {
-  trafficLayer.value = value;
+function updateLiveTrafficLayer(value: TrafficLayer) {
+  liveTrafficLayer.value = value;
+}
+
+function updateHistoryTrafficMode(value: TrafficHistoryDisplayMode) {
+  if (value === "mixed") {
+    historyTrafficMixedView.value = "total";
+  }
+  historyTrafficMode.value = value;
+}
+
+function updateHistoryTrafficMixedView(value: TrafficMixedViewMode) {
+  historyTrafficMixedView.value = value;
 }
 </script>
 
@@ -477,25 +541,27 @@ function updateTrafficLayer(value: TrafficLayer) {
       <OverviewCards :overview="overview" />
       <LiveTrafficCards
         :traffic="liveTraffic"
-        :selected-layer="trafficLayer"
-        @update:selected-layer="updateTrafficLayer"
+        :selected-layer="liveTrafficLayer"
+        @update:selected-layer="updateLiveTrafficLayer"
       />
 
       <el-card shadow="never" class="surface-card">
         <TrafficToolbar
           :model-value="trafficFilters"
-          :selected-layer="trafficLayer"
+          :selected-mode="historyTrafficMode"
           @update:model-value="updateTrafficFilters"
-          @update:selected-layer="updateTrafficLayer"
+          @update:selected-mode="updateHistoryTrafficMode"
         />
       </el-card>
 
       <TrafficChartCard
         :key="trafficChartKey"
-        title="历史流量"
-        description="按所选范围与粒度汇总核心业务 WebSocket 双向流量。"
+        :title="trafficChartTitle"
+        description="可查看单层拆分，或以混合模式在同一尺度下对比应用层与传输层的分流量细则。"
         :metrics="trafficHistory"
-        :selected-layer="trafficLayer"
+        :selected-mode="historyTrafficMode"
+        :mixed-view-mode="historyTrafficMixedView"
+        @update:mixed-view-mode="updateHistoryTrafficMixedView"
       />
 
       <el-card shadow="never" class="surface-card">
@@ -509,14 +575,14 @@ function updateTrafficLayer(value: TrafficLayer) {
       <section class="two-column-grid">
         <MetricChartCard
           :key="dailyChartKey"
-          :title="`最近 ${metricsFilters.dailyDays} 天 DAU`"
+          :title="dailyChartTitle"
           description="按 submitPlayerId 去重统计本地自然日活跃玩家，空桶自动补零。"
           :metrics="dailyMetrics"
           :loading="dailyMetricsLoading"
         />
         <MetricChartCard
           :key="hourlyChartKey"
-          :title="`最近 ${metricsFilters.hourlyHours} 小时活跃`"
+          :title="hourlyChartTitle"
           description="按本地时区整点统计小时桶内的唯一活跃玩家，空桶自动补零。"
           :metrics="hourlyMetrics"
           :loading="hourlyMetricsLoading"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 import importlib
 import json
 from pathlib import Path
@@ -387,6 +388,61 @@ async def test_admin_traffic_history_rejects_invalid_granularity(monkeypatch: py
 
 
 @pytest.mark.asyncio
+async def test_admin_metrics_and_traffic_history_support_explicit_starts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _load_main_module(monkeypatch, tmp_path)
+
+    async with main.app.router.lifespan_context(main.app):
+        base = app_runtime.admin_store.local_datetime().replace(hour=8, minute=37, second=0, microsecond=0)
+        daily_start = (base - timedelta(days=2)).strftime("%Y-%m-%d")
+        hourly_start = base.strftime("%Y-%m-%dT%H:%M:%S")
+        traffic_start = base.replace(minute=7).strftime("%Y-%m-%dT%H:%M:%S")
+        traffic_bucket = base.replace(minute=17).strftime("%Y-%m-%dT%H:%M:00")
+
+        await app_runtime.admin_store.record_player_activity("player-1", "room-started", occurred_at=base.timestamp())
+        await app_runtime.admin_store.record_player_activity(
+            "player-2",
+            "room-started",
+            occurred_at=(base + timedelta(hours=1)).timestamp(),
+        )
+        await app_runtime.admin_store.apply_traffic_increments(
+            minute_increments={
+                ("application", traffic_bucket, "player", "ingress"): 4096,
+                ("wire", traffic_bucket, "player", "ingress"): 2048,
+            },
+            hourly_increments={},
+            daily_increments={},
+        )
+
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            await _login(client)
+            daily = await client.get(f"/admin/api/metrics/daily?days=4&roomCode=room-started&startDate={daily_start}")
+            hourly = await client.get(f"/admin/api/metrics/hourly?hours=4&roomCode=room-started&startAt={hourly_start}")
+            traffic = await client.get(f"/admin/api/traffic/history?range=1h&granularity=5m&startAt={traffic_start}")
+
+    daily_payload = daily.json()
+    hourly_payload = hourly.json()
+    traffic_payload = traffic.json()
+
+    assert daily.status_code == 200
+    assert daily_payload["startDate"] == daily_start
+    assert daily_payload["items"][2]["activePlayers"] == 2
+
+    assert hourly.status_code == 200
+    assert hourly_payload["startAt"] == base.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:00:00")
+    assert hourly_payload["items"][0]["activePlayers"] == 1
+    assert hourly_payload["items"][1]["activePlayers"] == 1
+
+    assert traffic.status_code == 200
+    assert traffic_payload["startAt"] == base.replace(minute=5, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+    assert traffic_payload["application"]["totalBytes"] == 4096
+    assert traffic_payload["wire"]["totalBytes"] == 2048
+
+
+@pytest.mark.asyncio
 async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -409,6 +465,10 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         await app_runtime.admin_store.record_player_activity("player-1", "room-admin-test")
         await app_runtime.admin_traffic_service.record(channel="player", direction="ingress", byte_count=1024)
         await app_runtime.admin_traffic_service.flush_pending()
+        current_local = app_runtime.admin_store.local_datetime().replace(second=0, microsecond=0)
+        daily_start = (current_local - timedelta(days=2)).strftime("%Y-%m-%d")
+        hourly_start = current_local.replace(minute=0).strftime("%Y-%m-%dT%H:%M:%S")
+        traffic_start = current_local.replace(minute=(current_local.minute // 5) * 5).strftime("%Y-%m-%dT%H:%M:%S")
 
         request = _build_request(
             "/admin/api/events",
@@ -422,11 +482,14 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
             auditActorTypes=None,
             auditSuccess=None,
             dailyDays=30,
+            dailyStartDate=daily_start,
             dailyRoomCode=None,
             hourlyHours=48,
+            hourlyStartAt=hourly_start,
             hourlyRoomCode=None,
             trafficRange="6h",
             trafficGranularity="5m",
+            trafficStartAt=traffic_start,
         )
         assert response.status_code == 200
         assert response.media_type == "text/event-stream"
@@ -443,6 +506,9 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         assert bootstrap_payload["trafficHistory"]["wire"]["items"]
         assert bootstrap_payload["trafficHistory"]["range"] == "6h"
         assert bootstrap_payload["trafficHistory"]["granularity"] == "5m"
+        assert bootstrap_payload["dailyMetrics"]["startDate"] == daily_start
+        assert bootstrap_payload["hourlyMetrics"]["startAt"] == hourly_start
+        assert bootstrap_payload["trafficHistory"]["startAt"] == traffic_start
         assert "availableEventTypes" in bootstrap_payload["audit"]
 
         app_runtime.state.connections["player-2"] = _connected_websocket_stub()  # type: ignore[assignment]
@@ -454,19 +520,26 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         assert overview_payload["playerConnections"] == 1
 
         await admin_auth.record_player_activity("player-2", "room-admin-test")
-        metric_events = {
-            (await _read_sse_event(lines, expected_names={"daily_metrics", "hourly_metrics"}))[0],
-            (await _read_sse_event(lines, expected_names={"daily_metrics", "hourly_metrics"}))[0],
-        }
-        assert metric_events == {"daily_metrics", "hourly_metrics"}
+        metric_payloads = {}
+        for _ in range(2):
+            event_name, payload = await _read_sse_event(lines, expected_names={"daily_metrics", "hourly_metrics"})
+            metric_payloads[event_name] = payload
+        assert set(metric_payloads) == {"daily_metrics", "hourly_metrics"}
+        assert metric_payloads["daily_metrics"]["startDate"] == daily_start
+        assert metric_payloads["hourly_metrics"]["startAt"] == hourly_start
 
         await record_websocket_traffic(channel="web_map", direction="egress", byte_count=2048)
         await app_runtime.admin_traffic_service.flush_pending()
-        traffic_events = {
-            (await _read_sse_event(lines, expected_names={"traffic_live", "traffic_history"}, timeout_sec=8.0))[0],
-            (await _read_sse_event(lines, expected_names={"traffic_live", "traffic_history"}, timeout_sec=8.0))[0],
-        }
-        assert traffic_events == {"traffic_live", "traffic_history"}
+        traffic_payloads = {}
+        for _ in range(2):
+            event_name, payload = await _read_sse_event(
+                lines,
+                expected_names={"traffic_live", "traffic_history"},
+                timeout_sec=8.0,
+            )
+            traffic_payloads[event_name] = payload
+        assert set(traffic_payloads) == {"traffic_live", "traffic_history"}
+        assert traffic_payloads["traffic_history"]["startAt"] == traffic_start
 
         await admin_auth.record_audit_event(
             event_type="player_disconnected",

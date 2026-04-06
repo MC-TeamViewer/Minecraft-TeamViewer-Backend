@@ -48,6 +48,8 @@ export interface MetricsPayload {
   items: MetricItem[];
   days?: number;
   hours?: number;
+  startDate?: string | null;
+  startAt?: string | null;
   serverTime?: number;
 }
 
@@ -109,6 +111,8 @@ export interface TrafficBucketItem {
 export type TrafficRangePreset = "1h" | "6h" | "24h" | "48h" | "7d" | "30d";
 export type TrafficGranularity = "1m" | "5m" | "15m" | "1h" | "1d";
 export type TrafficLayer = "application" | "wire";
+export type TrafficHistoryDisplayMode = TrafficLayer | "mixed";
+export type TrafficMixedViewMode = "total" | "breakdown";
 
 export interface TrafficLayerLivePayload {
   playerIngressBps: number;
@@ -131,6 +135,7 @@ export interface TrafficHistoryPayload {
   range: TrafficRangePreset;
   granularity: TrafficGranularity;
   bucketSeconds: number;
+  startAt?: string | null;
   selectedLayer: TrafficLayer;
   application: TrafficLayerHistoryPayload;
   wire: TrafficLayerHistoryPayload;
@@ -147,11 +152,14 @@ export interface MetricsFilters {
   roomCode: string;
   dailyDays: number;
   hourlyHours: number;
+  dailyStartDate: string;
+  hourlyStartAt: string;
 }
 
 export interface TrafficFilters {
   range: TrafficRangePreset;
   granularity: TrafficGranularity;
+  startAt: string;
 }
 
 export interface DashboardFilters {
@@ -182,11 +190,14 @@ export const DEFAULT_METRICS_FILTERS: MetricsFilters = {
   roomCode: "",
   dailyDays: 30,
   hourlyHours: 48,
+  dailyStartDate: "",
+  hourlyStartAt: "",
 };
 
 export const DEFAULT_TRAFFIC_FILTERS: TrafficFilters = {
   range: "48h",
   granularity: "1h",
+  startAt: "",
 };
 
 export const DEFAULT_DASHBOARD_FILTERS: DashboardFilters = {
@@ -241,4 +252,21 @@ export const TRAFFIC_LAYER_LABELS: Record<TrafficLayer, string> = {
 export const TRAFFIC_LAYER_OPTIONS: Array<{ label: string; value: TrafficLayer }> = [
   { label: "应用层", value: "application" },
   { label: "传输层", value: "wire" },
+];
+
+export const TRAFFIC_HISTORY_DISPLAY_LABELS: Record<TrafficHistoryDisplayMode, string> = {
+  application: "应用层",
+  wire: "传输层",
+  mixed: "混合显示",
+};
+
+export const TRAFFIC_HISTORY_DISPLAY_OPTIONS: Array<{ label: string; value: TrafficHistoryDisplayMode }> = [
+  { label: "应用层", value: "application" },
+  { label: "传输层", value: "wire" },
+  { label: "混合显示", value: "mixed" },
+];
+
+export const TRAFFIC_MIXED_VIEW_OPTIONS: Array<{ label: string; value: TrafficMixedViewMode }> = [
+  { label: "总量对比", value: "total" },
+  { label: "分流量细则", value: "breakdown" },
 ];

@@ -148,7 +148,8 @@ describe("TrafficChartCard", () => {
         title: "历史流量",
         description: "desc",
         metrics: buildTrafficPayload(),
-        selectedLayer: "application",
+        selectedMode: "application",
+        mixedViewMode: "total",
       },
     });
 
@@ -160,7 +161,7 @@ describe("TrafficChartCard", () => {
     expect(initialSeries[0]?.data).toEqual([300, 180]);
 
     await wrapper.setProps({
-      selectedLayer: "wire",
+      selectedMode: "wire",
     });
     await nextTick();
     await nextTick();
@@ -170,5 +171,89 @@ describe("TrafficChartCard", () => {
     expect(nextSeries[0]?.data).toEqual([140, 70]);
     expect(nextSeries[0]?.data).not.toEqual(initialSeries[0]?.data);
     expect(echartsMocks.disposeMock).toHaveBeenCalled();
+  });
+
+  it("renders mixed mode with per-channel breakdown on a shared scale", async () => {
+    const wrapper = mount(TrafficChartCard, {
+      props: {
+        title: "历史流量",
+        description: "desc",
+        metrics: buildTrafficPayload(),
+        selectedMode: "mixed",
+        mixedViewMode: "total",
+      },
+    });
+
+    await nextTick();
+    await nextTick();
+
+    const option = echartsMocks.setOptionMock.mock.calls[echartsMocks.setOptionMock.mock.calls.length - 1]?.[0];
+    const series = Array.isArray(option?.series) ? option.series : [];
+    expect(series).toHaveLength(2);
+    expect(series[0]?.name).toBe("应用层总流量");
+    expect(series[0]?.data).toEqual([500, 300]);
+    expect(series[1]?.name).toBe("传输层总流量");
+    expect(series[1]?.data).toEqual([250, 150]);
+
+    const segmented = wrapper.findComponent({ name: "ElSegmented" });
+    expect(segmented.exists()).toBe(true);
+
+    await wrapper.setProps({
+      mixedViewMode: "breakdown",
+    });
+    await nextTick();
+    await nextTick();
+
+    const breakdownOption = echartsMocks.setOptionMock.mock.calls[echartsMocks.setOptionMock.mock.calls.length - 1]?.[0];
+    const breakdownSeries = Array.isArray(breakdownOption?.series) ? breakdownOption.series : [];
+    expect(breakdownSeries).toHaveLength(8);
+    expect(breakdownSeries[0]?.name).toBe("应用层 游戏端入站");
+    expect(breakdownSeries[0]?.data).toEqual([300, 180]);
+    expect(breakdownSeries[1]?.name).toBe("传输层 游戏端入站");
+    expect(breakdownSeries[1]?.data).toEqual([140, 70]);
+    expect(breakdownSeries[6]?.name).toBe("应用层 网页端出站");
+    expect(breakdownSeries[6]?.data).toEqual([20, 20]);
+    expect(breakdownSeries[7]?.name).toBe("传输层 网页端出站");
+    expect(breakdownSeries[7]?.data).toEqual([10, 10]);
+  });
+
+  it("rebuilds chart reliably when mixed subview toggles repeatedly", async () => {
+    const wrapper = mount(TrafficChartCard, {
+      props: {
+        title: "历史流量",
+        description: "desc",
+        metrics: buildTrafficPayload(),
+        selectedMode: "mixed",
+        mixedViewMode: "total",
+      },
+    });
+
+    await nextTick();
+    await nextTick();
+
+    const extractSeries = () => {
+      const option = echartsMocks.setOptionMock.mock.calls[echartsMocks.setOptionMock.mock.calls.length - 1]?.[0];
+      return Array.isArray(option?.series) ? option.series : [];
+    };
+
+    expect(extractSeries()).toHaveLength(2);
+
+    await wrapper.setProps({ mixedViewMode: "breakdown" });
+    await nextTick();
+    await nextTick();
+    expect(extractSeries()).toHaveLength(8);
+    expect(extractSeries()[0]?.data).toEqual([300, 180]);
+
+    await wrapper.setProps({ mixedViewMode: "total" });
+    await nextTick();
+    await nextTick();
+    expect(extractSeries()).toHaveLength(2);
+    expect(extractSeries()[0]?.data).toEqual([500, 300]);
+
+    await wrapper.setProps({ mixedViewMode: "breakdown" });
+    await nextTick();
+    await nextTick();
+    expect(extractSeries()).toHaveLength(8);
+    expect(extractSeries()[1]?.data).toEqual([140, 70]);
   });
 });

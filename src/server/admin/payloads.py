@@ -83,18 +83,38 @@ class AdminPayloadService:
 
         return await self._get_cached_payload(("overview", ()), ttl_sec=1.0, builder=builder)
 
-    async def build_daily_metrics_payload(self, *, days: int = 30, room_code: str | None = None) -> MetricsPayload:
+    async def build_daily_metrics_payload(
+        self,
+        *,
+        days: int = 30,
+        room_code: str | None = None,
+        start_date: str | None = None,
+    ) -> MetricsPayload:
         return await self._get_cached_payload(
-            ("daily_metrics", (("days", days), ("room_code", room_code))),
+            ("daily_metrics", (("days", days), ("room_code", room_code), ("start_date", start_date))),
             ttl_sec=1.0,
-            builder=lambda: self._store.query_daily_metrics(days=days, room_code=room_code),
+            builder=lambda: self._store.query_daily_metrics_with_start(
+                days=days,
+                room_code=room_code,
+                start_date=start_date,
+            ),
         )
 
-    async def build_hourly_metrics_payload(self, *, hours: int = 48, room_code: str | None = None) -> MetricsPayload:
+    async def build_hourly_metrics_payload(
+        self,
+        *,
+        hours: int = 48,
+        room_code: str | None = None,
+        start_at: str | None = None,
+    ) -> MetricsPayload:
         return await self._get_cached_payload(
-            ("hourly_metrics", (("hours", hours), ("room_code", room_code))),
+            ("hourly_metrics", (("hours", hours), ("room_code", room_code), ("start_at", start_at))),
             ttl_sec=1.0,
-            builder=lambda: self._store.query_hourly_metrics(hours=hours, room_code=room_code),
+            builder=lambda: self._store.query_hourly_metrics_with_start(
+                hours=hours,
+                room_code=room_code,
+                start_at=start_at,
+            ),
         )
 
     async def build_live_traffic_payload(self) -> LiveTrafficPayload:
@@ -123,6 +143,7 @@ class AdminPayloadService:
         *,
         range_preset: str = "48h",
         granularity: str = "1h",
+        start_at: str | None = None,
     ) -> TrafficHistoryPayload:
         async def builder() -> TrafficHistoryPayload:
             application, wire = await asyncio.gather(
@@ -130,11 +151,13 @@ class AdminPayloadService:
                     range_preset=range_preset,
                     granularity=granularity,
                     scope="application",
+                    start_at=start_at,
                 ),
                 self._store.query_traffic_history(
                     range_preset=range_preset,
                     granularity=granularity,
                     scope="wire",
+                    start_at=start_at,
                 ),
             )
             return {
@@ -142,6 +165,7 @@ class AdminPayloadService:
                 "range": application["range"],
                 "granularity": application["granularity"],
                 "bucketSeconds": application["bucketSeconds"],
+                "startAt": application.get("startAt"),
                 "selectedLayer": "application",
                 "application": {
                     "items": application["items"],
@@ -158,7 +182,7 @@ class AdminPayloadService:
             }
 
         return await self._get_cached_payload(
-            ("traffic_history", (("range", range_preset), ("granularity", granularity))),
+            ("traffic_history", (("range", range_preset), ("granularity", granularity), ("start_at", start_at))),
             ttl_sec=1.0,
             builder=builder,
         )
@@ -209,18 +233,25 @@ class AdminPayloadService:
         audit_actor_types: tuple[str, ...] = (),
         audit_success: bool | None = None,
         daily_days: int = 30,
+        daily_start_date: str | None = None,
         daily_room_code: str | None = None,
         hourly_hours: int = 48,
+        hourly_start_at: str | None = None,
         hourly_room_code: str | None = None,
         traffic_range: str = "48h",
         traffic_granularity: str = "1h",
+        traffic_start_at: str | None = None,
     ) -> BootstrapPayload:
         overview, daily_metrics, hourly_metrics, live_traffic, traffic_history, audit = await asyncio.gather(
             self.build_overview_payload(),
-            self.build_daily_metrics_payload(days=daily_days, room_code=daily_room_code),
-            self.build_hourly_metrics_payload(hours=hourly_hours, room_code=hourly_room_code),
+            self.build_daily_metrics_payload(days=daily_days, room_code=daily_room_code, start_date=daily_start_date),
+            self.build_hourly_metrics_payload(hours=hourly_hours, room_code=hourly_room_code, start_at=hourly_start_at),
             self.build_live_traffic_payload(),
-            self.build_traffic_history_payload(range_preset=traffic_range, granularity=traffic_granularity),
+            self.build_traffic_history_payload(
+                range_preset=traffic_range,
+                granularity=traffic_granularity,
+                start_at=traffic_start_at,
+            ),
             self.build_audit_payload(
                 limit=audit_limit,
                 event_type=audit_event_type,
