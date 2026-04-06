@@ -61,6 +61,12 @@ uv run src/main.py
 - `/web-map/ws`：网页地图 WebSocket 入口
 - `/adminws`：已弃用兼容别名，会提示迁移到 `/web-map/ws`
 - `/admin/ws`：预留管理接口，当前仅占位
+- `/admin`：Basic Auth 保护的内置后台页面
+- `/admin/api/overview`：当前在线概况
+- `/admin/api/events`：后台管理页 SSE 实时事件流
+- `/admin/api/metrics/daily`：日活趋势
+- `/admin/api/metrics/hourly`：小时活跃趋势
+- `/admin/api/audit`：审计日志查询，支持 `actorTypes` 多值筛选
 - `/health`：健康检查
 - `/snapshot`：状态快照调试接口
 
@@ -83,6 +89,66 @@ uv run src/main.py
 - 同服过滤（Tab 列表归并）相关行为
 
 如果你要调整“多久清理离线对象”“广播频率多高”“同服过滤是否默认启用”，优先看这个文件。
+
+### 后台管理配置
+
+后台管理依赖以下环境变量：
+
+- `TEAMVIEWER_ADMIN_USERNAME`
+- `TEAMVIEWER_ADMIN_PASSWORD`
+- `TEAMVIEWER_DB_PATH`：SQLite 文件路径，默认当前工作目录下的 `teamviewer-admin.db`
+- `TEAMVIEWER_AUDIT_RETENTION_DAYS`
+- `TEAMVIEWER_HOURLY_RETENTION_DAYS`
+- `TEAMVIEWER_DAILY_RETENTION_DAYS`
+- `TZ`：统计切日和切小时使用的本地时区
+
+统计口径：
+
+- DAU 按玩家 `submitPlayerId` 去重
+- 小时数据按整点小时桶统计唯一玩家
+- `roomCode` 过滤时按房间统计；不传时按全局玩家去重
+
+审计覆盖：
+
+- 玩家握手成功/失败、断开
+- web-map 握手成功/失败、断开
+- 管理页/API 鉴权成功/失败
+- 管理页/API 访问
+- 关键后台错误
+
+后台页面刷新策略：
+
+- 首屏先走普通 HTTP 拉取
+- 后续通过 `/admin/api/events` 的 SSE 流实时更新当前连接状态、房间概览、DAU、小时活跃和审计日志
+- 当前连接状态会细分到每个已登记连接，显示类型、名字、房间、协议版本、程序版本和地址
+
+## Docker Compose 部署
+
+项目内置了 `docker-compose.yml`，最小启动方式：
+
+```bash
+docker compose up -d --build
+```
+
+默认暴露：
+
+- `http://127.0.0.1:8765/admin`
+- `ws://127.0.0.1:8765/mc-client`
+- `ws://127.0.0.1:8765/web-map/ws`
+
+建议至少覆盖这两个变量：
+
+```bash
+export TEAMVIEWER_ADMIN_USERNAME=admin
+export TEAMVIEWER_ADMIN_PASSWORD=please-change-me
+docker compose up -d --build
+```
+
+Compose 默认会：
+
+- 把 SQLite 数据库直接映射到宿主机 `./data/teamviewer-admin.db`
+- 通过 `TZ` 控制报表时区，默认 `Asia/Shanghai`
+- 把容器内数据库路径固定为 `/app/data/teamviewer-admin.db`
 
 ### 与其他组件如何协作
 
@@ -116,6 +182,7 @@ uv run src/main.py
 uv sync
 uv run src/main.py
 uv run pytest -q
+docker compose up -d --build
 ```
 
 协议代码生成：

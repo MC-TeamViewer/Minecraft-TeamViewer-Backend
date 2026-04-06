@@ -1,15 +1,22 @@
+import base64
+import binascii
+import json
 import logging
 import os
+import secrets
+import asyncio
 import time
 import uuid
-import asyncio
 from contextlib import asynccontextmanager
 
 import msgpack
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
+from server.admin_sse import AdminSseHub
+from server.admin_store import AdminStore, AdminStoreConfig
+from server.admin_ui import render_admin_page
 from server.broadcaster import Broadcaster
 from server.codec import ProtobufMessageCodec
 from server.models import BattleChunkData, EntityData, PlayerData, WaypointData
@@ -78,6 +85,353 @@ configure_logging()
 logger = logging.getLogger("teamviewrelay.main")
 
 message_codec = ProtobufMessageCodec()
+admin_store: AdminStore | None = None
+admin_retention_task: asyncio.Task | None = None
+admin_sse_hub = AdminSseHub()
+web_map_connection_meta: dict[str, dict] = {}
+DEFAULT_ADMIN_DB_PATH = "./data/teamviewer-admin.db"
+
+
+def parse_positive_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(value, maximum))
+
+
+def build_admin_store_config() -> AdminStoreConfig:
+    return AdminStoreConfig(
+        db_path=os.getenv("TEAMVIEWER_DB_PATH", DEFAULT_ADMIN_DB_PATH),
+        audit_retention_days=parse_positive_int_env("TEAMVIEWER_AUDIT_RETENTION_DAYS", 90, minimum=1, maximum=3650),
+        hourly_retention_days=parse_positive_int_env("TEAMVIEWER_HOURLY_RETENTION_DAYS", 90, minimum=1, maximum=3650),
+        daily_retention_days=parse_positive_int_env("TEAMVIEWER_DAILY_RETENTION_DAYS", 400, minimum=1, maximum=3650),
+    )
+
+
+def get_remote_addr_from_client(client) -> str | None:
+    host = getattr(client, "host", None)
+    if isinstance(host, str) and host.strip():
+        return host
+    return None
+
+
+def get_request_remote_addr(request: Request) -> str | None:
+    return get_remote_addr_from_client(request.client)
+
+
+def get_websocket_remote_addr(websocket: WebSocket) -> str | None:
+    return get_remote_addr_from_client(websocket.client)
+
+
+async def record_audit_event(
+    *,
+    event_type: str,
+    actor_type: str,
+    actor_id: str | None = None,
+    room_code: str | None = None,
+    success: bool = True,
+    remote_addr: str | None = None,
+    detail: dict | None = None,
+    occurred_at: float | None = None,
+) -> None:
+    if admin_store is None:
+        return
+    try:
+        await admin_store.record_audit_event(
+            event_type=event_type,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            room_code=room_code,
+            success=success,
+            remote_addr=remote_addr,
+            detail=detail,
+            occurred_at=occurred_at,
+        )
+        trigger_admin_sse_audit()
+    except Exception as exc:
+        logger.warning("Failed to persist audit event type=%s: %s", event_type, exc)
+
+
+async def record_player_activity(player_id: str | None, room_code: str | None, *, occurred_at: float | None = None) -> None:
+    if admin_store is None or not isinstance(player_id, str) or not player_id:
+        return
+    try:
+        await admin_store.record_player_activity(
+            player_id,
+            state.normalize_room_code(room_code),
+            occurred_at=occurred_at,
+        )
+        trigger_admin_sse_metrics()
+    except Exception as exc:
+        logger.warning("Failed to persist player activity playerId=%s: %s", player_id, exc)
+
+
+def parse_basic_auth_header(header_value: str | None) -> tuple[str | None, str | None]:
+    if not isinstance(header_value, str):
+        return None, None
+
+    scheme, _, encoded = header_value.partition(" ")
+    if scheme.lower() != "basic" or not encoded:
+        return None, None
+
+    try:
+        decoded = base64.b64decode(encoded).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return None, None
+
+    username, separator, password = decoded.partition(":")
+    if not separator:
+        return None, None
+    return username, password
+
+
+def admin_unauthorized_response(detail: str) -> JSONResponse:
+    return JSONResponse(
+        {"detail": detail},
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="TeamViewRelay Admin"'},
+    )
+
+
+async def authenticate_admin_request(request: Request) -> str | JSONResponse:
+    configured_username = os.getenv("TEAMVIEWER_ADMIN_USERNAME", "admin")
+    configured_password = os.getenv("TEAMVIEWER_ADMIN_PASSWORD", "admin")
+    remote_addr = get_request_remote_addr(request)
+
+    if not configured_username or not configured_password:
+        await record_audit_event(
+            event_type="admin_auth_failed",
+            actor_type="admin",
+            success=False,
+            remote_addr=remote_addr,
+            detail={"reason": "admin_not_configured", "path": request.url.path},
+        )
+        return JSONResponse({"detail": "admin_not_configured"}, status_code=503)
+
+    username, password = parse_basic_auth_header(request.headers.get("authorization"))
+    auth_ok = (
+        isinstance(username, str)
+        and isinstance(password, str)
+        and secrets.compare_digest(username, configured_username)
+        and secrets.compare_digest(password, configured_password)
+    )
+    if not auth_ok:
+        await record_audit_event(
+            event_type="admin_auth_failed",
+            actor_type="admin",
+            actor_id=username,
+            success=False,
+            remote_addr=remote_addr,
+            detail={"reason": "invalid_credentials", "path": request.url.path},
+        )
+        return admin_unauthorized_response("invalid_admin_credentials")
+
+    await record_audit_event(
+        event_type="admin_auth_success",
+        actor_type="admin",
+        actor_id=username,
+        success=True,
+        remote_addr=remote_addr,
+        detail={"path": request.url.path, "method": request.method},
+    )
+    return username
+
+
+async def record_admin_access(request: Request, username: str, access_type: str) -> None:
+    await record_audit_event(
+        event_type=access_type,
+        actor_type="admin",
+        actor_id=username,
+        success=True,
+        remote_addr=get_request_remote_addr(request),
+        detail={"path": request.url.path, "method": request.method, "query": str(request.url.query or "")},
+    )
+
+
+def normalize_optional_room_code(room_code: str | None) -> str | None:
+    if room_code is None:
+        return None
+    text = str(room_code).strip()
+    if not text:
+        return None
+    return state.normalize_room_code(text)
+
+
+def build_room_overview() -> list[dict]:
+    room_index: dict[str, dict] = {}
+
+    def ensure_room(room_code: str) -> dict:
+        room = room_index.get(room_code)
+        if room is None:
+            room = {
+                "roomCode": room_code,
+                "playerConnections": 0,
+                "webMapConnections": 0,
+                "playerIds": [],
+                "webMapIds": [],
+            }
+            room_index[room_code] = room
+        return room
+
+    for player_id in sorted(state.connections.keys()):
+        room_code = state.get_player_room(player_id)
+        room = ensure_room(room_code)
+        room["playerConnections"] += 1
+        room["playerIds"].append(player_id)
+
+    for web_map_id in sorted(state.web_map_connections.keys()):
+        room_code = state.get_web_map_room(web_map_id)
+        room = ensure_room(room_code)
+        room["webMapConnections"] += 1
+        room["webMapIds"].append(web_map_id)
+
+    return [room_index[key] for key in sorted(room_index.keys())]
+
+
+def build_connection_details() -> list[dict]:
+    details: list[dict] = []
+
+    for player_id in sorted(state.connections.keys()):
+        room_code = state.get_player_room(player_id)
+        caps = state.connection_caps.get(player_id, {})
+        player_node = state.players.get(player_id, {})
+        player_data = player_node.get("data", {}) if isinstance(player_node, dict) else {}
+        if not isinstance(player_data, dict):
+            player_data = {}
+        player_name = str(player_data.get("playerName") or "").strip()
+        display_name = player_name or player_id
+        details.append(
+            {
+                "channel": "player",
+                "actorId": player_id,
+                "displayName": display_name,
+                "roomCode": room_code,
+                "protocolVersion": caps.get("protocol"),
+                "programVersion": caps.get("programVersion"),
+                "remoteAddr": caps.get("remoteAddr"),
+            }
+        )
+
+    for web_map_id in sorted(state.web_map_connections.keys()):
+        room_code = state.get_web_map_room(web_map_id)
+        meta = web_map_connection_meta.get(web_map_id, {})
+        program_version = meta.get("programVersion")
+        display_name = str(meta.get("displayName") or program_version or "Web Map").strip() or "Web Map"
+        details.append(
+            {
+                "channel": "web_map",
+                "actorId": web_map_id,
+                "displayName": display_name,
+                "roomCode": room_code,
+                "protocolVersion": meta.get("protocolVersion"),
+                "programVersion": program_version,
+                "remoteAddr": meta.get("remoteAddr"),
+            }
+        )
+
+    return details
+
+
+async def build_admin_overview_payload() -> dict:
+    if admin_store is None:
+        raise RuntimeError("admin_store_unavailable")
+
+    rooms = build_room_overview()
+    connection_details = build_connection_details()
+    hourly_metrics = await admin_store.query_hourly_metrics(hours=24)
+    hourly_peak = max((item["activePlayers"] for item in hourly_metrics["items"]), default=0)
+    return {
+        "playerConnections": len(state.connections),
+        "webMapConnections": len(state.web_map_connections),
+        "activeRooms": len(rooms),
+        "rooms": rooms,
+        "connectionDetails": connection_details,
+        "timezone": admin_store.timezone_label,
+        "dbPathMasked": admin_store.masked_db_path,
+        "broadcastHz": state.broadcast_hz,
+        "hourlyPeak24h": hourly_peak,
+    }
+
+
+async def build_admin_daily_metrics_payload(days: int = 30, room_code: str | None = None) -> dict:
+    if admin_store is None:
+        raise RuntimeError("admin_store_unavailable")
+    return await admin_store.query_daily_metrics(days=days, room_code=room_code)
+
+
+async def build_admin_hourly_metrics_payload(hours: int = 48, room_code: str | None = None) -> dict:
+    if admin_store is None:
+        raise RuntimeError("admin_store_unavailable")
+    return await admin_store.query_hourly_metrics(hours=hours, room_code=room_code)
+
+
+async def build_admin_audit_payload(
+    *,
+    limit: int = 100,
+    before_id: int | None = None,
+    event_type: str | None = None,
+    actor_type: str | None = None,
+    actor_types: list[str] | tuple[str, ...] | None = None,
+    success: bool | None = None,
+) -> dict:
+    if admin_store is None:
+        raise RuntimeError("admin_store_unavailable")
+    return await admin_store.query_audit_events(
+        limit=limit,
+        before_id=before_id,
+        event_type=event_type,
+        actor_type=actor_type,
+        actor_types=actor_types,
+        success=success,
+    )
+
+
+async def build_admin_bootstrap_payload(
+    *,
+    audit_limit: int = 100,
+    audit_event_type: str | None = None,
+    audit_actor_types: tuple[str, ...] = (),
+    audit_success: bool | None = None,
+) -> dict:
+    overview, daily_metrics, hourly_metrics, audit = await asyncio.gather(
+        build_admin_overview_payload(),
+        build_admin_daily_metrics_payload(days=30),
+        build_admin_hourly_metrics_payload(hours=48),
+        build_admin_audit_payload(
+            limit=audit_limit,
+            event_type=audit_event_type,
+            actor_types=audit_actor_types,
+            success=audit_success,
+        ),
+    )
+    return {
+        "serverTime": time.time(),
+        "overview": overview,
+        "dailyMetrics": daily_metrics,
+        "hourlyMetrics": hourly_metrics,
+        "audit": audit,
+    }
+
+
+def format_sse_event(event_name: str, payload: dict) -> str:
+    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def trigger_admin_sse_overview() -> None:
+    asyncio.create_task(admin_sse_hub.broadcast("overview"))
+
+
+def trigger_admin_sse_metrics() -> None:
+    admin_sse_hub.schedule_broadcast("daily_metrics", delay_sec=1.0)
+    admin_sse_hub.schedule_broadcast("hourly_metrics", delay_sec=1.0)
+
+
+def trigger_admin_sse_audit() -> None:
+    admin_sse_hub.schedule_broadcast("audit", delay_sec=1.0)
 
 async def send_packet(websocket: WebSocket, packet, *, channel: str | None = None) -> None:
     if channel:
@@ -426,20 +780,73 @@ async def run_broadcast_scheduler() -> None:
             raise
         except Exception as e:
             logger.exception("Broadcast scheduler error: %s", e)
+            await record_audit_event(
+                event_type="backend_error",
+                actor_type="system",
+                success=False,
+                detail={
+                    "scope": "broadcast_scheduler",
+                    "errorType": type(e).__name__,
+                    "message": str(e),
+                },
+            )
 
         interval_sec = 1.0 / max(state.MIN_BROADCAST_HZ, state.broadcast_hz)
         elapsed = time.time() - tick_start
         await asyncio.sleep(max(0.0, interval_sec - elapsed))
 
+
+async def run_admin_retention_scheduler() -> None:
+    while True:
+        try:
+            if admin_store is not None:
+                cleanup = await admin_store.cleanup_retention()
+                logger.info("Admin retention cleanup completed: %s", cleanup)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Admin retention cleanup error: %s", exc)
+            await record_audit_event(
+                event_type="backend_error",
+                actor_type="system",
+                success=False,
+                detail={
+                    "scope": "admin_retention_scheduler",
+                    "errorType": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+        await asyncio.sleep(6 * 60 * 60)
+
+
 # HTTP/WS 入口层：仅做协议收发与调度，不承载核心仲裁逻辑。
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global broadcast_task
+    global admin_retention_task, admin_store, broadcast_task
+    admin_store = AdminStore(build_admin_store_config())
+    await admin_store.initialize()
+    cleanup = await admin_store.cleanup_retention()
+    logger.info(
+        "Admin store initialized db=%s timezone=%s cleanup=%s",
+        admin_store.masked_db_path,
+        admin_store.timezone_label,
+        cleanup,
+    )
     if broadcast_task is None or broadcast_task.done():
         broadcast_task = asyncio.create_task(run_broadcast_scheduler())
+    if admin_retention_task is None or admin_retention_task.done():
+        admin_retention_task = asyncio.create_task(run_admin_retention_scheduler())
     try:
         yield
     finally:
+        await admin_sse_hub.close()
+        if admin_retention_task is not None:
+            admin_retention_task.cancel()
+            try:
+                await admin_retention_task
+            except asyncio.CancelledError:
+                pass
+            admin_retention_task = None
         if broadcast_task is not None:
             broadcast_task.cancel()
             try:
@@ -447,6 +854,9 @@ async def lifespan(_app: FastAPI):
             except asyncio.CancelledError:
                 pass
             broadcast_task = None
+        if admin_store is not None:
+            await admin_store.close()
+            admin_store = None
 
 
 app = FastAPI(lifespan=lifespan)
@@ -457,6 +867,7 @@ async def web_map_ws(websocket: WebSocket):
     """网页地图订阅通道：用于查看服务端实时快照与发送观察端指令。"""
     await websocket.accept()
     web_map_id = str(id(websocket))
+    remote_addr = get_websocket_remote_addr(websocket)
     if str(websocket.url.path) == "/adminws":
         logger.warning("Deprecated websocket route /adminws used; migrate clients to /web-map/ws")
     handshake_completed = False
@@ -471,6 +882,15 @@ async def web_map_ws(websocket: WebSocket):
                 require_wire_channel(payload, "web_map", "/web-map/ws")
             except PacketDecodeError as exc:
                 if not handshake_completed and exc.code == "channel_mismatch":
+                    await record_audit_event(
+                        event_type="web_map_handshake_failed",
+                        actor_type="web_map",
+                        actor_id=web_map_id,
+                        room_code=state.DEFAULT_ROOM_CODE,
+                        success=False,
+                        remote_addr=remote_addr,
+                        detail={"reason": exc.detail},
+                    )
                     await reject_handshake(websocket, exc.detail, state.DEFAULT_ROOM_CODE, channel="web_map")
                     return
                 await send_packet(websocket, WebMapAckPacket(ok=False, error=exc.code))
@@ -495,6 +915,18 @@ async def web_map_ws(websocket: WebSocket):
                         HandshakeHelpers.protocol_version(packet),
                         legacy_room,
                     )
+                    await record_audit_event(
+                        event_type="web_map_handshake_failed",
+                        actor_type="web_map",
+                        actor_id=web_map_id,
+                        room_code=legacy_room,
+                        success=False,
+                        remote_addr=remote_addr,
+                        detail={
+                            "reason": "legacy_messagepack",
+                            "clientProtocol": HandshakeHelpers.protocol_version(packet),
+                        },
+                    )
                     await reject_handshake(
                         websocket,
                         legacy_reason,
@@ -516,6 +948,19 @@ async def web_map_ws(websocket: WebSocket):
                         web_map_room,
                         rejection_reason,
                     )
+                    await record_audit_event(
+                        event_type="web_map_handshake_failed",
+                        actor_type="web_map",
+                        actor_id=web_map_id,
+                        room_code=web_map_room,
+                        success=False,
+                        remote_addr=remote_addr,
+                        detail={
+                            "reason": rejection_reason,
+                            "clientProtocol": client_protocol,
+                            "clientProgramVersion": client_program_version,
+                        },
+                    )
                     await reject_handshake(websocket, rejection_reason, web_map_room, channel="web_map")
                     return
 
@@ -536,12 +981,31 @@ async def web_map_ws(websocket: WebSocket):
                 )
                 state.web_map_connections[web_map_id] = websocket
                 state.set_web_map_room(web_map_id, web_map_room)
+                web_map_connection_meta[web_map_id] = {
+                    "protocolVersion": client_protocol,
+                    "programVersion": client_program_version,
+                    "displayName": "Web Map",
+                    "remoteAddr": remote_addr,
+                }
                 handshake_completed = True
                 logger.info(
                     "Web-map connected (clientProtocol=%s, clientProgramVersion=%s, roomCode=%s)",
                     client_protocol,
                     client_program_version,
                     web_map_room,
+                )
+                trigger_admin_sse_overview()
+                await record_audit_event(
+                    event_type="web_map_handshake_success",
+                    actor_type="web_map",
+                    actor_id=web_map_id,
+                    room_code=web_map_room,
+                    success=True,
+                    remote_addr=remote_addr,
+                    detail={
+                        "clientProtocol": client_protocol,
+                        "clientProgramVersion": client_program_version,
+                    },
                 )
                 try:
                     await broadcaster.send_web_map_snapshot_full(web_map_id)
@@ -777,6 +1241,19 @@ async def web_map_ws(websocket: WebSocket):
         disconnect_reason = f"error:{type(e).__name__}"
         disconnect_exception = e
         logger.exception("Web-map websocket error: %s", e)
+        await record_audit_event(
+            event_type="backend_error",
+            actor_type="web_map",
+            actor_id=web_map_id,
+            room_code=web_map_room,
+            success=False,
+            remote_addr=remote_addr,
+            detail={
+                "scope": "web_map_ws",
+                "errorType": type(e).__name__,
+                "message": str(e),
+            },
+        )
     finally:
         logger.info(
             "Web-map disconnected (webMapId=%s, roomCode=%s, handshakeCompleted=%s, reason=%s, code=%s, %s, error=%r)",
@@ -788,10 +1265,22 @@ async def web_map_ws(websocket: WebSocket):
             describe_websocket(websocket),
             disconnect_exception,
         )
+        if handshake_completed:
+            trigger_admin_sse_overview()
+            await record_audit_event(
+                event_type="web_map_disconnected",
+                actor_type="web_map",
+                actor_id=web_map_id,
+                room_code=web_map_room,
+                success=True,
+                remote_addr=remote_addr,
+                detail={"reason": disconnect_reason, "code": disconnect_code},
+            )
         if web_map_id in state.web_map_connections:
             del state.web_map_connections[web_map_id]
         if web_map_id in state.web_map_connection_rooms:
             del state.web_map_connection_rooms[web_map_id]
+        web_map_connection_meta.pop(web_map_id, None)
 
 
 @app.websocket("/admin/ws")
@@ -815,6 +1304,186 @@ async def reserved_admin_ws(websocket: WebSocket):
         await websocket.close(code=1008, reason="admin_interface_reserved")
 
 
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page(request: Request):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+
+    await record_admin_access(request, auth_result, "admin_page_view")
+    return HTMLResponse(render_admin_page())
+
+
+@app.get("/admin/api/overview")
+async def admin_overview(request: Request):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    if admin_store is None:
+        return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
+
+    await record_admin_access(request, auth_result, "admin_api_access")
+    return JSONResponse(await build_admin_overview_payload())
+
+
+@app.get("/admin/api/events")
+async def admin_events(
+    request: Request,
+    auditLimit: int = Query(default=100, ge=1, le=500),
+    auditEventType: str | None = None,
+    auditActorType: str | None = None,
+    auditActorTypes: list[str] | None = Query(default=None),
+    auditSuccess: bool | None = None,
+):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    if admin_store is None:
+        return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
+
+    await record_admin_access(request, auth_result, "admin_sse_connect")
+    audit_event_type = auditEventType.strip() if isinstance(auditEventType, str) and auditEventType.strip() else None
+    audit_actor_type = auditActorType.strip() if isinstance(auditActorType, str) and auditActorType.strip() else None
+    audit_actor_types = tuple(
+        item.strip()
+        for item in (auditActorTypes or [])
+        if isinstance(item, str) and item.strip()
+    )
+    if not audit_actor_types and audit_actor_type:
+        audit_actor_types = (audit_actor_type,)
+    subscriber = await admin_sse_hub.subscribe(
+        audit_limit=auditLimit,
+        audit_event_type=audit_event_type,
+        audit_actor_types=audit_actor_types,
+        audit_success=auditSuccess,
+    )
+
+    async def event_stream():
+        try:
+            bootstrap_payload = await build_admin_bootstrap_payload(
+                audit_limit=subscriber.audit_limit,
+                audit_event_type=subscriber.audit_event_type,
+                audit_actor_types=subscriber.audit_actor_types,
+                audit_success=subscriber.audit_success,
+            )
+            yield format_sse_event("bootstrap", bootstrap_payload)
+
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    event_name = await asyncio.wait_for(subscriber.queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield format_sse_event("heartbeat", {"serverTime": time.time()})
+                    continue
+
+                payload: dict
+                if event_name == "overview":
+                    payload = {"serverTime": time.time(), **(await build_admin_overview_payload())}
+                elif event_name == "daily_metrics":
+                    payload = {"serverTime": time.time(), **(await build_admin_daily_metrics_payload(days=30))}
+                elif event_name == "hourly_metrics":
+                    payload = {"serverTime": time.time(), **(await build_admin_hourly_metrics_payload(hours=48))}
+                elif event_name == "audit":
+                    payload = {
+                        "serverTime": time.time(),
+                        **(
+                            await build_admin_audit_payload(
+                                limit=subscriber.audit_limit,
+                                event_type=subscriber.audit_event_type,
+                                actor_types=subscriber.audit_actor_types,
+                                success=subscriber.audit_success,
+                            )
+                        ),
+                    }
+                else:
+                    continue
+
+                yield format_sse_event(event_name, payload)
+        finally:
+            await admin_sse_hub.unsubscribe(subscriber)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/admin/api/metrics/daily")
+async def admin_daily_metrics(
+    request: Request,
+    days: int = Query(default=30, ge=1, le=400),
+    roomCode: str | None = None,
+):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    if admin_store is None:
+        return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
+
+    await record_admin_access(request, auth_result, "admin_api_access")
+    payload = await build_admin_daily_metrics_payload(days=days, room_code=normalize_optional_room_code(roomCode))
+    return JSONResponse(payload)
+
+
+@app.get("/admin/api/metrics/hourly")
+async def admin_hourly_metrics(
+    request: Request,
+    hours: int = Query(default=48, ge=1, le=240),
+    roomCode: str | None = None,
+):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    if admin_store is None:
+        return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
+
+    await record_admin_access(request, auth_result, "admin_api_access")
+    payload = await build_admin_hourly_metrics_payload(hours=hours, room_code=normalize_optional_room_code(roomCode))
+    return JSONResponse(payload)
+
+
+@app.get("/admin/api/audit")
+async def admin_audit_log(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    beforeId: int | None = Query(default=None, ge=1),
+    eventType: str | None = None,
+    actorType: str | None = None,
+    actorTypes: list[str] | None = Query(default=None),
+    success: bool | None = None,
+):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    if admin_store is None:
+        return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
+
+    await record_admin_access(request, auth_result, "admin_api_access")
+    normalized_actor_types = [
+        item.strip()
+        for item in (actorTypes or [])
+        if isinstance(item, str) and item.strip()
+    ]
+    if not normalized_actor_types and isinstance(actorType, str) and actorType.strip():
+        normalized_actor_types = [actorType.strip()]
+    payload = await build_admin_audit_payload(
+        limit=limit,
+        before_id=beforeId,
+        event_type=eventType.strip() if isinstance(eventType, str) and eventType.strip() else None,
+        actor_type=actorType.strip() if isinstance(actorType, str) and actorType.strip() else None,
+        actor_types=normalized_actor_types,
+        success=success,
+    )
+    return JSONResponse(payload)
+
+
 @app.websocket("/playeresp")
 @app.websocket("/mc-client")
 async def websocket_endpoint(websocket: WebSocket):
@@ -828,6 +1497,10 @@ async def websocket_endpoint(websocket: WebSocket):
     """
     await websocket.accept()
     submit_player_id = None
+    remote_addr = get_websocket_remote_addr(websocket)
+    disconnect_reason = "connection_closed"
+    disconnect_code = None
+    disconnect_exception = None
 
     try:
         while True:
@@ -838,6 +1511,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 packet = PacketParsers.parse_player(payload)
             except PacketDecodeError as e:
                 if submit_player_id is None and e.code == "channel_mismatch":
+                    await record_audit_event(
+                        event_type="player_handshake_failed",
+                        actor_type="player",
+                        room_code=state.DEFAULT_ROOM_CODE,
+                        success=False,
+                        remote_addr=remote_addr,
+                        detail={"reason": e.detail},
+                    )
                     await reject_handshake(
                         websocket,
                         e.detail,
@@ -872,6 +1553,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     submit_player_id,
                     legacy_room,
                 )
+                await record_audit_event(
+                    event_type="player_handshake_failed",
+                    actor_type="player",
+                    actor_id=submit_player_id,
+                    room_code=legacy_room,
+                    success=False,
+                    remote_addr=remote_addr,
+                    detail={"reason": "legacy_messagepack"},
+                )
                 await reject_handshake(
                     websocket,
                     legacy_reason,
@@ -890,6 +1580,15 @@ async def websocket_endpoint(websocket: WebSocket):
                         "Player handshake rejected (submitPlayerId=%s, reason=%s)",
                         submit_player_id,
                         rejection_reason,
+                    )
+                    await record_audit_event(
+                        event_type="player_handshake_failed",
+                        actor_type="player",
+                        actor_id=submit_player_id,
+                        room_code=HandshakeHelpers.room_code(packet, state.DEFAULT_ROOM_CODE),
+                        success=False,
+                        remote_addr=remote_addr,
+                        detail={"reason": rejection_reason},
                     )
                     await reject_handshake(
                         websocket,
@@ -919,6 +1618,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     caps = state.connection_caps.get(submit_player_id)
                     if isinstance(caps, dict):
                         caps["negotiatedReportIntervalTicks"] = negotiated_ticks
+                        caps["programVersion"] = client_program_version
+                        caps["remoteAddr"] = remote_addr
 
                     ack = {
                         "networkProtocolVersion": NETWORK_PROTOCOL_VERSION,
@@ -943,12 +1644,31 @@ async def websocket_endpoint(websocket: WebSocket):
                         client_program_version,
                         client_room,
                     )
+                    trigger_admin_sse_overview()
+                    await record_player_activity(submit_player_id, client_room)
+                    await record_audit_event(
+                        event_type="player_handshake_success",
+                        actor_type="player",
+                        actor_id=submit_player_id,
+                        room_code=client_room,
+                        success=True,
+                        remote_addr=remote_addr,
+                        detail={
+                            "clientProtocol": client_protocol,
+                            "clientProgramVersion": client_program_version,
+                        },
+                    )
                     await broadcaster.send_snapshot_full_to_player(submit_player_id)
                 continue
 
             if not submit_player_id or submit_player_id not in state.connections:
                 logger.debug("Ignore player packet before handshake registration submitPlayerId=%s", submit_player_id)
                 continue
+
+            await record_player_activity(
+                submit_player_id,
+                state.get_player_room(submit_player_id),
+            )
 
             for packet in expand_player_packets(packet):
                 if (
@@ -1343,12 +2063,39 @@ async def websocket_endpoint(websocket: WebSocket):
                         logger.warning("Error sending snapshot_full to %s: %s", submit_player_id, e)
                     continue
 
-    except WebSocketDisconnect:
-        pass
+    except WebSocketDisconnect as exc:
+        disconnect_reason = "client_disconnect"
+        disconnect_code = getattr(exc, "code", None)
+        disconnect_exception = exc
     except Exception as e:
+        disconnect_reason = f"error:{type(e).__name__}"
+        disconnect_exception = e
         logger.exception("Error handling player message: %s", e)
+        await record_audit_event(
+            event_type="backend_error",
+            actor_type="player",
+            actor_id=submit_player_id,
+            room_code=state.get_player_room(submit_player_id) if submit_player_id else None,
+            success=False,
+            remote_addr=remote_addr,
+            detail={
+                "scope": "player_ws",
+                "errorType": type(e).__name__,
+                "message": str(e),
+            },
+        )
     finally:
         if submit_player_id:
+            trigger_admin_sse_overview()
+            await record_audit_event(
+                event_type="player_disconnected",
+                actor_type="player",
+                actor_id=submit_player_id,
+                room_code=state.get_player_room(submit_player_id),
+                success=True,
+                remote_addr=remote_addr,
+                detail={"reason": disconnect_reason, "code": disconnect_code},
+            )
             state.remove_connection(submit_player_id)
             await broadcaster.broadcast_web_map_updates()
             logger.info("Client %s disconnected", submit_player_id)

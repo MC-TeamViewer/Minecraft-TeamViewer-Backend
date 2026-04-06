@@ -1,11 +1,12 @@
-FROM astral/uv:python3.13-alpine
+FROM astral/uv:python3.12-bookworm-slim
 
 WORKDIR /app
 
-COPY ./src/ ./pyproject.toml /app/
+COPY pyproject.toml uv.lock README.md /app/
+COPY src /app/src
 
-RUN uv sync
+RUN uv sync --frozen --no-dev
 
 EXPOSE 8765
 
-CMD ["uv", "run", "main.py"]
+CMD ["uv", "run", "src/main.py"]

@@ -1,0 +1,20 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: teamviewer-backend
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      TEAMVIEWER_LOG_LEVEL: ${TEAMVIEWER_LOG_LEVEL:-INFO}
+      TEAMVIEWER_ADMIN_USERNAME: ${TEAMVIEWER_ADMIN_USERNAME:-admin}
+      TEAMVIEWER_ADMIN_PASSWORD: ${TEAMVIEWER_ADMIN_PASSWORD:-change-me}
+      TEAMVIEWER_DB_PATH: /app/data/teamviewer-admin.db
+      TEAMVIEWER_AUDIT_RETENTION_DAYS: ${TEAMVIEWER_AUDIT_RETENTION_DAYS:-90}
+      TEAMVIEWER_HOURLY_RETENTION_DAYS: ${TEAMVIEWER_HOURLY_RETENTION_DAYS:-90}
+      TEAMVIEWER_DAILY_RETENTION_DAYS: ${TEAMVIEWER_DAILY_RETENTION_DAYS:-400}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ./data:/app/data
