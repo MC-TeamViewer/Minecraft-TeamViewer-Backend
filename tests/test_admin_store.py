@@ -10,7 +10,7 @@ BACKEND_SRC = Path(__file__).resolve().parents[1] / "src"
 if str(BACKEND_SRC) not in sys.path:
     sys.path.insert(0, str(BACKEND_SRC))
 
-from server.admin_store import AdminStore, AdminStoreConfig
+from server.admin.store import AdminStore, AdminStoreConfig
 
 
 def _local_base(hour: int = 10, minute: int = 0) -> datetime:

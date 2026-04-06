@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 
-BACKEND_ROOT = Path(__file__).resolve().parents[2]
+BACKEND_ROOT = Path(__file__).resolve().parents[3]
 ADMIN_UI_DIST_DIR = BACKEND_ROOT / "admin-ui" / "dist"
 ADMIN_UI_INDEX_PATH = ADMIN_UI_DIST_DIR / "index.html"
 ADMIN_UI_ASSETS_DIR = ADMIN_UI_DIST_DIR / "assets"

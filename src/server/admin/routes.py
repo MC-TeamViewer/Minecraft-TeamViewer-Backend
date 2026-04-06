@@ -1,0 +1,272 @@
+import asyncio
+import time
+from pathlib import Path
+
+from fastapi import Query, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+
+from ..app import runtime
+from .auth import (
+    admin_ui_unavailable_response,
+    authenticate_admin_request,
+    build_admin_audit_payload,
+    build_admin_bootstrap_payload,
+    build_admin_daily_metrics_payload,
+    build_admin_hourly_metrics_payload,
+    build_admin_overview_payload,
+    format_sse_event,
+    normalize_optional_room_code,
+    record_admin_access,
+)
+from .frontend import ADMIN_UI_INDEX_PATH, resolve_admin_asset_path
+
+
+async def admin_page(request: Request):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+
+    await record_admin_access(request, auth_result, "admin_page_view")
+    if not Path(ADMIN_UI_INDEX_PATH).exists():
+        return admin_ui_unavailable_response()
+    return FileResponse(ADMIN_UI_INDEX_PATH, media_type="text/html")
+
+
+async def admin_assets(request: Request, asset_path: str):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+
+    asset_file = resolve_admin_asset_path(asset_path)
+    if asset_file is None:
+        if not Path(ADMIN_UI_INDEX_PATH).exists():
+            return admin_ui_unavailable_response()
+        return JSONResponse({"detail": "not_found"}, status_code=404)
+
+    return FileResponse(Path(asset_file))
+
+
+async def admin_overview(request: Request):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    if runtime.admin_store is None:
+        return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
+
+    await record_admin_access(request, auth_result, "admin_api_access")
+    try:
+        return JSONResponse(await build_admin_overview_payload())
+    except Exception:
+        runtime.admin_runtime_stats["apiErrors"] += 1
+        raise
+
+
+async def admin_events(
+    request: Request,
+    auditLimit: int = Query(default=100, ge=1, le=500),
+    auditEventType: str | None = None,
+    auditActorType: str | None = None,
+    auditActorTypes: list[str] | None = Query(default=None),
+    auditSuccess: bool | None = None,
+    dailyDays: int = Query(default=30, ge=1, le=400),
+    dailyRoomCode: str | None = None,
+    hourlyHours: int = Query(default=48, ge=1, le=240),
+    hourlyRoomCode: str | None = None,
+):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    if runtime.admin_store is None:
+        return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
+
+    await record_admin_access(request, auth_result, "admin_sse_connect")
+    audit_event_type = auditEventType.strip() if isinstance(auditEventType, str) and auditEventType.strip() else None
+    audit_actor_type = auditActorType.strip() if isinstance(auditActorType, str) and auditActorType.strip() else None
+    audit_actor_types = tuple(
+        item.strip()
+        for item in (auditActorTypes or [])
+        if isinstance(item, str) and item.strip()
+    )
+    if not audit_actor_types and audit_actor_type:
+        audit_actor_types = (audit_actor_type,)
+    subscriber = await runtime.admin_sse_hub.subscribe(
+        audit_limit=auditLimit,
+        audit_event_type=audit_event_type,
+        audit_actor_types=audit_actor_types,
+        audit_success=auditSuccess,
+        daily_days=dailyDays,
+        daily_room_code=normalize_optional_room_code(dailyRoomCode),
+        hourly_hours=hourlyHours,
+        hourly_room_code=normalize_optional_room_code(hourlyRoomCode),
+    )
+
+    async def event_stream():
+        try:
+            try:
+                bootstrap_payload = await build_admin_bootstrap_payload(
+                    audit_limit=subscriber.audit_limit,
+                    audit_event_type=subscriber.audit_event_type,
+                    audit_actor_types=subscriber.audit_actor_types,
+                    audit_success=subscriber.audit_success,
+                    daily_days=subscriber.daily_days,
+                    daily_room_code=subscriber.daily_room_code,
+                    hourly_hours=subscriber.hourly_hours,
+                    hourly_room_code=subscriber.hourly_room_code,
+                )
+            except Exception:
+                runtime.admin_runtime_stats["sseErrors"] += 1
+                raise
+            yield format_sse_event("bootstrap", bootstrap_payload)
+
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    event_name = await asyncio.wait_for(subscriber.queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield format_sse_event("heartbeat", {"serverTime": time.time()})
+                    continue
+
+                try:
+                    if event_name == "overview":
+                        payload = {"serverTime": time.time(), **(await build_admin_overview_payload())}
+                    elif event_name == "daily_metrics":
+                        payload = {
+                            "serverTime": time.time(),
+                            **(
+                                await build_admin_daily_metrics_payload(
+                                    days=subscriber.daily_days,
+                                    room_code=subscriber.daily_room_code,
+                                )
+                            ),
+                        }
+                    elif event_name == "hourly_metrics":
+                        payload = {
+                            "serverTime": time.time(),
+                            **(
+                                await build_admin_hourly_metrics_payload(
+                                    hours=subscriber.hourly_hours,
+                                    room_code=subscriber.hourly_room_code,
+                                )
+                            ),
+                        }
+                    elif event_name == "audit":
+                        payload = {
+                            "serverTime": time.time(),
+                            **(
+                                await build_admin_audit_payload(
+                                    limit=subscriber.audit_limit,
+                                    event_type=subscriber.audit_event_type,
+                                    actor_types=subscriber.audit_actor_types,
+                                    success=subscriber.audit_success,
+                                )
+                            ),
+                        }
+                    else:
+                        continue
+                except Exception:
+                    runtime.admin_runtime_stats["sseErrors"] += 1
+                    raise
+
+                yield format_sse_event(event_name, payload)
+        finally:
+            await runtime.admin_sse_hub.unsubscribe(subscriber)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def admin_daily_metrics(
+    request: Request,
+    days: int = Query(default=30, ge=1, le=400),
+    roomCode: str | None = None,
+):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    if runtime.admin_store is None:
+        return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
+
+    await record_admin_access(request, auth_result, "admin_api_access")
+    try:
+        payload = await build_admin_daily_metrics_payload(days=days, room_code=normalize_optional_room_code(roomCode))
+        return JSONResponse(payload)
+    except Exception:
+        runtime.admin_runtime_stats["apiErrors"] += 1
+        raise
+
+
+async def admin_hourly_metrics(
+    request: Request,
+    hours: int = Query(default=48, ge=1, le=240),
+    roomCode: str | None = None,
+):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    if runtime.admin_store is None:
+        return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
+
+    await record_admin_access(request, auth_result, "admin_api_access")
+    try:
+        payload = await build_admin_hourly_metrics_payload(hours=hours, room_code=normalize_optional_room_code(roomCode))
+        return JSONResponse(payload)
+    except Exception:
+        runtime.admin_runtime_stats["apiErrors"] += 1
+        raise
+
+
+async def admin_audit_log(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    beforeId: int | None = Query(default=None, ge=1),
+    eventType: str | None = None,
+    actorType: str | None = None,
+    actorTypes: list[str] | None = Query(default=None),
+    success: bool | None = None,
+):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    if runtime.admin_store is None:
+        return JSONResponse({"detail": "admin_store_unavailable"}, status_code=503)
+
+    await record_admin_access(request, auth_result, "admin_api_access")
+    normalized_actor_types = [
+        item.strip()
+        for item in (actorTypes or [])
+        if isinstance(item, str) and item.strip()
+    ]
+    if not normalized_actor_types and isinstance(actorType, str) and actorType.strip():
+        normalized_actor_types = [actorType.strip()]
+    try:
+        payload = await build_admin_audit_payload(
+            limit=limit,
+            before_id=beforeId,
+            event_type=eventType.strip() if isinstance(eventType, str) and eventType.strip() else None,
+            actor_type=actorType.strip() if isinstance(actorType, str) and actorType.strip() else None,
+            actor_types=normalized_actor_types,
+            success=success,
+        )
+        return JSONResponse(payload)
+    except Exception:
+        runtime.admin_runtime_stats["apiErrors"] += 1
+        raise
+
+
+def register_admin_routes(app) -> None:
+    app.get("/admin")(admin_page)
+    app.get("/admin/assets/{asset_path:path}")(admin_assets)
+    app.get("/admin/api/overview")(admin_overview)
+    app.get("/admin/api/events")(admin_events)
+    app.get("/admin/api/metrics/daily")(admin_daily_metrics)
+    app.get("/admin/api/metrics/hourly")(admin_hourly_metrics)
+    app.get("/admin/api/audit")(admin_audit_log)

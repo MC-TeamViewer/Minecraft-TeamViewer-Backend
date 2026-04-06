@@ -26,9 +26,11 @@ BACKEND_SRC = Path(__file__).resolve().parents[1] / "src"
 if str(BACKEND_SRC) not in sys.path:
     sys.path.insert(0, str(BACKEND_SRC))
 
-import main
-from main import app, truncate_websocket_close_reason
-from server.codec import ProtobufMessageCodec
+from main import app
+from server.app import runtime as app_runtime
+from server.core.codec import ProtobufMessageCodec
+from server.ws import routes as ws_routes
+from server.ws.io import truncate_websocket_close_reason
 
 
 CODEC = ProtobufMessageCodec()
@@ -249,14 +251,14 @@ async def test_player_route_does_not_register_connection_before_handshake_ack_se
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     submit_player_id = "00000000-0000-0000-0000-000000000123"
-    original_send_packet = main.send_packet
+    original_send_packet = ws_routes.send_packet
 
     async def failing_send_packet(websocket, packet, *, channel=None):
         if getattr(packet, "type", None) == "handshake_ack":
             raise RuntimeError("simulated player handshake ack failure")
         return await original_send_packet(websocket, packet, channel=channel)
 
-    monkeypatch.setattr(main, "send_packet", failing_send_packet)
+    monkeypatch.setattr(ws_routes, "send_packet", failing_send_packet)
 
     async with websockets.connect(f"{live_server}/mc-client") as websocket:
         await websocket.send(build_handshake(channel="player", submit_player_id=submit_player_id))
@@ -265,9 +267,9 @@ async def test_player_route_does_not_register_connection_before_handshake_ack_se
             await asyncio.wait_for(websocket.recv(), timeout=5.0)
 
     await asyncio.sleep(0.1)
-    assert submit_player_id not in main.state.connections
-    assert submit_player_id not in main.state.connection_caps
-    assert submit_player_id not in main.state.connection_rooms
+    assert submit_player_id not in app_runtime.state.connections
+    assert submit_player_id not in app_runtime.state.connection_caps
+    assert submit_player_id not in app_runtime.state.connection_rooms
 
 
 @pytest.mark.asyncio
@@ -275,14 +277,14 @@ async def test_web_map_route_does_not_register_connection_before_handshake_ack_s
     live_server: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_send_packet = main.send_packet
+    original_send_packet = ws_routes.send_packet
 
     async def failing_send_packet(websocket, packet, *, channel=None):
         if getattr(packet, "type", None) == "handshake_ack" and channel == "web_map":
             raise RuntimeError("simulated web-map handshake ack failure")
         return await original_send_packet(websocket, packet, channel=channel)
 
-    monkeypatch.setattr(main, "send_packet", failing_send_packet)
+    monkeypatch.setattr(ws_routes, "send_packet", failing_send_packet)
 
     async with websockets.connect(f"{live_server}/web-map/ws") as websocket:
         await websocket.send(build_handshake(channel="web_map"))
@@ -291,5 +293,5 @@ async def test_web_map_route_does_not_register_connection_before_handshake_ack_s
             await asyncio.wait_for(websocket.recv(), timeout=5.0)
 
     await asyncio.sleep(0.1)
-    assert not main.state.web_map_connections
-    assert not main.state.web_map_connection_rooms
+    assert not app_runtime.state.web_map_connections
+    assert not app_runtime.state.web_map_connection_rooms

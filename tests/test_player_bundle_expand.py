@@ -5,10 +5,10 @@ BACKEND_SRC = Path(__file__).resolve().parents[1] / "src"
 if str(BACKEND_SRC) not in sys.path:
     sys.path.insert(0, str(BACKEND_SRC))
 
-from server.codec import ProtobufMessageCodec
+from server.core.codec import ProtobufMessageCodec
 from server.proto_generated.teamviewer.v1 import teamviewer_pb2
-from main import expand_player_packets
-from server.protocol import PlayerReportBundlePacket, ScopePatchPacket
+from server.core.protocol import PlayerReportBundlePacket, ScopePatchPacket
+from server.ws.io import expand_player_packets
 
 
 def test_expand_player_packets_assigns_internal_packet_types() -> None:

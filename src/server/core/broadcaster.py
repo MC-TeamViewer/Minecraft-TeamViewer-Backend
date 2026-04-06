@@ -5,7 +5,7 @@ from fastapi import WebSocketDisconnect
 
 from .codec import ProtobufMessageCodec
 from .protocol import DigestPacket, PatchPacket, RefreshRequestOutboundPacket, ReportRateHintPacket, SnapshotFullPacket
-from .state import ServerState
+from ..state import ServerState
 
 
 logger = logging.getLogger("teamviewrelay.broadcaster")
@@ -115,6 +115,7 @@ class Broadcaster:
             scope_patch = self.state.compute_scope_patch(
                 self._wrap_plain_scope(old_state.get(scope, {})),
                 self._wrap_plain_scope(new_state.get(scope, {})),
+                full_replace=(scope == "battleChunks"),
             )
             if scope_patch.get("upsert") or scope_patch.get("delete"):
                 patch[scope] = scope_patch

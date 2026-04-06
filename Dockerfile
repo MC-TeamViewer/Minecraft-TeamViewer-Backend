@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS admin-ui-build
+FROM node:24-bookworm-slim AS admin-ui-build
 
 WORKDIR /admin-ui
 
@@ -10,7 +10,7 @@ COPY admin-ui/src /admin-ui/src
 RUN pnpm install --frozen-lockfile
 RUN pnpm build
 
-FROM astral/uv:python3.12-bookworm-slim
+FROM astral/uv:python3.13-bookworm-slim
 
 WORKDIR /app
 

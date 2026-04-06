@@ -6,7 +6,7 @@ BACKEND_SRC = Path(__file__).resolve().parents[1] / "src"
 if str(BACKEND_SRC) not in sys.path:
     sys.path.insert(0, str(BACKEND_SRC))
 
-from server.broadcaster import Broadcaster
+from server.core.broadcaster import Broadcaster
 from server.state import ServerState
 
 
@@ -109,3 +109,39 @@ def test_compute_web_map_patch_keeps_changed_battle_chunk_as_full_object() -> No
     assert patch["battleChunks"]["upsert"] == {
         chunk_id: new_state["battleChunks"][chunk_id],
     }
+
+
+def test_apply_battle_map_observation_computes_semantic_hash_without_name_error() -> None:
+    state = ServerState()
+
+    result = state.apply_battle_map_observation(
+        submit_player_id="player-1",
+        room_code="room-a",
+        dimension="minecraft:overworld",
+        map_size=3,
+        anchor_row=0,
+        anchor_col=0,
+        snapshot_observed_at=123456,
+        parsed_at=123460,
+        candidates=[
+            {
+                "baseChunkX": 12,
+                "baseChunkZ": 34,
+                "positionSampledAt": 123450,
+                "source": "history_primary",
+            }
+        ],
+        cells=[
+            {
+                "relChunkX": 0,
+                "relChunkZ": 0,
+                "symbol": "A",
+                "colorRaw": "#ff0000",
+            }
+        ],
+        current_time=1.0,
+    )
+
+    assert result["accepted"] is True
+    assert result["upserted"] == 1
+    assert state.battle_map_reporter_state["player-1"]["lastSemanticProjectionHash"]

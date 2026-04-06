@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from .admin_models import (
+from .models import (
     AdminObservabilityPayload,
     AuditPayload,
     BootstrapPayload,
@@ -14,7 +14,7 @@ from .admin_models import (
     OverviewPayload,
     RoomOverviewItem,
 )
-from .admin_store import AdminStore
+from .store import AdminStore
 
 
 @dataclass(slots=True)

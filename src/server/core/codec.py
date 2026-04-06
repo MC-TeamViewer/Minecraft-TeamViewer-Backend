@@ -5,7 +5,7 @@ from typing import Any, Protocol
 from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.message import Message
 
-from .proto_generated.teamviewer.v1 import teamviewer_pb2
+from ..proto_generated.teamviewer.v1 import teamviewer_pb2
 from .protocol import PacketDecodeError
 
 

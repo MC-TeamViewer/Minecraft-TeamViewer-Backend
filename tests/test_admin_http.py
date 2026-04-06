@@ -18,6 +18,10 @@ if str(BACKEND_SRC) not in sys.path:
     sys.path.insert(0, str(BACKEND_SRC))
 
 import main as main_module
+from server.admin import auth as admin_auth
+from server.admin import routes as admin_routes
+from server.admin.proxy_ip import get_websocket_remote_addr
+from server.app import runtime as app_runtime
 
 
 def _auth_headers(username: str = "admin", password: str = "secret") -> dict[str, str]:
@@ -155,8 +159,8 @@ async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytes
     main = _load_main_module(monkeypatch, tmp_path)
 
     async with main.app.router.lifespan_context(main.app):
-        await main.admin_store.record_player_activity("player-1", "room-admin-test")
-        await main.record_audit_event(
+        await app_runtime.admin_store.record_player_activity("player-1", "room-admin-test")
+        await admin_auth.record_audit_event(
             event_type="player_handshake_success",
             actor_type="player",
             actor_id="player-1",
@@ -164,7 +168,7 @@ async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytes
             success=True,
             detail={"clientProtocol": "0.6.1"},
         )
-        await main.record_audit_event(
+        await admin_auth.record_audit_event(
             event_type="web_map_handshake_success",
             actor_type="web_map",
             actor_id="web-map-1",
@@ -173,21 +177,21 @@ async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytes
             detail={"clientProtocol": "0.6.1"},
         )
 
-        main.state.connections["player-1"] = _connected_websocket_stub()  # type: ignore[assignment]
-        main.state.set_player_room("player-1", "room-admin-test")
-        main.state.connection_caps["player-1"] = {
+        app_runtime.state.connections["player-1"] = _connected_websocket_stub()  # type: ignore[assignment]
+        app_runtime.state.set_player_room("player-1", "room-admin-test")
+        app_runtime.state.connection_caps["player-1"] = {
             "protocol": "0.6.1",
             "programVersion": "test-player-client",
             "remoteAddr": "127.0.0.1",
         }
-        main.state.players["player-1"] = {
+        app_runtime.state.players["player-1"] = {
             "data": {
                 "playerName": "Alice",
             }
         }
-        main.state.web_map_connections["web-map-1"] = _connected_websocket_stub()  # type: ignore[assignment]
-        main.state.set_web_map_room("web-map-1", "room-admin-test")
-        main.web_map_connection_meta["web-map-1"] = {
+        app_runtime.state.web_map_connections["web-map-1"] = _connected_websocket_stub()  # type: ignore[assignment]
+        app_runtime.state.set_web_map_room("web-map-1", "room-admin-test")
+        app_runtime.web_map_connection_meta["web-map-1"] = {
             "protocolVersion": "0.6.1",
             "programVersion": "squaremap-script",
             "displayName": "Web Map",
@@ -243,19 +247,19 @@ async def test_admin_audit_supports_multi_actor_type_filter(monkeypatch: pytest.
     main = _load_main_module(monkeypatch, tmp_path)
 
     async with main.app.router.lifespan_context(main.app):
-        await main.record_audit_event(
+        await admin_auth.record_audit_event(
             event_type="player_handshake_success",
             actor_type="player",
             actor_id="player-1",
             success=True,
         )
-        await main.record_audit_event(
+        await admin_auth.record_audit_event(
             event_type="admin_auth_success",
             actor_type="admin",
             actor_id="admin",
             success=True,
         )
-        await main.record_audit_event(
+        await admin_auth.record_audit_event(
             event_type="backend_error",
             actor_type="system",
             actor_id="system",
@@ -284,9 +288,9 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
     main = _load_main_module(monkeypatch, tmp_path)
 
     async with main.app.router.lifespan_context(main.app):
-        await main.admin_store.record_player_activity("player-1", "room-admin-test")
+        await app_runtime.admin_store.record_player_activity("player-1", "room-admin-test")
         request = _build_request("/admin/api/events", authorization=_auth_headers()["Authorization"])
-        response = await main.admin_events(
+        response = await admin_routes.admin_events(
             request,
             auditLimit=100,
             auditEventType=None,
@@ -312,22 +316,22 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         assert isinstance(bootstrap_payload["audit"]["items"], list)
         assert "availableEventTypes" in bootstrap_payload["audit"]
 
-        main.state.connections["player-2"] = _connected_websocket_stub()  # type: ignore[assignment]
-        main.state.set_player_room("player-2", "room-admin-test")
-        main.trigger_admin_sse_overview()
+        app_runtime.state.connections["player-2"] = _connected_websocket_stub()  # type: ignore[assignment]
+        app_runtime.state.set_player_room("player-2", "room-admin-test")
+        admin_auth.trigger_admin_sse_overview()
 
         overview_name, overview_payload = await _read_sse_event(lines, expected_names={"overview"})
         assert overview_name == "overview"
         assert overview_payload["playerConnections"] == 1
 
-        await main.record_player_activity("player-2", "room-admin-test")
+        await admin_auth.record_player_activity("player-2", "room-admin-test")
         metric_events = {
             (await _read_sse_event(lines, expected_names={"daily_metrics", "hourly_metrics"}))[0],
             (await _read_sse_event(lines, expected_names={"daily_metrics", "hourly_metrics"}))[0],
         }
         assert metric_events == {"daily_metrics", "hourly_metrics"}
 
-        await main.record_audit_event(
+        await admin_auth.record_audit_event(
             event_type="player_disconnected",
             actor_type="player",
             actor_id="player-2",
@@ -356,8 +360,8 @@ async def test_trusted_proxy_headers_update_admin_audit_remote_addr(monkeypatch:
     )
 
     async with main.app.router.lifespan_context(main.app):
-        username = await main.authenticate_admin_request(request)
-        audit_payload = await main.build_admin_audit_payload(limit=20, event_type="admin_auth_success")
+        username = await admin_auth.authenticate_admin_request(request)
+        audit_payload = await admin_auth.build_admin_audit_payload(limit=20, event_type="admin_auth_success")
 
     assert username == "admin"
     assert audit_payload["items"][0]["remoteAddr"] == "203.0.113.10"
@@ -366,7 +370,7 @@ async def test_trusted_proxy_headers_update_admin_audit_remote_addr(monkeypatch:
         host="127.0.0.1",
         headers={"x-forwarded-for": "198.51.100.20, 127.0.0.1"},
     )
-    assert main.get_websocket_remote_addr(websocket) == "198.51.100.20"
+    assert get_websocket_remote_addr(websocket) == "198.51.100.20"
 
 
 @pytest.mark.asyncio
@@ -384,8 +388,8 @@ async def test_untrusted_proxy_headers_are_ignored(monkeypatch: pytest.MonkeyPat
     )
 
     async with main.app.router.lifespan_context(main.app):
-        username = await main.authenticate_admin_request(request)
-        audit_payload = await main.build_admin_audit_payload(limit=20, event_type="admin_auth_success")
+        username = await admin_auth.authenticate_admin_request(request)
+        audit_payload = await admin_auth.build_admin_audit_payload(limit=20, event_type="admin_auth_success")
 
     assert username == "admin"
     assert audit_payload["items"][0]["remoteAddr"] == "127.0.0.1"
