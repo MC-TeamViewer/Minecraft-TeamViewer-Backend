@@ -358,7 +358,9 @@ const liveStatusLabel = computed(() => {
 
 const dailyChartKey = computed(() => `daily:${metricsFilters.value.dailyDays}:${metricsFilters.value.roomCode || "global"}`);
 const hourlyChartKey = computed(() => `hourly:${metricsFilters.value.hourlyHours}:${metricsFilters.value.roomCode || "global"}`);
-const trafficChartKey = computed(() => `traffic:${trafficFilters.value.range}:${trafficFilters.value.granularity}`);
+const trafficChartKey = computed(
+  () => `traffic:${trafficFilters.value.range}:${trafficFilters.value.granularity}:${trafficLayer.value}`,
+);
 
 const heroTags = computed(() => [
   `管理员 ${session.value?.actorId ?? "-"}`,

@@ -295,6 +295,48 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_admin_traffic_history_exposes_distinct_application_and_wire_layers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _load_main_module(monkeypatch, tmp_path)
+
+    async with main.app.router.lifespan_context(main.app):
+        now_local = app_runtime.admin_store.local_datetime().replace(second=0, microsecond=0)
+        current_minute = now_local.strftime("%Y-%m-%dT%H:%M:00")
+        current_hour = now_local.replace(minute=0).strftime("%Y-%m-%dT%H:00:00")
+        current_day = now_local.strftime("%Y-%m-%d")
+        await app_runtime.admin_store.apply_traffic_increments(
+            minute_increments={
+                ("application", current_minute, "player", "ingress"): 5000,
+                ("wire", current_minute, "player", "ingress"): 2300,
+            },
+            hourly_increments={
+                ("application", current_hour, "player", "ingress"): 5000,
+                ("wire", current_hour, "player", "ingress"): 2300,
+            },
+            daily_increments={
+                ("application", current_day, "player", "ingress"): 5000,
+                ("wire", current_day, "player", "ingress"): 2300,
+            },
+        )
+
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            await _login(client)
+            history_traffic = await client.get("/admin/api/traffic/history?range=1h&granularity=1m")
+
+    payload = history_traffic.json()
+
+    assert history_traffic.status_code == 200
+    assert payload["application"]["items"][-1]["playerIngressBytes"] == 5000
+    assert payload["wire"]["items"][-1]["playerIngressBytes"] == 2300
+    assert payload["application"]["totalBytes"] == 5000
+    assert payload["wire"]["totalBytes"] == 2300
+    assert payload["application"]["items"] != payload["wire"]["items"]
+
+
+@pytest.mark.asyncio
 async def test_admin_audit_supports_multi_actor_type_filter(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     main = _load_main_module(monkeypatch, tmp_path)
 

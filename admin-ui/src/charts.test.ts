@@ -92,6 +92,84 @@ describe("buildTrafficChartOption", () => {
     expect(series[0]?.data).toEqual([100, 130]);
     expect(series[3]?.data).toEqual([30, 50]);
   });
+
+  it("uses different layer series when application and wire data differ", () => {
+    const metrics: TrafficHistoryPayload = {
+      timezone: "CST (UTC+08:00)",
+      range: "48h",
+      granularity: "1h",
+      bucketSeconds: 3600,
+      selectedLayer: "application",
+      application: {
+        totalIngressBytes: 450,
+        totalEgressBytes: 250,
+        totalBytes: 700,
+        items: [
+          {
+            bucket: "2026-04-06T00:00:00",
+            label: "2026-04-06T00:00:00",
+            playerIngressBytes: 300,
+            playerEgressBytes: 120,
+            webMapIngressBytes: 40,
+            webMapEgressBytes: 20,
+            totalIngressBytes: 340,
+            totalEgressBytes: 140,
+            totalBytes: 480,
+          },
+          {
+            bucket: "2026-04-06T01:00:00",
+            label: "2026-04-06T01:00:00",
+            playerIngressBytes: 110,
+            playerEgressBytes: 90,
+            webMapIngressBytes: 0,
+            webMapEgressBytes: 20,
+            totalIngressBytes: 110,
+            totalEgressBytes: 110,
+            totalBytes: 220,
+          },
+        ],
+      },
+      wire: {
+        totalIngressBytes: 260,
+        totalEgressBytes: 160,
+        totalBytes: 420,
+        items: [
+          {
+            bucket: "2026-04-06T00:00:00",
+            label: "2026-04-06T00:00:00",
+            playerIngressBytes: 160,
+            playerEgressBytes: 80,
+            webMapIngressBytes: 10,
+            webMapEgressBytes: 10,
+            totalIngressBytes: 170,
+            totalEgressBytes: 90,
+            totalBytes: 260,
+          },
+          {
+            bucket: "2026-04-06T01:00:00",
+            label: "2026-04-06T01:00:00",
+            playerIngressBytes: 70,
+            playerEgressBytes: 60,
+            webMapIngressBytes: 20,
+            webMapEgressBytes: 10,
+            totalIngressBytes: 90,
+            totalEgressBytes: 70,
+            totalBytes: 160,
+          },
+        ],
+      },
+    };
+
+    const applicationOption = buildTrafficChartOption(metrics, "application");
+    const wireOption = buildTrafficChartOption(metrics, "wire");
+    const applicationSeries = Array.isArray(applicationOption.series) ? applicationOption.series : [];
+    const wireSeries = Array.isArray(wireOption.series) ? wireOption.series : [];
+
+    expect(applicationSeries[0]?.data).toEqual([300, 110]);
+    expect(wireSeries[0]?.data).toEqual([160, 70]);
+    expect(applicationSeries[0]?.data).not.toEqual(wireSeries[0]?.data);
+    expect(applicationSeries[1]?.data).not.toEqual(wireSeries[1]?.data);
+  });
 });
 
 describe("formatByteValue", () => {
