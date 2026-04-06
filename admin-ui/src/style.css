@@ -1,0 +1,253 @@
+:root {
+  color-scheme: light;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background:
+    radial-gradient(circle at top left, rgba(194, 106, 24, 0.18), transparent 28%),
+    linear-gradient(180deg, #fff8ef 0%, #f5efe6 100%);
+  color: #1f2937;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: #1f2937;
+  background: transparent;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+.app-shell {
+  width: min(1480px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 28px 0 48px;
+  display: grid;
+  gap: 18px;
+}
+
+.hero-panel,
+.surface-card {
+  border: 1px solid rgba(120, 53, 15, 0.12);
+  box-shadow: 0 16px 36px rgba(120, 53, 15, 0.08);
+  border-radius: 24px;
+  background: rgba(255, 251, 245, 0.92);
+  backdrop-filter: blur(12px);
+}
+
+.hero-panel {
+  padding: 28px;
+  display: grid;
+  gap: 16px;
+}
+
+.hero-eyebrow {
+  color: #9a3412;
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.hero-panel h1,
+.section-header h2 {
+  margin: 0;
+  font-family: Georgia, "Times New Roman", serif;
+  color: #7c2d12;
+}
+
+.hero-panel p,
+.section-header p {
+  margin: 8px 0 0;
+  color: #6b7280;
+  line-height: 1.6;
+}
+
+.hero-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+.hero-tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.hero-tag {
+  border-radius: 999px;
+  padding: 8px 12px;
+  background: rgba(194, 106, 24, 0.08);
+  border: 1px solid rgba(194, 106, 24, 0.12);
+  color: #7c2d12;
+  font-size: 0.88rem;
+}
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.metric-label {
+  color: #6b7280;
+  font-size: 0.95rem;
+}
+
+.metric-value {
+  margin-top: 12px;
+  color: #7c2d12;
+  font-size: clamp(2rem, 3vw, 2.6rem);
+  font-weight: 700;
+}
+
+.two-column-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.section-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.chart-card :deep(.el-card__body) {
+  padding-top: 6px;
+}
+
+.chart-host {
+  width: 100%;
+  height: 320px;
+}
+
+.chart-meta {
+  color: #92400e;
+  font-size: 0.86rem;
+  white-space: nowrap;
+}
+
+.admin-table {
+  width: 100%;
+}
+
+.admin-table :deep(.cell) {
+  word-break: break-word;
+}
+
+.status-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.status-summary-card {
+  padding: 16px;
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.86), rgba(250, 239, 220, 0.92));
+  border: 1px solid rgba(194, 106, 24, 0.12);
+}
+
+.status-summary-label {
+  display: block;
+  color: #6b7280;
+  font-size: 0.88rem;
+}
+
+.status-summary-value {
+  display: block;
+  margin-top: 10px;
+  color: #7c2d12;
+  font-size: 1.8rem;
+}
+
+.expanded-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 20px;
+}
+
+.expanded-detail-grid > div {
+  display: grid;
+  gap: 4px;
+}
+
+.detail-key {
+  color: #9ca3af;
+  font-size: 0.82rem;
+}
+
+.mono-text {
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+.audit-detail {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 12px;
+  border-radius: 14px;
+  background: #f8fafc;
+  font-size: 0.82rem;
+}
+
+.audit-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
+.actor-type-group {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.filter-control {
+  min-width: 220px;
+}
+
+.section-gap {
+  margin-top: 8px;
+}
+
+@media (max-width: 1180px) {
+  .card-grid,
+  .two-column-grid,
+  .status-summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 860px) {
+  .app-shell {
+    width: min(100vw - 20px, 1480px);
+    padding: 18px 0 32px;
+  }
+
+  .card-grid,
+  .two-column-grid,
+  .status-summary-grid,
+  .expanded-detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .hero-actions,
+  .section-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .chart-meta {
+    white-space: normal;
+  }
+}

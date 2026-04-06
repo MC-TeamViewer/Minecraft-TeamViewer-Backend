@@ -5,8 +5,9 @@ import base64
 import importlib
 import json
 from pathlib import Path
+import re
 import sys
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 import httpx
 import pytest
@@ -30,6 +31,21 @@ def _load_main_module(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("TEAMVIEWER_DB_PATH", str(tmp_path / "admin-http.db"))
     monkeypatch.setenv("TZ", "Asia/Shanghai")
     return importlib.reload(main_module)
+
+
+class _ConnectedWebSocketStub(SimpleNamespace):
+    async def send_bytes(self, _payload: bytes) -> None:
+        return None
+
+
+def _connected_websocket_stub():
+    connected_state = SimpleNamespace(name="CONNECTED")
+    return _ConnectedWebSocketStub(
+        client_state=connected_state,
+        application_state=connected_state,
+        close_code=None,
+        close_reason=None,
+    )
 
 
 async def _read_sse_event(lines, *, expected_names: set[str], timeout_sec: float = 4.0) -> tuple[str, dict]:
@@ -63,10 +79,18 @@ async def _byte_lines(iterator):
             yield line.rstrip("\r")
 
 
-def _build_request(path: str, *, authorization: str | None = None) -> Request:
+def _build_request(
+    path: str,
+    *,
+    authorization: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+    client_host: str = "127.0.0.1",
+) -> Request:
     headers = []
     if authorization is not None:
         headers.append((b"authorization", authorization.encode("utf-8")))
+    for key, value in (extra_headers or {}).items():
+        headers.append((key.lower().encode("utf-8"), value.encode("utf-8")))
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
@@ -77,7 +101,7 @@ def _build_request(path: str, *, authorization: str | None = None) -> Request:
         "raw_path": path.encode("utf-8"),
         "query_string": b"",
         "headers": headers,
-        "client": ("127.0.0.1", 12345),
+        "client": (client_host, 12345),
         "server": ("testserver", 80),
     }
 
@@ -90,6 +114,18 @@ def _build_request(path: str, *, authorization: str | None = None) -> Request:
     return request
 
 
+def _make_websocket_stub(*, host: str, headers: dict[str, str] | None = None):
+    connected_state = SimpleNamespace(name="CONNECTED")
+    return SimpleNamespace(
+        client=SimpleNamespace(host=host),
+        headers=headers or {},
+        client_state=connected_state,
+        application_state=connected_state,
+        close_code=None,
+        close_reason=None,
+    )
+
+
 @pytest.mark.asyncio
 async def test_admin_http_requires_basic_auth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     main = _load_main_module(monkeypatch, tmp_path)
@@ -99,10 +135,12 @@ async def test_admin_http_requires_basic_auth(monkeypatch: pytest.MonkeyPatch, t
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             page = await client.get("/admin")
             overview = await client.get("/admin/api/overview")
+            assets = await client.get("/admin/assets/example.js")
 
     assert page.status_code == 401
     assert page.headers["www-authenticate"].startswith("Basic")
     assert overview.status_code == 401
+    assert assets.status_code == 401
 
     async with main.app.router.lifespan_context(main.app):
         transport = httpx.ASGITransport(app=main.app)
@@ -135,7 +173,7 @@ async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytes
             detail={"clientProtocol": "0.6.1"},
         )
 
-        main.state.connections["player-1"] = object()  # type: ignore[assignment]
+        main.state.connections["player-1"] = _connected_websocket_stub()  # type: ignore[assignment]
         main.state.set_player_room("player-1", "room-admin-test")
         main.state.connection_caps["player-1"] = {
             "protocol": "0.6.1",
@@ -147,7 +185,7 @@ async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytes
                 "playerName": "Alice",
             }
         }
-        main.state.web_map_connections["web-map-1"] = object()  # type: ignore[assignment]
+        main.state.web_map_connections["web-map-1"] = _connected_websocket_stub()  # type: ignore[assignment]
         main.state.set_web_map_room("web-map-1", "room-admin-test")
         main.web_map_connection_meta["web-map-1"] = {
             "protocolVersion": "0.6.1",
@@ -163,6 +201,9 @@ async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytes
             daily = await client.get("/admin/api/metrics/daily?days=2", headers=_auth_headers())
             hourly = await client.get("/admin/api/metrics/hourly?hours=3", headers=_auth_headers())
             audit = await client.get("/admin/api/audit?limit=200&success=true", headers=_auth_headers())
+            asset_match = re.search(r"/admin/assets/[^\"']+", page.text)
+            assert asset_match is not None
+            asset_response = await client.get(asset_match.group(0), headers=_auth_headers())
 
     overview_payload = overview.json()
     daily_payload = daily.json()
@@ -172,6 +213,8 @@ async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytes
 
     assert page.status_code == 200
     assert "TeamViewRelay Admin" in page.text
+    assert 'id="app"' in page.text
+    assert asset_response.status_code == 200
 
     assert overview.status_code == 200
     assert overview_payload["playerConnections"] == 1
@@ -179,7 +222,7 @@ async def test_admin_http_exposes_dashboard_metrics_and_audit(monkeypatch: pytes
     assert overview_payload["activeRooms"] == 1
     assert overview_payload["rooms"][0]["roomCode"] == "room-admin-test"
     assert len(overview_payload["connectionDetails"]) == 2
-    assert any(item["displayName"] == "Alice" for item in overview_payload["connectionDetails"])
+    assert any(item["actorId"] == "player-1" for item in overview_payload["connectionDetails"])
     assert any(item["programVersion"] == "squaremap-script" for item in overview_payload["connectionDetails"])
     assert overview_payload["dbPathMasked"].endswith("/admin-http.db")
 
@@ -262,7 +305,7 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         assert bootstrap_payload["hourlyMetrics"]["items"]
         assert isinstance(bootstrap_payload["audit"]["items"], list)
 
-        main.state.connections["player-2"] = object()  # type: ignore[assignment]
+        main.state.connections["player-2"] = _connected_websocket_stub()  # type: ignore[assignment]
         main.state.set_player_room("player-2", "room-admin-test")
         main.trigger_admin_sse_overview()
 
@@ -289,3 +332,53 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         assert any(item["eventType"] == "player_disconnected" for item in audit_payload["items"])
 
         await iterator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_trusted_proxy_headers_update_admin_audit_remote_addr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TEAMVIEWER_TRUST_PROXY_HEADERS", "true")
+    monkeypatch.setenv("TEAMVIEWER_TRUSTED_PROXY_CIDRS", "127.0.0.1/32")
+    main = _load_main_module(monkeypatch, tmp_path)
+
+    auth_header = _auth_headers()["Authorization"]
+    request = _build_request(
+        "/admin",
+        authorization=auth_header,
+        extra_headers={"x-forwarded-for": "203.0.113.10, 127.0.0.1"},
+        client_host="127.0.0.1",
+    )
+
+    async with main.app.router.lifespan_context(main.app):
+        username = await main.authenticate_admin_request(request)
+        audit_payload = await main.build_admin_audit_payload(limit=20, event_type="admin_auth_success")
+
+    assert username == "admin"
+    assert audit_payload["items"][0]["remoteAddr"] == "203.0.113.10"
+
+    websocket = _make_websocket_stub(
+        host="127.0.0.1",
+        headers={"x-forwarded-for": "198.51.100.20, 127.0.0.1"},
+    )
+    assert main.get_websocket_remote_addr(websocket) == "198.51.100.20"
+
+
+@pytest.mark.asyncio
+async def test_untrusted_proxy_headers_are_ignored(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TEAMVIEWER_TRUST_PROXY_HEADERS", "true")
+    monkeypatch.setenv("TEAMVIEWER_TRUSTED_PROXY_CIDRS", "10.0.0.0/8")
+    main = _load_main_module(monkeypatch, tmp_path)
+
+    auth_header = _auth_headers()["Authorization"]
+    request = _build_request(
+        "/admin",
+        authorization=auth_header,
+        extra_headers={"x-forwarded-for": "203.0.113.10"},
+        client_host="127.0.0.1",
+    )
+
+    async with main.app.router.lifespan_context(main.app):
+        username = await main.authenticate_admin_request(request)
+        audit_payload = await main.build_admin_audit_payload(limit=20, event_type="admin_auth_success")
+
+    assert username == "admin"
+    assert audit_payload["items"][0]["remoteAddr"] == "127.0.0.1"

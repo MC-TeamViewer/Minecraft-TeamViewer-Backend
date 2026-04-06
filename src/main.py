@@ -5,18 +5,21 @@ import logging
 import os
 import secrets
 import asyncio
+import ipaddress
 import time
 import uuid
 from contextlib import asynccontextmanager
+from functools import lru_cache
+from pathlib import Path
 
 import msgpack
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import ValidationError
 
+from server.admin_frontend import ADMIN_UI_INDEX_PATH, admin_ui_ready, resolve_admin_asset_path
 from server.admin_sse import AdminSseHub
 from server.admin_store import AdminStore, AdminStoreConfig
-from server.admin_ui import render_admin_page
 from server.broadcaster import Broadcaster
 from server.codec import ProtobufMessageCodec
 from server.models import BattleChunkData, EntityData, PlayerData, WaypointData
@@ -103,6 +106,13 @@ def parse_positive_int_env(name: str, default: int, *, minimum: int, maximum: in
     return max(minimum, min(value, maximum))
 
 
+def parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def build_admin_store_config() -> AdminStoreConfig:
     return AdminStoreConfig(
         db_path=os.getenv("TEAMVIEWER_DB_PATH", DEFAULT_ADMIN_DB_PATH),
@@ -119,12 +129,103 @@ def get_remote_addr_from_client(client) -> str | None:
     return None
 
 
+def normalize_ip_text(value: str | None) -> str | None:
+    text = str(value or "").strip().strip('"')
+    if not text:
+        return None
+
+    if text.startswith("[") and "]" in text:
+        text = text[1:text.index("]")]
+
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        pass
+
+    if text.count(":") == 1 and "." in text:
+        host, _, _port = text.rpartition(":")
+        try:
+            return str(ipaddress.ip_address(host))
+        except ValueError:
+            return None
+
+    return None
+
+
+def extract_client_ip_from_headers(headers) -> str | None:
+    if headers is None:
+        return None
+
+    x_forwarded_for = headers.get("x-forwarded-for")
+    if isinstance(x_forwarded_for, str):
+        for item in x_forwarded_for.split(","):
+            normalized = normalize_ip_text(item)
+            if normalized:
+                return normalized
+
+    x_real_ip = headers.get("x-real-ip")
+    if isinstance(x_real_ip, str):
+        normalized = normalize_ip_text(x_real_ip)
+        if normalized:
+            return normalized
+
+    return None
+
+
+@lru_cache(maxsize=1)
+def get_trusted_proxy_networks() -> tuple[ipaddress._BaseNetwork, ...]:
+    raw_value = os.getenv(
+        "TEAMVIEWER_TRUSTED_PROXY_CIDRS",
+        "127.0.0.1/32,::1/128,172.16.0.0/12",
+    )
+    networks: list[ipaddress._BaseNetwork] = []
+
+    for raw_item in str(raw_value).split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            logger.warning("Ignore invalid TEAMVIEWER_TRUSTED_PROXY_CIDRS entry: %s", item)
+
+    return tuple(networks)
+
+
+def should_trust_proxy_headers(client_host: str | None) -> bool:
+    if not parse_bool_env("TEAMVIEWER_TRUST_PROXY_HEADERS", False):
+        return False
+
+    normalized = normalize_ip_text(client_host)
+    if normalized is None:
+        return False
+
+    ip_obj = ipaddress.ip_address(normalized)
+    return any(ip_obj in network for network in get_trusted_proxy_networks())
+
+
+def get_effective_remote_addr(client, headers=None) -> str | None:
+    direct_addr = get_remote_addr_from_client(client)
+    if not should_trust_proxy_headers(direct_addr):
+        return direct_addr
+
+    forwarded_addr = extract_client_ip_from_headers(headers)
+    return forwarded_addr or direct_addr
+
+
 def get_request_remote_addr(request: Request) -> str | None:
-    return get_remote_addr_from_client(request.client)
+    return get_effective_remote_addr(request.client, request.headers)
 
 
 def get_websocket_remote_addr(websocket: WebSocket) -> str | None:
-    return get_remote_addr_from_client(websocket.client)
+    return get_effective_remote_addr(websocket.client, websocket.headers)
+
+
+def admin_ui_unavailable_response() -> PlainTextResponse:
+    return PlainTextResponse(
+        "admin_ui_not_built: run `cd admin-ui && pnpm install && pnpm build` first",
+        status_code=503,
+    )
 
 
 async def record_audit_event(
@@ -1304,14 +1405,31 @@ async def reserved_admin_ws(websocket: WebSocket):
         await websocket.close(code=1008, reason="admin_interface_reserved")
 
 
-@app.get("/admin", response_class=HTMLResponse)
+@app.get("/admin")
 async def admin_page(request: Request):
     auth_result = await authenticate_admin_request(request)
     if isinstance(auth_result, JSONResponse):
         return auth_result
 
     await record_admin_access(request, auth_result, "admin_page_view")
-    return HTMLResponse(render_admin_page())
+    if not admin_ui_ready():
+        return admin_ui_unavailable_response()
+    return FileResponse(ADMIN_UI_INDEX_PATH, media_type="text/html")
+
+
+@app.get("/admin/assets/{asset_path:path}")
+async def admin_assets(request: Request, asset_path: str):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+
+    asset_file = resolve_admin_asset_path(asset_path)
+    if asset_file is None:
+        if not admin_ui_ready():
+            return admin_ui_unavailable_response()
+        return JSONResponse({"detail": "not_found"}, status_code=404)
+
+    return FileResponse(Path(asset_file))
 
 
 @app.get("/admin/api/overview")

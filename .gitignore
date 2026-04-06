@@ -14,6 +14,9 @@
 .vscode/
 **/__pycache__
 .pytest_cache/
+admin-ui/node_modules/
+admin-ui/dist/
+admin-ui/coverage/
 src/server/proto_generated/teamviewer/v1/*.py
 *.db
 data/

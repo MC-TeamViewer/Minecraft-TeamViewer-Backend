@@ -1,0 +1,27 @@
+{
+  "name": "team-view-relay-admin-ui",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.33.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "echarts": "^5.6.0",
+    "element-plus": "^2.11.1",
+    "vue": "^3.5.18"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.1",
+    "@vue/test-utils": "^2.4.6",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1",
+    "vitest": "^3.2.4",
+    "vue-tsc": "^2.2.12"
+  }
+}
