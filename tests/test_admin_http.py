@@ -275,11 +275,15 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
     assert hourly_payload["items"][-1]["activePlayers"] == 1
     assert "UTC" in hourly_payload["timezone"]
 
-    assert live_traffic_payload["totalIngressBps"] > 0
-    assert live_traffic_payload["totalEgressBps"] > 0
+    assert live_traffic_payload["selectedLayer"] == "application"
+    assert live_traffic_payload["application"]["totalIngressBps"] > 0
+    assert live_traffic_payload["application"]["totalEgressBps"] > 0
+    assert live_traffic_payload["wire"]["totalIngressBps"] == 0
     assert history_traffic_payload["range"] == "6h"
     assert history_traffic_payload["granularity"] == "5m"
-    assert history_traffic_payload["items"][-1]["totalBytes"] >= 3072
+    assert history_traffic_payload["selectedLayer"] == "application"
+    assert history_traffic_payload["application"]["items"][-1]["totalBytes"] >= 3072
+    assert history_traffic_payload["wire"]["totalBytes"] == 0
     assert hourly_traffic_payload["items"][-1]["totalBytes"] >= 3072
     assert daily_traffic_payload["totalBytes"] >= 3072
 
@@ -391,8 +395,10 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         bootstrap_name, bootstrap_payload = await _read_sse_event(lines, expected_names={"bootstrap"})
         assert bootstrap_name == "bootstrap"
         assert bootstrap_payload["overview"]["playerConnections"] == 0
-        assert bootstrap_payload["liveTraffic"]["totalIngressBps"] > 0
-        assert bootstrap_payload["trafficHistory"]["items"]
+        assert bootstrap_payload["liveTraffic"]["application"]["totalIngressBps"] > 0
+        assert bootstrap_payload["liveTraffic"]["wire"]["totalIngressBps"] == 0
+        assert bootstrap_payload["trafficHistory"]["application"]["items"]
+        assert bootstrap_payload["trafficHistory"]["wire"]["items"]
         assert bootstrap_payload["trafficHistory"]["range"] == "6h"
         assert bootstrap_payload["trafficHistory"]["granularity"] == "5m"
         assert "availableEventTypes" in bootstrap_payload["audit"]

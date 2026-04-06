@@ -88,12 +88,9 @@ export interface AdminSessionPayload {
 
 export interface LiveTrafficPayload {
   sampleWindowSec: number;
-  playerIngressBps: number;
-  playerEgressBps: number;
-  webMapIngressBps: number;
-  webMapEgressBps: number;
-  totalIngressBps: number;
-  totalEgressBps: number;
+  selectedLayer: TrafficLayer;
+  application: TrafficLayerLivePayload;
+  wire: TrafficLayerLivePayload;
   serverTime?: number;
 }
 
@@ -111,16 +108,32 @@ export interface TrafficBucketItem {
 
 export type TrafficRangePreset = "1h" | "6h" | "24h" | "48h" | "7d" | "30d";
 export type TrafficGranularity = "1m" | "5m" | "15m" | "1h" | "1d";
+export type TrafficLayer = "application" | "wire";
+
+export interface TrafficLayerLivePayload {
+  playerIngressBps: number;
+  playerEgressBps: number;
+  webMapIngressBps: number;
+  webMapEgressBps: number;
+  totalIngressBps: number;
+  totalEgressBps: number;
+}
+
+export interface TrafficLayerHistoryPayload {
+  items: TrafficBucketItem[];
+  totalIngressBytes: number;
+  totalEgressBytes: number;
+  totalBytes: number;
+}
 
 export interface TrafficHistoryPayload {
   timezone: string;
   range: TrafficRangePreset;
   granularity: TrafficGranularity;
   bucketSeconds: number;
-  items: TrafficBucketItem[];
-  totalIngressBytes: number;
-  totalEgressBytes: number;
-  totalBytes: number;
+  selectedLayer: TrafficLayer;
+  application: TrafficLayerHistoryPayload;
+  wire: TrafficLayerHistoryPayload;
   serverTime?: number;
 }
 
@@ -219,3 +232,13 @@ export const TRAFFIC_GRANULARITY_LABELS: Record<TrafficGranularity, string> = {
   "1h": "1 小时",
   "1d": "1 天",
 };
+
+export const TRAFFIC_LAYER_LABELS: Record<TrafficLayer, string> = {
+  application: "应用层",
+  wire: "传输层",
+};
+
+export const TRAFFIC_LAYER_OPTIONS: Array<{ label: string; value: TrafficLayer }> = [
+  { label: "应用层", value: "application" },
+  { label: "传输层", value: "wire" },
+];

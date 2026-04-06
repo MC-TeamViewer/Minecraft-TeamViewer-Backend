@@ -1,23 +1,28 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import { ElSegmented } from "element-plus/es/components/segmented/index";
 import { ElOption, ElSelect } from "element-plus/es/components/select/index";
 
 import {
   DEFAULT_TRAFFIC_GRANULARITY_BY_RANGE,
   TRAFFIC_GRANULARITY_LABELS,
+  TRAFFIC_LAYER_OPTIONS,
   TRAFFIC_GRANULARITY_OPTIONS,
   TRAFFIC_RANGE_OPTIONS,
   type TrafficFilters,
   type TrafficGranularity,
+  type TrafficLayer,
   type TrafficRangePreset,
 } from "@/types";
 
 const props = defineProps<{
   modelValue: TrafficFilters;
+  selectedLayer: TrafficLayer;
 }>();
 
 const emit = defineEmits<{
   "update:modelValue": [value: TrafficFilters];
+  "update:selectedLayer": [value: TrafficLayer];
 }>();
 
 const granularityOptions = computed(() => TRAFFIC_GRANULARITY_OPTIONS[props.modelValue.range]);
@@ -42,6 +47,12 @@ function updateGranularity(current: TrafficFilters, nextGranularity: TrafficGran
 
 <template>
   <div class="metrics-toolbar">
+    <el-segmented
+      :model-value="selectedLayer"
+      :options="TRAFFIC_LAYER_OPTIONS"
+      @update:model-value="(value: TrafficLayer) => emit('update:selectedLayer', value)"
+    />
+
     <el-select
       :model-value="modelValue.range"
       class="filter-control short-filter"

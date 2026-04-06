@@ -130,7 +130,31 @@ class AdminStore:
                 PRIMARY KEY (local_minute, channel, direction)
             );
 
+            CREATE TABLE IF NOT EXISTS minute_wire_traffic_bytes (
+                local_minute TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                PRIMARY KEY (local_minute, channel, direction)
+            );
+
             CREATE TABLE IF NOT EXISTS daily_traffic_bytes (
+                local_date TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                PRIMARY KEY (local_date, channel, direction)
+            );
+
+            CREATE TABLE IF NOT EXISTS hourly_wire_traffic_bytes (
+                local_hour TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                PRIMARY KEY (local_hour, channel, direction)
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_wire_traffic_bytes (
                 local_date TEXT NOT NULL,
                 channel TEXT NOT NULL,
                 direction TEXT NOT NULL,
@@ -453,50 +477,35 @@ class AdminStore:
     async def apply_traffic_increments(
         self,
         *,
-        minute_increments: dict[tuple[str, str, str], int],
-        hourly_increments: dict[tuple[str, str, str], int],
-        daily_increments: dict[tuple[str, str, str], int],
+        minute_increments: dict[tuple[str, str, str, str], int],
+        hourly_increments: dict[tuple[str, str, str, str], int],
+        daily_increments: dict[tuple[str, str, str, str], int],
     ) -> None:
         statements: list[tuple[str, tuple[Any, ...]]] = []
-        for (local_minute, channel, direction), amount in minute_increments.items():
+        for (scope, local_minute, channel, direction), amount in minute_increments.items():
             if int(amount) <= 0:
                 continue
             statements.append(
                 (
-                    """
-                    INSERT INTO minute_traffic_bytes (local_minute, channel, direction, bytes)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(local_minute, channel, direction) DO UPDATE SET
-                        bytes = bytes + excluded.bytes
-                    """,
+                    self._traffic_upsert_sql(scope=scope, bucket_kind="minute"),
                     (local_minute, channel, direction, int(amount)),
                 )
             )
-        for (local_hour, channel, direction), amount in hourly_increments.items():
+        for (scope, local_hour, channel, direction), amount in hourly_increments.items():
             if int(amount) <= 0:
                 continue
             statements.append(
                 (
-                    """
-                    INSERT INTO hourly_traffic_bytes (local_hour, channel, direction, bytes)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(local_hour, channel, direction) DO UPDATE SET
-                        bytes = bytes + excluded.bytes
-                    """,
+                    self._traffic_upsert_sql(scope=scope, bucket_kind="hourly"),
                     (local_hour, channel, direction, int(amount)),
                 )
             )
-        for (local_date, channel, direction), amount in daily_increments.items():
+        for (scope, local_date, channel, direction), amount in daily_increments.items():
             if int(amount) <= 0:
                 continue
             statements.append(
                 (
-                    """
-                    INSERT INTO daily_traffic_bytes (local_date, channel, direction, bytes)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(local_date, channel, direction) DO UPDATE SET
-                        bytes = bytes + excluded.bytes
-                    """,
+                    self._traffic_upsert_sql(scope=scope, bucket_kind="daily"),
                     (local_date, channel, direction, int(amount)),
                 )
             )
@@ -584,14 +593,15 @@ class AdminStore:
             "items": [{"bucket": label, "label": label, "activePlayers": counts[label]} for label in labels],
         }
 
-    async def query_hourly_traffic(self, *, hours: int) -> dict[str, Any]:
+    async def query_hourly_traffic(self, *, hours: int, scope: str = "application") -> dict[str, Any]:
         end_dt = self._local_datetime().replace(minute=0, second=0, microsecond=0)
         start_dt = end_dt - timedelta(hours=max(hours - 1, 0))
         labels = [(start_dt + timedelta(hours=index)).strftime("%Y-%m-%dT%H:00:00") for index in range(hours)]
+        table_name = self._traffic_table_name(scope=scope, bucket_kind="hourly")
         rows = await self._fetchall(
-            """
+            f"""
             SELECT local_hour, channel, direction, bytes
-            FROM hourly_traffic_bytes
+            FROM {table_name}
             WHERE local_hour BETWEEN ? AND ?
             ORDER BY local_hour ASC
             """,
@@ -599,14 +609,15 @@ class AdminStore:
         )
         return self._build_traffic_payload(labels=labels, rows=rows, hours=hours)
 
-    async def query_daily_traffic(self, *, days: int) -> dict[str, Any]:
+    async def query_daily_traffic(self, *, days: int, scope: str = "application") -> dict[str, Any]:
         end_dt = self._local_datetime()
         start_dt = (end_dt - timedelta(days=max(days - 1, 0))).replace(hour=0, minute=0, second=0, microsecond=0)
         labels = [(start_dt + timedelta(days=index)).strftime("%Y-%m-%d") for index in range(days)]
+        table_name = self._traffic_table_name(scope=scope, bucket_kind="daily")
         rows = await self._fetchall(
-            """
+            f"""
             SELECT local_date, channel, direction, bytes
-            FROM daily_traffic_bytes
+            FROM {table_name}
             WHERE local_date BETWEEN ? AND ?
             ORDER BY local_date ASC
             """,
@@ -614,12 +625,19 @@ class AdminStore:
         )
         return self._build_traffic_payload(labels=labels, rows=rows, days=days)
 
-    async def query_traffic_history(self, *, range_preset: str, granularity: str) -> dict[str, Any]:
+    async def query_traffic_history(
+        self,
+        *,
+        range_preset: str,
+        granularity: str,
+        scope: str = "application",
+    ) -> dict[str, Any]:
         normalized_range, normalized_granularity = self.normalize_traffic_history_params(range_preset, granularity)
         bucket_seconds = TRAFFIC_GRANULARITY_SECONDS[normalized_granularity]
         bucket_count = TRAFFIC_RANGE_SECONDS[normalized_range] // bucket_seconds
         if normalized_granularity in {"1m", "5m", "15m"}:
             return await self._query_minute_traffic_history(
+                scope=scope,
                 range_preset=normalized_range,
                 granularity=normalized_granularity,
                 bucket_seconds=bucket_seconds,
@@ -627,12 +645,14 @@ class AdminStore:
             )
         if normalized_granularity == "1h":
             return await self._query_hourly_traffic_history(
+                scope=scope,
                 range_preset=normalized_range,
                 granularity=normalized_granularity,
                 bucket_seconds=bucket_seconds,
                 bucket_count=bucket_count,
             )
         return await self._query_daily_traffic_history(
+            scope=scope,
             range_preset=normalized_range,
             granularity=normalized_granularity,
             bucket_seconds=bucket_seconds,
@@ -821,8 +841,11 @@ class AdminStore:
         daily_cursor = db.execute("DELETE FROM daily_player_activity WHERE local_date < ?", (daily_cutoff,))
         hourly_cursor = db.execute("DELETE FROM hourly_player_activity WHERE local_hour < ?", (hourly_cutoff,))
         minute_traffic_cursor = db.execute("DELETE FROM minute_traffic_bytes WHERE local_minute < ?", (minute_cutoff,))
+        minute_wire_traffic_cursor = db.execute("DELETE FROM minute_wire_traffic_bytes WHERE local_minute < ?", (minute_cutoff,))
         hourly_traffic_cursor = db.execute("DELETE FROM hourly_traffic_bytes WHERE local_hour < ?", (hourly_cutoff,))
+        hourly_wire_traffic_cursor = db.execute("DELETE FROM hourly_wire_traffic_bytes WHERE local_hour < ?", (hourly_cutoff,))
         daily_traffic_cursor = db.execute("DELETE FROM daily_traffic_bytes WHERE local_date < ?", (daily_cutoff,))
+        daily_wire_traffic_cursor = db.execute("DELETE FROM daily_wire_traffic_bytes WHERE local_date < ?", (daily_cutoff,))
         audit_cursor = db.execute("DELETE FROM audit_events WHERE local_date < ?", (audit_cutoff,))
         session_cursor = db.execute(
             """
@@ -837,8 +860,11 @@ class AdminStore:
                 "dailyDeleted": int(daily_cursor.rowcount or 0),
                 "hourlyDeleted": int(hourly_cursor.rowcount or 0),
                 "minuteTrafficDeleted": int(minute_traffic_cursor.rowcount or 0),
+                "minuteWireTrafficDeleted": int(minute_wire_traffic_cursor.rowcount or 0),
                 "hourlyTrafficDeleted": int(hourly_traffic_cursor.rowcount or 0),
+                "hourlyWireTrafficDeleted": int(hourly_wire_traffic_cursor.rowcount or 0),
                 "dailyTrafficDeleted": int(daily_traffic_cursor.rowcount or 0),
+                "dailyWireTrafficDeleted": int(daily_wire_traffic_cursor.rowcount or 0),
                 "auditDeleted": int(audit_cursor.rowcount or 0),
                 "sessionDeleted": int(session_cursor.rowcount or 0),
             }
@@ -846,8 +872,11 @@ class AdminStore:
             daily_cursor.close()
             hourly_cursor.close()
             minute_traffic_cursor.close()
+            minute_wire_traffic_cursor.close()
             hourly_traffic_cursor.close()
+            hourly_wire_traffic_cursor.close()
             daily_traffic_cursor.close()
+            daily_wire_traffic_cursor.close()
             audit_cursor.close()
             session_cursor.close()
 
@@ -865,9 +894,45 @@ class AdminStore:
             raise ValueError("invalid_traffic_granularity")
         return normalized_range, normalized_granularity
 
+    @staticmethod
+    def _traffic_table_name(*, scope: str, bucket_kind: str) -> str:
+        if scope == "application":
+            mapping = {
+                "minute": "minute_traffic_bytes",
+                "hourly": "hourly_traffic_bytes",
+                "daily": "daily_traffic_bytes",
+            }
+        elif scope == "wire":
+            mapping = {
+                "minute": "minute_wire_traffic_bytes",
+                "hourly": "hourly_wire_traffic_bytes",
+                "daily": "daily_wire_traffic_bytes",
+            }
+        else:
+            raise ValueError(f"invalid_traffic_scope:{scope}")
+        table_name = mapping.get(bucket_kind)
+        if table_name is None:
+            raise ValueError(f"invalid_traffic_bucket_kind:{bucket_kind}")
+        return table_name
+
+    def _traffic_upsert_sql(self, *, scope: str, bucket_kind: str) -> str:
+        table_name = self._traffic_table_name(scope=scope, bucket_kind=bucket_kind)
+        bucket_column = {
+            "minute": "local_minute",
+            "hourly": "local_hour",
+            "daily": "local_date",
+        }[bucket_kind]
+        return f"""
+            INSERT INTO {table_name} ({bucket_column}, channel, direction, bytes)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT({bucket_column}, channel, direction) DO UPDATE SET
+                bytes = bytes + excluded.bytes
+        """
+
     async def _query_minute_traffic_history(
         self,
         *,
+        scope: str,
         range_preset: str,
         granularity: str,
         bucket_seconds: int,
@@ -879,10 +944,11 @@ class AdminStore:
         query_start = start_bucket.strftime("%Y-%m-%dT%H:%M:00")
         query_end = current_minute.strftime("%Y-%m-%dT%H:%M:00")
         labels = self._build_traffic_labels(start_bucket=start_bucket, bucket_count=bucket_count, bucket_seconds=bucket_seconds)
+        table_name = self._traffic_table_name(scope=scope, bucket_kind="minute")
         rows = await self._fetchall(
-            """
+            f"""
             SELECT local_minute, channel, direction, bytes
-            FROM minute_traffic_bytes
+            FROM {table_name}
             WHERE local_minute BETWEEN ? AND ?
             ORDER BY local_minute ASC
             """,
@@ -916,6 +982,7 @@ class AdminStore:
     async def _query_hourly_traffic_history(
         self,
         *,
+        scope: str,
         range_preset: str,
         granularity: str,
         bucket_seconds: int,
@@ -924,10 +991,11 @@ class AdminStore:
         end_dt = self._local_datetime().replace(minute=0, second=0, microsecond=0)
         start_dt = end_dt - timedelta(hours=max(bucket_count - 1, 0))
         labels = self._build_traffic_labels(start_bucket=start_dt, bucket_count=bucket_count, bucket_seconds=bucket_seconds)
+        table_name = self._traffic_table_name(scope=scope, bucket_kind="hourly")
         rows = await self._fetchall(
-            """
+            f"""
             SELECT local_hour, channel, direction, bytes
-            FROM hourly_traffic_bytes
+            FROM {table_name}
             WHERE local_hour BETWEEN ? AND ?
             ORDER BY local_hour ASC
             """,
@@ -944,6 +1012,7 @@ class AdminStore:
     async def _query_daily_traffic_history(
         self,
         *,
+        scope: str,
         range_preset: str,
         granularity: str,
         bucket_seconds: int,
@@ -952,10 +1021,11 @@ class AdminStore:
         end_dt = self._local_datetime().replace(hour=0, minute=0, second=0, microsecond=0)
         start_dt = end_dt - timedelta(days=max(bucket_count - 1, 0))
         labels = self._build_traffic_labels(start_bucket=start_dt, bucket_count=bucket_count, bucket_seconds=bucket_seconds)
+        table_name = self._traffic_table_name(scope=scope, bucket_kind="daily")
         rows = await self._fetchall(
-            """
+            f"""
             SELECT local_date, channel, direction, bytes
-            FROM daily_traffic_bytes
+            FROM {table_name}
             WHERE local_date BETWEEN ? AND ?
             ORDER BY local_date ASC
             """,

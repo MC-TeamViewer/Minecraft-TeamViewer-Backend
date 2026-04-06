@@ -46,36 +46,45 @@ describe("buildTrafficChartOption", () => {
       range: "48h",
       granularity: "1h",
       bucketSeconds: 3600,
-      totalIngressBytes: 250,
-      totalEgressBytes: 200,
-      totalBytes: 450,
-      items: [
-        {
-          bucket: "2026-04-06T00:00:00",
-          label: "2026-04-06T00:00:00",
-          playerIngressBytes: 100,
-          playerEgressBytes: 50,
-          webMapIngressBytes: 20,
-          webMapEgressBytes: 30,
-          totalIngressBytes: 120,
-          totalEgressBytes: 80,
-          totalBytes: 200,
-        },
-        {
-          bucket: "2026-04-06T01:00:00",
-          label: "2026-04-06T01:00:00",
-          playerIngressBytes: 130,
-          playerEgressBytes: 70,
-          webMapIngressBytes: 0,
-          webMapEgressBytes: 50,
-          totalIngressBytes: 130,
-          totalEgressBytes: 120,
-          totalBytes: 250,
-        },
-      ],
+      selectedLayer: "application",
+      application: {
+        totalIngressBytes: 250,
+        totalEgressBytes: 200,
+        totalBytes: 450,
+        items: [
+          {
+            bucket: "2026-04-06T00:00:00",
+            label: "2026-04-06T00:00:00",
+            playerIngressBytes: 100,
+            playerEgressBytes: 50,
+            webMapIngressBytes: 20,
+            webMapEgressBytes: 30,
+            totalIngressBytes: 120,
+            totalEgressBytes: 80,
+            totalBytes: 200,
+          },
+          {
+            bucket: "2026-04-06T01:00:00",
+            label: "2026-04-06T01:00:00",
+            playerIngressBytes: 130,
+            playerEgressBytes: 70,
+            webMapIngressBytes: 0,
+            webMapEgressBytes: 50,
+            totalIngressBytes: 130,
+            totalEgressBytes: 120,
+            totalBytes: 250,
+          },
+        ],
+      },
+      wire: {
+        totalIngressBytes: 200,
+        totalEgressBytes: 160,
+        totalBytes: 360,
+        items: [],
+      },
     };
 
-    const option = buildTrafficChartOption(metrics);
+    const option = buildTrafficChartOption(metrics, "application");
     const xAxis = Array.isArray(option.xAxis) ? option.xAxis[0] : option.xAxis;
     const series = Array.isArray(option.series) ? option.series : [];
 

@@ -20,5 +20,6 @@ register_app_routes(app)
 
 if __name__ == "__main__":
     import uvicorn
+    from server.app.uvicorn_websocket_protocol import TeamViewerWebSocketProtocol
 
-    uvicorn.run(app, host="0.0.0.0", port=8765, ws_per_message_deflate=True)
+    uvicorn.run(app, host="0.0.0.0", port=8765, ws=TeamViewerWebSocketProtocol, ws_per_message_deflate=True)

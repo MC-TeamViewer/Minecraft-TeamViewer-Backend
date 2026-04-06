@@ -1,6 +1,6 @@
 import type { EChartsCoreOption } from "echarts/core";
 
-import type { MetricsPayload, TrafficHistoryPayload } from "@/types";
+import type { MetricsPayload, TrafficHistoryPayload, TrafficLayer } from "@/types";
 
 function formatAxisLabel(bucket: string, metrics: MetricsPayload | TrafficHistoryPayload | null): string {
   if (!bucket) {
@@ -99,8 +99,9 @@ export function buildBarChartOption(metrics: MetricsPayload | null): EChartsCore
   };
 }
 
-export function buildTrafficChartOption(metrics: TrafficHistoryPayload | null): EChartsCoreOption {
-  const items = metrics?.items ?? [];
+export function buildTrafficChartOption(metrics: TrafficHistoryPayload | null, layer: TrafficLayer): EChartsCoreOption {
+  const layerMetrics = metrics?.[layer];
+  const items = layerMetrics?.items ?? [];
   const labels = items.map((item) => formatAxisLabel(item.bucket || item.label, metrics));
 
   return {

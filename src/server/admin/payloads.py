@@ -124,10 +124,43 @@ class AdminPayloadService:
         range_preset: str = "48h",
         granularity: str = "1h",
     ) -> TrafficHistoryPayload:
+        async def builder() -> TrafficHistoryPayload:
+            application, wire = await asyncio.gather(
+                self._store.query_traffic_history(
+                    range_preset=range_preset,
+                    granularity=granularity,
+                    scope="application",
+                ),
+                self._store.query_traffic_history(
+                    range_preset=range_preset,
+                    granularity=granularity,
+                    scope="wire",
+                ),
+            )
+            return {
+                "timezone": application["timezone"],
+                "range": application["range"],
+                "granularity": application["granularity"],
+                "bucketSeconds": application["bucketSeconds"],
+                "selectedLayer": "application",
+                "application": {
+                    "items": application["items"],
+                    "totalIngressBytes": application["totalIngressBytes"],
+                    "totalEgressBytes": application["totalEgressBytes"],
+                    "totalBytes": application["totalBytes"],
+                },
+                "wire": {
+                    "items": wire["items"],
+                    "totalIngressBytes": wire["totalIngressBytes"],
+                    "totalEgressBytes": wire["totalEgressBytes"],
+                    "totalBytes": wire["totalBytes"],
+                },
+            }
+
         return await self._get_cached_payload(
             ("traffic_history", (("range", range_preset), ("granularity", granularity))),
             ttl_sec=1.0,
-            builder=lambda: self._store.query_traffic_history(range_preset=range_preset, granularity=granularity),
+            builder=builder,
         )
 
     async def build_audit_payload(

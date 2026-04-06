@@ -35,6 +35,7 @@ import type {
   DashboardFilters,
   MetricsFilters,
   TrafficFilters,
+  TrafficLayer,
 } from "@/types";
 import { DEFAULT_AUDIT_FILTERS, DEFAULT_METRICS_FILTERS, DEFAULT_TRAFFIC_FILTERS } from "@/types";
 
@@ -46,6 +47,7 @@ const AuditTable = defineAsyncComponent(() => import("@/components/AuditTable.vu
 const auditFilters = ref<AuditFiltersModel>({ ...DEFAULT_AUDIT_FILTERS });
 const metricsFilters = ref<MetricsFilters>({ ...DEFAULT_METRICS_FILTERS });
 const trafficFilters = ref<TrafficFilters>({ ...DEFAULT_TRAFFIC_FILTERS });
+const trafficLayer = ref<TrafficLayer>("application");
 const session = ref<AdminSessionPayload | null>(null);
 const sessionLoading = ref(true);
 const loginLoading = ref(false);
@@ -110,6 +112,7 @@ function applyBootstrap(payload: BootstrapPayload) {
   applyHourlyMetrics(payload.hourlyMetrics);
   applyLiveTraffic(payload.liveTraffic);
   applyTrafficHistory(payload.trafficHistory);
+  trafficLayer.value = payload.trafficHistory.selectedLayer ?? payload.liveTraffic.selectedLayer ?? "application";
   applyAudit(payload.audit);
   dailyMetricsLoading.value = false;
   hourlyMetricsLoading.value = false;
@@ -420,6 +423,10 @@ function updateMetricsFilters(value: MetricsFilters) {
 function updateTrafficFilters(value: TrafficFilters) {
   trafficFilters.value = value;
 }
+
+function updateTrafficLayer(value: TrafficLayer) {
+  trafficLayer.value = value;
+}
 </script>
 
 <template>
@@ -466,12 +473,18 @@ function updateTrafficFilters(value: TrafficFilters) {
 
     <template v-else>
       <OverviewCards :overview="overview" />
-      <LiveTrafficCards :traffic="liveTraffic" />
+      <LiveTrafficCards
+        :traffic="liveTraffic"
+        :selected-layer="trafficLayer"
+        @update:selected-layer="updateTrafficLayer"
+      />
 
       <el-card shadow="never" class="surface-card">
         <TrafficToolbar
           :model-value="trafficFilters"
+          :selected-layer="trafficLayer"
           @update:model-value="updateTrafficFilters"
+          @update:selected-layer="updateTrafficLayer"
         />
       </el-card>
 
@@ -480,6 +493,7 @@ function updateTrafficFilters(value: TrafficFilters) {
         title="历史流量"
         description="按所选范围与粒度汇总核心业务 WebSocket 双向流量。"
         :metrics="trafficHistory"
+        :selected-layer="trafficLayer"
       />
 
       <el-card shadow="never" class="surface-card">

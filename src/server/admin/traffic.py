@@ -11,6 +11,8 @@ if TYPE_CHECKING:
 
 TRAFFIC_CHANNELS = ("player", "web_map")
 TRAFFIC_DIRECTIONS = ("ingress", "egress")
+TRAFFIC_LAYERS = ("application", "wire")
+DEFAULT_TRAFFIC_LAYER = "application"
 
 
 def _normalize_payload_size(payload: bytes | bytearray | memoryview | str) -> int:
@@ -21,17 +23,47 @@ def _normalize_payload_size(payload: bytes | bytearray | memoryview | str) -> in
     return len(payload)
 
 
+def infer_traffic_channel_from_path(path: str | None) -> str | None:
+    normalized_path = str(path or "")
+    if normalized_path in {"/mc-client", "/playeresp"}:
+        return "player"
+    if normalized_path in {"/web-map/ws", "/adminws"}:
+        return "web_map"
+    return None
+
+
 def infer_websocket_traffic_channel(websocket, explicit_channel: str | None = None) -> str | None:
     if explicit_channel in TRAFFIC_CHANNELS:
         return explicit_channel
 
     url = getattr(websocket, "url", None)
-    path = str(getattr(url, "path", "") or "")
-    if path in {"/mc-client", "/playeresp"}:
-        return "player"
-    if path in {"/web-map/ws", "/adminws"}:
-        return "web_map"
-    return None
+    return infer_traffic_channel_from_path(str(getattr(url, "path", "") or ""))
+
+
+def build_empty_live_layer_payload() -> dict[str, float]:
+    return {
+        "playerIngressBps": 0.0,
+        "playerEgressBps": 0.0,
+        "webMapIngressBps": 0.0,
+        "webMapEgressBps": 0.0,
+        "totalIngressBps": 0.0,
+        "totalEgressBps": 0.0,
+    }
+
+
+def build_live_payload(
+    *,
+    sample_window_sec: int,
+    application: dict[str, float],
+    wire: dict[str, float],
+    selected_layer: str = DEFAULT_TRAFFIC_LAYER,
+) -> dict[str, object]:
+    return {
+        "sampleWindowSec": int(sample_window_sec),
+        "selectedLayer": selected_layer if selected_layer in TRAFFIC_LAYERS else DEFAULT_TRAFFIC_LAYER,
+        "application": application,
+        "wire": wire,
+    }
 
 
 class TrafficStatsService:
@@ -44,10 +76,12 @@ class TrafficStatsService:
         self._store = admin_store
         self._live_window_sec = max(1, int(live_window_sec))
         self._lock = asyncio.Lock()
-        self._live_buckets: dict[int, dict[tuple[str, str], int]] = {}
-        self._pending_minute: dict[tuple[str, str, str], int] = defaultdict(int)
-        self._pending_hourly: dict[tuple[str, str, str], int] = defaultdict(int)
-        self._pending_daily: dict[tuple[str, str, str], int] = defaultdict(int)
+        self._live_buckets: dict[str, dict[int, dict[tuple[str, str], int]]] = {
+            layer: {} for layer in TRAFFIC_LAYERS
+        }
+        self._pending_minute: dict[tuple[str, str, str, str], int] = defaultdict(int)
+        self._pending_hourly: dict[tuple[str, str, str, str], int] = defaultdict(int)
+        self._pending_daily: dict[tuple[str, str, str, str], int] = defaultdict(int)
 
     @property
     def live_window_sec(self) -> int:
@@ -56,12 +90,30 @@ class TrafficStatsService:
     async def record(
         self,
         *,
+        layer: str = DEFAULT_TRAFFIC_LAYER,
         channel: str,
         direction: str,
         byte_count: int,
         occurred_at: float | None = None,
     ) -> None:
-        if channel not in TRAFFIC_CHANNELS or direction not in TRAFFIC_DIRECTIONS:
+        self.record_nowait(
+            layer=layer,
+            channel=channel,
+            direction=direction,
+            byte_count=byte_count,
+            occurred_at=occurred_at,
+        )
+
+    def record_nowait(
+        self,
+        *,
+        layer: str = DEFAULT_TRAFFIC_LAYER,
+        channel: str,
+        direction: str,
+        byte_count: int,
+        occurred_at: float | None = None,
+    ) -> None:
+        if layer not in TRAFFIC_LAYERS or channel not in TRAFFIC_CHANNELS or direction not in TRAFFIC_DIRECTIONS:
             return
         amount = max(0, int(byte_count))
         if amount <= 0:
@@ -74,30 +126,37 @@ class TrafficStatsService:
         hourly_bucket = local_dt.strftime("%Y-%m-%dT%H:00:00")
         daily_bucket = local_dt.strftime("%Y-%m-%d")
 
-        async with self._lock:
-            live_bucket = self._live_buckets.get(second_bucket)
-            if live_bucket is None:
-                live_bucket = defaultdict(int)
-                self._live_buckets[second_bucket] = live_bucket
-            live_bucket[(channel, direction)] += amount
-            self._prune_live_buckets_locked(second_bucket)
-            self._pending_minute[(minute_bucket, channel, direction)] += amount
-            self._pending_hourly[(hourly_bucket, channel, direction)] += amount
-            self._pending_daily[(daily_bucket, channel, direction)] += amount
+        layer_live_buckets = self._live_buckets[layer]
+        live_bucket = layer_live_buckets.get(second_bucket)
+        if live_bucket is None:
+            live_bucket = defaultdict(int)
+            layer_live_buckets[second_bucket] = live_bucket
+        live_bucket[(channel, direction)] += amount
+        self._prune_live_buckets_locked(layer, second_bucket)
+        self._pending_minute[(layer, minute_bucket, channel, direction)] += amount
+        self._pending_hourly[(layer, hourly_bucket, channel, direction)] += amount
+        self._pending_daily[(layer, daily_bucket, channel, direction)] += amount
 
-    async def build_live_payload(self) -> dict[str, float | int]:
+    async def build_live_payload(self) -> dict[str, object]:
         now_sec = int(time.time())
         async with self._lock:
-            self._prune_live_buckets_locked(now_sec)
-            totals: dict[tuple[str, str], int] = defaultdict(int)
             threshold = now_sec - self._live_window_sec + 1
-            for bucket, series in self._live_buckets.items():
-                if bucket < threshold:
-                    continue
-                for key, value in series.items():
-                    totals[key] += int(value)
+            layer_totals: dict[str, dict[tuple[str, str], int]] = {}
+            for layer in TRAFFIC_LAYERS:
+                self._prune_live_buckets_locked(layer, now_sec)
+                totals: dict[tuple[str, str], int] = defaultdict(int)
+                for bucket, series in self._live_buckets[layer].items():
+                    if bucket < threshold:
+                        continue
+                    for key, value in series.items():
+                        totals[key] += int(value)
+                layer_totals[layer] = totals
 
-        return self._build_live_payload_from_totals(totals)
+        return build_live_payload(
+            sample_window_sec=self._live_window_sec,
+            application=self._build_live_layer_payload_from_totals(layer_totals["application"]),
+            wire=self._build_live_layer_payload_from_totals(layer_totals["wire"]),
+        )
 
     async def flush_pending(self) -> bool:
         async with self._lock:
@@ -118,13 +177,14 @@ class TrafficStatsService:
         )
         return True
 
-    def _prune_live_buckets_locked(self, current_second: int) -> None:
+    def _prune_live_buckets_locked(self, layer: str, current_second: int) -> None:
         threshold = current_second - self._live_window_sec - 2
-        stale_keys = [bucket for bucket in self._live_buckets.keys() if bucket < threshold]
+        layer_buckets = self._live_buckets[layer]
+        stale_keys = [bucket for bucket in layer_buckets.keys() if bucket < threshold]
         for bucket in stale_keys:
-            self._live_buckets.pop(bucket, None)
+            layer_buckets.pop(bucket, None)
 
-    def _build_live_payload_from_totals(self, totals: dict[tuple[str, str], int]) -> dict[str, float | int]:
+    def _build_live_layer_payload_from_totals(self, totals: dict[tuple[str, str], int]) -> dict[str, float]:
         window = float(self._live_window_sec)
 
         def value(channel: str, direction: str) -> float:
@@ -135,7 +195,6 @@ class TrafficStatsService:
         web_map_ingress = value("web_map", "ingress")
         web_map_egress = value("web_map", "egress")
         return {
-            "sampleWindowSec": self._live_window_sec,
             "playerIngressBps": player_ingress,
             "playerEgressBps": player_egress,
             "webMapIngressBps": web_map_ingress,
@@ -145,14 +204,24 @@ class TrafficStatsService:
         }
 
 
+def _schedule_traffic_updates() -> None:
+    from ..app import runtime
+
+    if runtime.admin_payload_service is not None:
+        runtime.admin_payload_service.invalidate("live_traffic", "hourly_traffic", "daily_traffic", "traffic_history")
+    runtime.admin_sse_hub.schedule_broadcast("traffic_live", delay_sec=1.0)
+    runtime.admin_sse_hub.schedule_broadcast("traffic_history", delay_sec=5.0)
+
+
 async def record_websocket_traffic(
     *,
+    layer: str = DEFAULT_TRAFFIC_LAYER,
     channel: str,
     direction: str,
     byte_count: int,
     occurred_at: float | None = None,
 ) -> None:
-    if channel not in TRAFFIC_CHANNELS or direction not in TRAFFIC_DIRECTIONS:
+    if layer not in TRAFFIC_LAYERS or channel not in TRAFFIC_CHANNELS or direction not in TRAFFIC_DIRECTIONS:
         return
 
     from ..app import runtime
@@ -162,20 +231,46 @@ async def record_websocket_traffic(
         return
 
     await service.record(
+        layer=layer,
         channel=channel,
         direction=direction,
         byte_count=byte_count,
         occurred_at=occurred_at,
     )
-    if runtime.admin_payload_service is not None:
-        runtime.admin_payload_service.invalidate("live_traffic", "hourly_traffic", "daily_traffic", "traffic_history")
-    runtime.admin_sse_hub.schedule_broadcast("traffic_live", delay_sec=1.0)
-    runtime.admin_sse_hub.schedule_broadcast("traffic_history", delay_sec=5.0)
+    _schedule_traffic_updates()
+
+
+def record_websocket_traffic_nowait(
+    *,
+    layer: str = DEFAULT_TRAFFIC_LAYER,
+    channel: str,
+    direction: str,
+    byte_count: int,
+    occurred_at: float | None = None,
+) -> None:
+    if layer not in TRAFFIC_LAYERS or channel not in TRAFFIC_CHANNELS or direction not in TRAFFIC_DIRECTIONS:
+        return
+
+    from ..app import runtime
+
+    service = runtime.admin_traffic_service
+    if service is None:
+        return
+
+    service.record_nowait(
+        layer=layer,
+        channel=channel,
+        direction=direction,
+        byte_count=byte_count,
+        occurred_at=occurred_at,
+    )
+    _schedule_traffic_updates()
 
 
 async def record_websocket_payload_traffic(
     *,
     websocket,
+    layer: str = DEFAULT_TRAFFIC_LAYER,
     direction: str,
     payload: bytes | bytearray | memoryview | str,
     channel: str | None = None,
@@ -185,6 +280,7 @@ async def record_websocket_payload_traffic(
     if resolved_channel is None:
         return
     await record_websocket_traffic(
+        layer=layer,
         channel=resolved_channel,
         direction=direction,
         byte_count=_normalize_payload_size(payload),

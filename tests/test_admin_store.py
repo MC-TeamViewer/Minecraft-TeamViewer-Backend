@@ -150,19 +150,25 @@ async def test_traffic_queries_zero_fill_and_sum_totals(tmp_path: Path) -> None:
         current_day = now_local.strftime("%Y-%m-%d")
         await store.apply_traffic_increments(
             minute_increments={
-                (current_minute, "player", "ingress"): 1200,
-                (current_minute, "player", "egress"): 800,
-                (current_minute, "web_map", "egress"): 400,
+                ("application", current_minute, "player", "ingress"): 1200,
+                ("application", current_minute, "player", "egress"): 800,
+                ("application", current_minute, "web_map", "egress"): 400,
+                ("wire", current_minute, "player", "ingress"): 900,
+                ("wire", current_minute, "player", "egress"): 700,
             },
             hourly_increments={
-                (current_hour, "player", "ingress"): 1200,
-                (current_hour, "player", "egress"): 800,
-                (current_hour, "web_map", "egress"): 400,
+                ("application", current_hour, "player", "ingress"): 1200,
+                ("application", current_hour, "player", "egress"): 800,
+                ("application", current_hour, "web_map", "egress"): 400,
+                ("wire", current_hour, "player", "ingress"): 900,
+                ("wire", current_hour, "player", "egress"): 700,
             },
             daily_increments={
-                (current_day, "player", "ingress"): 1200,
-                (current_day, "player", "egress"): 800,
-                (current_day, "web_map", "egress"): 400,
+                ("application", current_day, "player", "ingress"): 1200,
+                ("application", current_day, "player", "egress"): 800,
+                ("application", current_day, "web_map", "egress"): 400,
+                ("wire", current_day, "player", "ingress"): 900,
+                ("wire", current_day, "player", "egress"): 700,
             },
         )
 
@@ -170,6 +176,8 @@ async def test_traffic_queries_zero_fill_and_sum_totals(tmp_path: Path) -> None:
         daily = await store.query_daily_traffic(days=2)
         history_1m = await store.query_traffic_history(range_preset="1h", granularity="1m")
         history_5m = await store.query_traffic_history(range_preset="6h", granularity="5m")
+        wire_hourly = await store.query_hourly_traffic(hours=2, scope="wire")
+        wire_history_1m = await store.query_traffic_history(range_preset="1h", granularity="1m", scope="wire")
 
         assert hourly["items"][-1]["playerIngressBytes"] == 1200
         assert hourly["items"][-1]["totalBytes"] == 2400
@@ -185,5 +193,8 @@ async def test_traffic_queries_zero_fill_and_sum_totals(tmp_path: Path) -> None:
         assert history_5m["range"] == "6h"
         assert history_5m["granularity"] == "5m"
         assert any(item["bucket"] == current_5m and item["totalBytes"] == 2400 for item in history_5m["items"])
+        assert wire_hourly["items"][-1]["totalBytes"] == 1600
+        assert wire_hourly["items"][-1]["webMapEgressBytes"] == 0
+        assert wire_history_1m["items"][-1]["totalBytes"] == 1600
     finally:
         await store.close()

@@ -66,14 +66,20 @@ class AdminObservabilityPayload(TypedDict):
     trustProxyHeaders: bool
 
 
-class LiveTrafficPayload(TypedDict):
-    sampleWindowSec: int
+class TrafficLayerLivePayload(TypedDict):
     playerIngressBps: float
     playerEgressBps: float
     webMapIngressBps: float
     webMapEgressBps: float
     totalIngressBps: float
     totalEgressBps: float
+
+
+class LiveTrafficPayload(TypedDict):
+    sampleWindowSec: int
+    selectedLayer: str
+    application: TrafficLayerLivePayload
+    wire: TrafficLayerLivePayload
     serverTime: NotRequired[float]
 
 
@@ -84,6 +90,13 @@ class TrafficBucketItem(TypedDict):
     playerEgressBytes: int
     webMapIngressBytes: int
     webMapEgressBytes: int
+    totalIngressBytes: int
+    totalEgressBytes: int
+    totalBytes: int
+
+
+class TrafficLayerHistoryPayload(TypedDict):
+    items: list[TrafficBucketItem]
     totalIngressBytes: int
     totalEgressBytes: int
     totalBytes: int
@@ -105,10 +118,9 @@ class TrafficHistoryPayload(TypedDict):
     range: str
     granularity: str
     bucketSeconds: int
-    items: list[TrafficBucketItem]
-    totalIngressBytes: int
-    totalEgressBytes: int
-    totalBytes: int
+    selectedLayer: str
+    application: TrafficLayerHistoryPayload
+    wire: TrafficLayerHistoryPayload
     serverTime: NotRequired[float]
 
 
