@@ -6,17 +6,26 @@ import ElTag from "element-plus/es/components/tag/index";
 import { ElTable, ElTableColumn } from "element-plus/es/components/table/index";
 import { computed, ref, watch } from "vue";
 
-import type { AuditPayload } from "@/types";
+import type { AuditItem, AuditPayload } from "@/types";
 
 const props = defineProps<{
   audit: AuditPayload | null;
 }>();
 
 const currentPage = ref(1);
+const mappingCurrentPage = ref(1);
 const pageSize = 25;
+const mappingPageSize = 10;
 const prettyExpandedRows = ref<Record<number, boolean>>({});
+const actorDisplayMode = ref<"id" | "username">("id");
 
 function formatOccurredAt(value: number): string {
+  return new Date(value).toLocaleString("zh-CN", {
+    hour12: false,
+  });
+}
+
+function formatTimestamp(value: number): string {
   return new Date(value).toLocaleString("zh-CN", {
     hour12: false,
   });
@@ -36,10 +45,23 @@ const pagedItems = computed(() => {
   return items.slice(start, start + pageSize);
 });
 
+const pagedMappings = computed(() => {
+  const items = props.audit?.playerIdentityMappings ?? [];
+  const start = (mappingCurrentPage.value - 1) * mappingPageSize;
+  return items.slice(start, start + mappingPageSize);
+});
+
 watch(
   () => props.audit?.items,
   () => {
     currentPage.value = 1;
+  },
+);
+
+watch(
+  () => props.audit?.playerIdentityMappings,
+  () => {
+    mappingCurrentPage.value = 1;
   },
 );
 
@@ -58,6 +80,20 @@ async function copyDetail(detail: Record<string, unknown>) {
 function handlePageChange(page: number) {
   currentPage.value = page;
 }
+
+function handleMappingPageChange(page: number) {
+  mappingCurrentPage.value = page;
+}
+
+function resolveActorDisplay(row: AuditItem): string {
+  if (row.actorType === "player" && actorDisplayMode.value === "username") {
+    const resolved = String(row.resolvedActorName || "").trim();
+    if (resolved) {
+      return resolved;
+    }
+  }
+  return String(row.actorId || "");
+}
 </script>
 
 <template>
@@ -65,8 +101,64 @@ function handlePageChange(page: number) {
     <template #header>
       <div class="section-header">
         <div>
+          <h2>玩家身份映射</h2>
+          <p>当前已学到的 submitPlayerId 与 username 映射。</p>
+        </div>
+      </div>
+    </template>
+
+    <el-table
+      :data="pagedMappings"
+      border
+      row-key="playerId"
+      table-layout="fixed"
+      class="admin-table"
+      empty-text="暂无身份映射"
+    >
+      <el-table-column prop="playerId" label="UUID" min-width="280" show-overflow-tooltip resizable />
+      <el-table-column prop="username" label="Username" min-width="180" show-overflow-tooltip resizable />
+      <el-table-column label="最后更新时间" min-width="190" resizable>
+        <template #default="{ row }">
+          {{ formatTimestamp(row.updatedAt) }}
+        </template>
+      </el-table-column>
+    </el-table>
+
+    <div class="audit-pagination">
+      <el-pagination
+        layout="prev, pager, next"
+        :total="audit?.playerIdentityMappings?.length ?? 0"
+        :page-size="mappingPageSize"
+        :current-page="mappingCurrentPage"
+        size="small"
+        background
+        @update:current-page="handleMappingPageChange"
+      />
+    </div>
+  </el-card>
+
+  <el-card shadow="never" class="surface-card">
+    <template #header>
+      <div class="section-header">
+        <div>
           <h2>审计日志</h2>
           <p>最新 100 条匹配当前筛选条件的审计事件。</p>
+        </div>
+        <div class="audit-detail-toolbar">
+          <el-button
+            :type="actorDisplayMode === 'id' ? 'primary' : 'default'"
+            plain
+            @click="actorDisplayMode = 'id'"
+          >
+            显示原始 Actor ID
+          </el-button>
+          <el-button
+            :type="actorDisplayMode === 'username' ? 'primary' : 'default'"
+            plain
+            @click="actorDisplayMode = 'username'"
+          >
+            显示 username
+          </el-button>
         </div>
       </div>
     </template>
@@ -105,7 +197,11 @@ function handlePageChange(page: number) {
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column prop="actorId" label="Actor ID" min-width="180" show-overflow-tooltip resizable />
+      <el-table-column label="Actor" min-width="180" show-overflow-tooltip resizable>
+        <template #default="{ row }">
+          {{ resolveActorDisplay(row) }}
+        </template>
+      </el-table-column>
       <el-table-column prop="roomCode" label="房间" min-width="140" show-overflow-tooltip resizable />
       <el-table-column prop="remoteAddr" label="地址" min-width="160" show-overflow-tooltip resizable />
     </el-table>
@@ -116,7 +212,7 @@ function handlePageChange(page: number) {
         :total="audit?.items?.length ?? 0"
         :page-size="pageSize"
         :current-page="currentPage"
-        small
+        size="small"
         background
         @update:current-page="handlePageChange"
       />

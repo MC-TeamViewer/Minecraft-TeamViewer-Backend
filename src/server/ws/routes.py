@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from ..admin.auth import (
     record_audit_event,
+    record_player_identity,
     record_player_activity,
     trigger_admin_sse_overview,
 )
@@ -43,6 +44,30 @@ from .io import (
     resolve_handshake_rejection_reason,
     send_packet,
 )
+
+
+def _resolve_self_reported_username(
+    submit_player_id: str | None,
+    player_id: str,
+    player_data: dict,
+) -> str | None:
+    normalized_submit_player_id = str(submit_player_id or "").strip()
+    normalized_player_id = str(player_id or "").strip()
+    if not normalized_submit_player_id:
+        return None
+
+    player_name = str(player_data.get("playerName") or "").strip()
+    if not player_name:
+        return None
+
+    if normalized_player_id == normalized_submit_player_id:
+        return player_name
+
+    player_uuid = str(player_data.get("playerUUID") or "").strip()
+    if player_uuid and player_uuid == normalized_submit_player_id:
+        return player_name
+
+    return None
 
 
 async def web_map_ws(websocket: WebSocket):
@@ -725,6 +750,9 @@ async def websocket_endpoint(websocket: WebSocket):
                             normalized = player_data.model_dump()
                             node = runtime.state.build_state_node(submit_player_id, current_time, normalized)
                             runtime.state.upsert_report(runtime.state.player_reports, pid, submit_player_id, node)
+                            username = _resolve_self_reported_username(submit_player_id, pid, normalized)
+                            if username is not None:
+                                await record_player_identity(submit_player_id, username)
                         except Exception as exc:
                             runtime.logger.warning("Error validating player data for %s: %s", pid, exc)
                     continue
@@ -758,6 +786,9 @@ async def websocket_endpoint(websocket: WebSocket):
                             normalized = runtime.state.merge_patch_and_validate(PlayerData, existing_node, player_data)
                             node = runtime.state.build_state_node(submit_player_id, current_time, normalized)
                             runtime.state.upsert_report(runtime.state.player_reports, pid, submit_player_id, node)
+                            username = _resolve_self_reported_username(submit_player_id, pid, normalized)
+                            if username is not None:
+                                await record_player_identity(submit_player_id, username)
                         except ValidationError as exc:
                             missing_fields = runtime.state.missing_fields_from_validation_error(exc)
                             existing_data = existing_node.get("data") if isinstance(existing_node, dict) else None

@@ -102,6 +102,13 @@ class AdminStore:
                 detail_json TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS player_identity_mappings (
+                player_id TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS admin_sessions (
                 session_id TEXT PRIMARY KEY,
                 token_hash TEXT NOT NULL UNIQUE,
@@ -179,6 +186,9 @@ class AdminStore:
 
             CREATE INDEX IF NOT EXISTS idx_audit_events_filters
                 ON audit_events (event_type, actor_type, success, id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_player_identity_mappings_updated_at
+                ON player_identity_mappings (updated_at DESC, player_id ASC);
 
             CREATE INDEX IF NOT EXISTS idx_admin_sessions_token_hash
                 ON admin_sessions (token_hash);
@@ -295,6 +305,65 @@ class AdminStore:
                     detail_json,
                 ),
             )
+
+    async def upsert_player_identity(
+        self,
+        player_id: str,
+        username: str,
+        *,
+        occurred_at: float | None = None,
+    ) -> bool:
+        normalized_player_id = str(player_id or "").strip()
+        normalized_username = str(username or "").strip()
+        if not normalized_player_id or not normalized_username:
+            return False
+
+        current = await self._fetchone(
+            """
+            SELECT username
+            FROM player_identity_mappings
+            WHERE player_id = ?
+            LIMIT 1
+            """,
+            (normalized_player_id,),
+        )
+        if current is not None and str(current["username"] or "").strip() == normalized_username:
+            return False
+
+        stamp_ms = self._to_timestamp_ms(occurred_at)
+        async with self._lock:
+            self._execute(
+                """
+                INSERT INTO player_identity_mappings (
+                    player_id,
+                    username,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(player_id) DO UPDATE SET
+                    username = excluded.username,
+                    updated_at = excluded.updated_at
+                """,
+                (normalized_player_id, normalized_username, stamp_ms, stamp_ms),
+            )
+        return True
+
+    async def query_player_identities(self) -> list[dict[str, Any]]:
+        rows = await self._fetchall(
+            """
+            SELECT player_id, username, updated_at
+            FROM player_identity_mappings
+            ORDER BY updated_at DESC, player_id ASC
+            """
+        )
+        return [
+            {
+                "playerId": str(row["player_id"]),
+                "username": str(row["username"]),
+                "updatedAt": int(row["updated_at"]),
+            }
+            for row in rows
+        ]
 
     async def create_admin_session(
         self,
@@ -753,6 +822,12 @@ class AdminStore:
             ORDER BY event_type ASC
             """
         )
+        player_identity_mappings = await self.query_player_identities()
+        identity_by_player_id = {
+            item["playerId"]: item["username"]
+            for item in player_identity_mappings
+            if item["playerId"] and item["username"]
+        }
 
         items = []
         for row in rows:
@@ -770,6 +845,11 @@ class AdminStore:
                     "eventType": row["event_type"],
                     "actorType": row["actor_type"],
                     "actorId": row["actor_id"],
+                    "resolvedActorName": (
+                        identity_by_player_id.get(str(row["actor_id"]))
+                        if row["actor_type"] == "player" and row["actor_id"]
+                        else None
+                    ),
                     "roomCode": row["room_code"],
                     "success": bool(row["success"]),
                     "remoteAddr": row["remote_addr"],
@@ -780,6 +860,7 @@ class AdminStore:
         next_before_id = items[-1]["id"] if items else None
         return {
             "items": items,
+            "playerIdentityMappings": player_identity_mappings,
             "nextBeforeId": next_before_id,
             "limit": limit,
             "availableEventTypes": [str(row["event_type"]) for row in event_type_rows if row["event_type"]],

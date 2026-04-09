@@ -116,6 +116,7 @@ async def test_audit_query_supports_filters_and_pagination(tmp_path: Path) -> No
     store = AdminStore(AdminStoreConfig(db_path=str(tmp_path / "audit.db")))
     await store.initialize()
     try:
+        await store.upsert_player_identity("player-1", "Alice")
         await store.record_audit_event(
             event_type="player_handshake_success",
             actor_type="player",
@@ -139,15 +140,48 @@ async def test_audit_query_supports_filters_and_pagination(tmp_path: Path) -> No
         )
 
         failed_only = await store.query_audit_events(limit=10, success=False)
+        full_page = await store.query_audit_events(limit=10)
         page_one = await store.query_audit_events(limit=2)
         page_two = await store.query_audit_events(limit=2, before_id=page_one["nextBeforeId"])
 
         assert len(failed_only["items"]) == 1
         assert failed_only["items"][0]["eventType"] == "admin_auth_failed"
+        assert failed_only["items"][0]["resolvedActorName"] is None
+        assert len(full_page["items"]) == 3
+        matching_player_event = next(item for item in full_page["items"] if item["actorId"] == "player-1")
+        assert matching_player_event["resolvedActorName"] == "Alice"
+        assert len(full_page["playerIdentityMappings"]) == 1
+        assert full_page["playerIdentityMappings"][0]["playerId"] == "player-1"
+        assert full_page["playerIdentityMappings"][0]["username"] == "Alice"
         assert len(page_one["items"]) == 2
         assert page_one["items"][0]["id"] > page_one["items"][1]["id"]
         assert page_two["items"]
         assert page_two["items"][0]["id"] < page_one["items"][-1]["id"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_player_identity_upsert_overwrites_and_ignores_empty_username(tmp_path: Path) -> None:
+    store = AdminStore(AdminStoreConfig(db_path=str(tmp_path / "identity.db")))
+    await store.initialize()
+    try:
+        base = _local_base(11, 0)
+        changed = await store.upsert_player_identity("player-1", "Alice", occurred_at=base.timestamp())
+        unchanged_empty = await store.upsert_player_identity("player-1", "   ", occurred_at=(base + timedelta(minutes=1)).timestamp())
+        updated = await store.upsert_player_identity("player-1", "Bob", occurred_at=(base + timedelta(minutes=2)).timestamp())
+
+        rows = await store._fetchall(  # noqa: SLF001
+            "SELECT player_id, username, created_at, updated_at FROM player_identity_mappings WHERE player_id = ?",
+            ("player-1",),
+        )
+
+        assert changed is True
+        assert unchanged_empty is False
+        assert updated is True
+        assert len(rows) == 1
+        assert rows[0]["username"] == "Bob"
+        assert int(rows[0]["created_at"]) < int(rows[0]["updated_at"])
     finally:
         await store.close()
 

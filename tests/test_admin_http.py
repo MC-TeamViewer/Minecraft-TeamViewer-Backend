@@ -196,6 +196,7 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
 
     async with main.app.router.lifespan_context(main.app):
         await app_runtime.admin_store.record_player_activity("player-1", "room-admin-test")
+        await app_runtime.admin_store.upsert_player_identity("player-1", "Alice")
         await admin_auth.record_audit_event(
             event_type="player_handshake_success",
             actor_type="player",
@@ -293,6 +294,9 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
     assert "web_map_handshake_success" in audit_types
     assert "admin_api_access" in audit_types
     assert "admin_session_started" in audit_types
+    player_audit = next(item for item in audit_payload["items"] if item["actorType"] == "player" and item["actorId"] == "player-1")
+    assert player_audit["resolvedActorName"] == "Alice"
+    assert any(item["playerId"] == "player-1" and item["username"] == "Alice" for item in audit_payload["playerIdentityMappings"])
 
 
 @pytest.mark.asyncio
@@ -465,6 +469,7 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         await app_runtime.admin_store.record_player_activity("player-1", "room-admin-test")
         await app_runtime.admin_traffic_service.record(channel="player", direction="ingress", byte_count=1024)
         await app_runtime.admin_traffic_service.flush_pending()
+        await app_runtime.admin_store.upsert_player_identity("player-2", "Bob")
         current_local = app_runtime.admin_store.local_datetime().replace(second=0, microsecond=0)
         daily_start = (current_local - timedelta(days=2)).strftime("%Y-%m-%d")
         hourly_start = current_local.replace(minute=0).strftime("%Y-%m-%dT%H:%M:%S")
@@ -510,6 +515,7 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         assert bootstrap_payload["hourlyMetrics"]["startAt"] == hourly_start
         assert bootstrap_payload["trafficHistory"]["startAt"] == traffic_start
         assert "availableEventTypes" in bootstrap_payload["audit"]
+        assert any(item["playerId"] == "player-2" and item["username"] == "Bob" for item in bootstrap_payload["audit"]["playerIdentityMappings"])
 
         app_runtime.state.connections["player-2"] = _connected_websocket_stub()  # type: ignore[assignment]
         app_runtime.state.set_player_room("player-2", "room-admin-test")

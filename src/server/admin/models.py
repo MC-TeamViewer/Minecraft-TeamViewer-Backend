@@ -46,14 +46,22 @@ class AuditEventItem(TypedDict):
     eventType: str
     actorType: str
     actorId: str | None
+    resolvedActorName: str | None
     roomCode: str | None
     success: bool
     remoteAddr: str | None
     detail: dict
 
 
+class PlayerIdentityMappingItem(TypedDict):
+    playerId: str
+    username: str
+    updatedAt: int
+
+
 class AuditPayload(TypedDict):
     items: list[AuditEventItem]
+    playerIdentityMappings: list[PlayerIdentityMappingItem]
     nextBeforeId: int | None
     limit: int
     availableEventTypes: list[str]

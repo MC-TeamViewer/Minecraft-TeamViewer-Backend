@@ -65,14 +65,22 @@ export interface AuditItem {
   eventType: string;
   actorType: string;
   actorId: string | null;
+  resolvedActorName: string | null;
   roomCode: string | null;
   success: boolean;
   remoteAddr: string | null;
   detail: AuditDetail;
 }
 
+export interface PlayerIdentityMapping {
+  playerId: string;
+  username: string;
+  updatedAt: number;
+}
+
 export interface AuditPayload {
   items: AuditItem[];
+  playerIdentityMappings: PlayerIdentityMapping[];
   nextBeforeId: number | null;
   limit: number;
   availableEventTypes: string[];

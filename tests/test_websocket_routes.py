@@ -29,6 +29,7 @@ if str(BACKEND_SRC) not in sys.path:
 from main import app
 from server.app import runtime as app_runtime
 from server.core.codec import ProtobufMessageCodec
+from server.proto_generated.teamviewer.v1 import teamviewer_pb2
 from server.ws import routes as ws_routes
 from server.ws.io import truncate_websocket_close_reason
 
@@ -96,6 +97,32 @@ def decode_packet(payload: bytes) -> dict:
 
 def decode_legacy_msgpack_packet(payload: bytes) -> dict:
     return msgpack.unpackb(payload, raw=False)
+
+
+def build_players_replace_bundle(
+    *,
+    submit_player_id: str,
+    players: dict[str, dict[str, object]],
+) -> bytes:
+    envelope = teamviewer_pb2.WireEnvelope(channel=teamviewer_pb2.WIRE_CHANNEL_PLAYER)
+    bundle = envelope.player_report_bundle
+    bundle.submit_player_id = submit_player_id
+    for player_id, player_data in players.items():
+        bundle.players_replace.players[player_id].CopyFrom(teamviewer_pb2.PlayerData(**player_data))
+    return envelope.SerializeToString()
+
+
+def build_players_patch_bundle(
+    *,
+    submit_player_id: str,
+    upsert: dict[str, dict[str, object]],
+) -> bytes:
+    envelope = teamviewer_pb2.WireEnvelope(channel=teamviewer_pb2.WIRE_CHANNEL_PLAYER)
+    bundle = envelope.player_report_bundle
+    bundle.submit_player_id = submit_player_id
+    for player_id, player_data in upsert.items():
+        bundle.players_patch.upsert.add(id=player_id, data=teamviewer_pb2.PlayerDelta(**player_data))
+    return envelope.SerializeToString()
 
 
 def test_truncate_websocket_close_reason_limits_utf8_bytes() -> None:
@@ -295,3 +322,133 @@ async def test_web_map_route_does_not_register_connection_before_handshake_ack_s
     await asyncio.sleep(0.1)
     assert not app_runtime.state.web_map_connections
     assert not app_runtime.state.web_map_connection_rooms
+
+
+@pytest.mark.asyncio
+async def test_player_route_learns_identity_from_players_replace_bundle(live_server: str) -> None:
+    submit_player_id = "00000000-0000-0000-0000-000000000201"
+
+    async with websockets.connect(f"{live_server}/mc-client") as websocket:
+        await websocket.send(build_handshake(channel="player", submit_player_id=submit_player_id))
+        handshake_ack = decode_packet(await asyncio.wait_for(websocket.recv(), timeout=5.0))
+        assert handshake_ack["type"] == "handshake_ack"
+        assert handshake_ack.get("ready") is True
+        snapshot_full = decode_packet(await asyncio.wait_for(websocket.recv(), timeout=5.0))
+        assert snapshot_full["type"] == "snapshot_full"
+
+        await websocket.send(
+            build_players_replace_bundle(
+                submit_player_id=submit_player_id,
+                players={
+                    submit_player_id: {
+                        "x": 1.0,
+                        "y": 64.0,
+                        "z": 2.0,
+                        "dimension": "minecraft:overworld",
+                        "player_name": "Alice",
+                        "player_uuid": submit_player_id,
+                    },
+                    "00000000-0000-0000-0000-000000000999": {
+                        "x": 3.0,
+                        "y": 64.0,
+                        "z": 4.0,
+                        "dimension": "minecraft:overworld",
+                        "player_name": "Mallory",
+                        "player_uuid": "00000000-0000-0000-0000-000000000999",
+                    },
+                },
+            )
+        )
+        await asyncio.sleep(0.2)
+        await asyncio.wait_for(websocket.close(), timeout=5.0)
+
+    audit_rows = app_runtime.admin_store._fetchall_sync(  # noqa: SLF001
+        """
+        SELECT actor_id
+        FROM audit_events
+        WHERE event_type = 'player_handshake_success' AND actor_id = ?
+        ORDER BY id DESC
+        """,
+        (submit_player_id,),
+    )
+    identity_rows = app_runtime.admin_store._fetchall_sync(  # noqa: SLF001
+        """
+        SELECT player_id, username
+        FROM player_identity_mappings
+        WHERE player_id = ?
+        ORDER BY updated_at DESC
+        """,
+        (submit_player_id,),
+    )
+
+    assert audit_rows
+    assert audit_rows[0]["actor_id"] == submit_player_id
+    assert identity_rows
+    assert identity_rows[0]["player_id"] == submit_player_id
+    assert identity_rows[0]["username"] == "Alice"
+    assert identity_rows[0]["username"] != "Mallory"
+
+
+@pytest.mark.asyncio
+async def test_player_route_learns_identity_from_players_patch_bundle(live_server: str) -> None:
+    submit_player_id = "00000000-0000-0000-0000-000000000202"
+
+    async with websockets.connect(f"{live_server}/mc-client") as websocket:
+        await websocket.send(build_handshake(channel="player", submit_player_id=submit_player_id))
+        handshake_ack = decode_packet(await asyncio.wait_for(websocket.recv(), timeout=5.0))
+        assert handshake_ack["type"] == "handshake_ack"
+        assert handshake_ack.get("ready") is True
+        snapshot_full = decode_packet(await asyncio.wait_for(websocket.recv(), timeout=5.0))
+        assert snapshot_full["type"] == "snapshot_full"
+
+        await websocket.send(
+            build_players_replace_bundle(
+                submit_player_id=submit_player_id,
+                players={
+                    submit_player_id: {
+                        "x": 1.0,
+                        "y": 64.0,
+                        "z": 2.0,
+                        "dimension": "minecraft:overworld",
+                    }
+                },
+            )
+        )
+        await websocket.send(
+            build_players_patch_bundle(
+                submit_player_id=submit_player_id,
+                upsert={
+                    submit_player_id: {
+                        "player_name": "Bob",
+                        "player_uuid": submit_player_id,
+                    }
+                },
+            )
+        )
+        await asyncio.sleep(0.2)
+        await asyncio.wait_for(websocket.close(), timeout=5.0)
+
+    audit_rows = app_runtime.admin_store._fetchall_sync(  # noqa: SLF001
+        """
+        SELECT actor_id
+        FROM audit_events
+        WHERE event_type = 'player_handshake_success' AND actor_id = ?
+        ORDER BY id DESC
+        """,
+        (submit_player_id,),
+    )
+    identity_rows = app_runtime.admin_store._fetchall_sync(  # noqa: SLF001
+        """
+        SELECT player_id, username
+        FROM player_identity_mappings
+        WHERE player_id = ?
+        ORDER BY updated_at DESC
+        """,
+        (submit_player_id,),
+    )
+
+    assert audit_rows
+    assert audit_rows[0]["actor_id"] == submit_player_id
+    assert identity_rows
+    assert identity_rows[0]["player_id"] == submit_player_id
+    assert identity_rows[0]["username"] == "Bob"

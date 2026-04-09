@@ -113,6 +113,37 @@ async def record_player_activity(
         runtime.logger.warning("Failed to persist player activity playerId=%s: %s", player_id, exc)
 
 
+async def record_player_identity(
+    player_id: str | None,
+    username: str | None,
+    *,
+    occurred_at: float | None = None,
+) -> None:
+    if runtime.admin_store is None:
+        return
+
+    normalized_player_id = str(player_id or "").strip()
+    normalized_username = str(username or "").strip()
+    if not normalized_player_id or not normalized_username:
+        return
+
+    try:
+        changed = await runtime.admin_store.upsert_player_identity(
+            normalized_player_id,
+            normalized_username,
+            occurred_at=occurred_at,
+        )
+        if changed:
+            trigger_admin_sse_audit()
+    except Exception as exc:
+        runtime.logger.warning(
+            "Failed to persist player identity playerId=%s username=%s: %s",
+            normalized_player_id,
+            normalized_username,
+            exc,
+        )
+
+
 def admin_unauthorized_response(detail: str = "admin_session_required") -> JSONResponse:
     return JSONResponse({"detail": detail}, status_code=401)
 
