@@ -143,12 +143,12 @@ async def test_admin_page_is_public_but_api_requires_session(monkeypatch: pytest
             page = await client.get("/admin")
             overview = await client.get("/admin/api/overview")
             events = await client.get("/admin/api/events")
+            assert page.status_code == 200, page.text
+            assert "TeamViewRelay Admin" in page.text
             asset_match = re.search(r"/admin/assets/[^\"']+", page.text)
             assert asset_match is not None
             asset_response = await client.get(asset_match.group(0))
 
-    assert page.status_code == 200
-    assert "TeamViewRelay Admin" in page.text
     assert asset_response.status_code == 200
     assert overview.status_code == 401
     assert events.status_code == 401
@@ -246,6 +246,8 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
             hourly_traffic = await client.get("/admin/api/traffic/hourly?hours=2")
             daily_traffic = await client.get("/admin/api/traffic/daily?days=2")
             audit = await client.get("/admin/api/audit?limit=200&success=true")
+            assert page.status_code == 200, page.text
+            assert "TeamViewRelay Admin" in page.text
             asset_match = re.search(r"/admin/assets/[^\"']+", page.text)
             assert asset_match is not None
             asset_response = await client.get(asset_match.group(0))
@@ -260,8 +262,6 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
     audit_payload = audit.json()
     audit_types = {item["eventType"] for item in audit_payload["items"]}
 
-    assert page.status_code == 200
-    assert "TeamViewRelay Admin" in page.text
     assert asset_response.status_code == 200
 
     assert overview.status_code == 200

@@ -34,11 +34,23 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Generate protobuf bindings
         run: ./scripts/generate_proto_python.sh
 
       - name: Install dependencies
         run: uv sync --extra dev --extra test
+
+      - name: Build admin UI
+        working-directory: admin-ui
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm build
 
       - name: Run tests
         run: UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q
