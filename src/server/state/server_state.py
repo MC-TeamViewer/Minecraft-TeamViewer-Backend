@@ -330,6 +330,9 @@ class ServerState:
         color_mode = str(normalized.get("colorMode") or "").strip()
         if not color_mode:
             normalized["colorMode"] = self.BATTLE_CHUNK_COLOR_MODE_RAW_OBSERVED
+        battle_map_mode = str(normalized.get("mode") or "").strip().lower()
+        if battle_map_mode not in {"nodemc", "simmc"}:
+            normalized["mode"] = "nodemc"
         validated = BattleChunkData(**normalized).model_dump()
         if not include_meta:
             for field_name in ("observedAt", "positionSampledAt", "alignmentSource", "reporterId"):
@@ -795,6 +798,7 @@ class ServerState:
         base_chunk_x: int,
         base_chunk_z: int,
         cells: list[dict],
+        mode: str,
     ) -> dict[str, dict]:
         projected: dict[str, dict] = {}
         for cell in cells:
@@ -817,6 +821,7 @@ class ServerState:
                 "roomCode": room_code,
                 "colorMode": self.BATTLE_CHUNK_COLOR_MODE_RAW_OBSERVED,
                 "colorSemanticKey": None,
+                "mode": mode,
             }
         return projected
 
@@ -896,6 +901,7 @@ class ServerState:
                 candidate["baseChunkX"],
                 candidate["baseChunkZ"],
                 cells,
+                "nodemc",
             )
             score = 0
             for chunk_id, cell in projected.items():
@@ -924,6 +930,7 @@ class ServerState:
         self,
         submit_player_id: str,
         room_code: str,
+        mode: str | None,
         dimension: str,
         map_size: int,
         anchor_row: int,
@@ -937,6 +944,9 @@ class ServerState:
         now = time.time() if current_time is None else float(current_time)
         normalized_room = self.normalize_room_code(room_code)
         normalized_dimension = str(dimension or "").strip() or "minecraft:overworld"
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode not in {"nodemc", "simmc"}:
+            normalized_mode = "nodemc"
 
         normalized_candidates: list[dict] = []
         seen_candidate_keys: set[tuple[int, int, str]] = set()
@@ -1000,6 +1010,7 @@ class ServerState:
             chosen_candidate["baseChunkX"],
             chosen_candidate["baseChunkZ"],
             normalized_cells,
+            normalized_mode,
         )
         semantic_hash = self.build_battle_chunk_semantic_projection_hash(projected)
         previous_projected_chunk_ids = set()

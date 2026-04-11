@@ -117,6 +117,7 @@ def test_apply_battle_map_observation_computes_semantic_hash_without_name_error(
     result = state.apply_battle_map_observation(
         submit_player_id="player-1",
         room_code="room-a",
+        mode="nodemc",
         dimension="minecraft:overworld",
         map_size=3,
         anchor_row=0,
@@ -145,3 +146,58 @@ def test_apply_battle_map_observation_computes_semantic_hash_without_name_error(
     assert result["accepted"] is True
     assert result["upserted"] == 1
     assert state.battle_map_reporter_state["player-1"]["lastSemanticProjectionHash"]
+
+
+def test_apply_battle_map_observation_preserves_simmc_mode_and_core_symbol_compatibility() -> None:
+    state = ServerState()
+
+    result = state.apply_battle_map_observation(
+        submit_player_id="player-1",
+        room_code="room-a",
+        mode="simmc",
+        dimension="minecraft:overworld",
+        map_size=3,
+        anchor_row=0,
+        anchor_col=0,
+        snapshot_observed_at=123456,
+        parsed_at=123460,
+        candidates=[
+            {
+                "baseChunkX": 12,
+                "baseChunkZ": 34,
+                "positionSampledAt": 123450,
+                "source": "history_primary",
+            }
+        ],
+        cells=[
+            {
+                "relChunkX": 0,
+                "relChunkZ": 0,
+                "symbol": "╫",
+                "colorRaw": "#ff0000",
+            }
+        ],
+        current_time=1.0,
+    )
+
+    chunk_report = state.battle_chunk_reports["room-a|minecraft:overworld|12|34"]["player-1"]["data"]
+
+    assert result["accepted"] is True
+    assert chunk_report["mode"] == "simmc"
+    assert chunk_report["markerType"] == "war_core"
+
+
+def test_build_battle_chunk_sync_data_defaults_legacy_mode_to_nodemc() -> None:
+    state = ServerState()
+
+    normalized = state.build_battle_chunk_sync_data(
+        {
+            "chunkX": 1,
+            "chunkZ": 2,
+            "dimension": "minecraft:overworld",
+            "colorRaw": "#112233",
+        },
+        include_meta=False,
+    )
+
+    assert normalized["mode"] == "nodemc"

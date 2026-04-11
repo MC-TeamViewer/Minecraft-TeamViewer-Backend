@@ -9,7 +9,7 @@ from ..core.codec import ProtobufMessageCodec
 from ..state import ServerState
 
 
-NETWORK_PROTOCOL_VERSION = "0.6.1"
+NETWORK_PROTOCOL_VERSION = "0.6.2"
 SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.6.1"
 SERVER_PROGRAM_VERSION = "team-view-relay-server-dev"
 LEGACY_PROTOCOL_REJECTION_REASON = (

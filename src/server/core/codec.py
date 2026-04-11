@@ -87,6 +87,7 @@ def _message_to_value(value: Any) -> Any:
 
 def _battle_map_observation_to_plain_dict(message: Message) -> dict[str, Any]:
     return {
+        "mode": getattr(message, "mode", "") or None,
         "dimension": message.dimension,
         "mapSize": message.map_size,
         "anchorRow": message.anchor_row,
@@ -198,6 +199,7 @@ def _battle_chunk_value_from_data(
         ("roomCode", "roomCode"),
         ("colorMode", "colorMode"),
         ("colorSemanticKey", "colorSemanticKey"),
+        ("mode", "mode"),
     ):
         raw = data.get(source_key)
         if raw is not None:

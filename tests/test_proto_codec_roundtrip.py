@@ -98,6 +98,7 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
                         "chunkX": 1,
                         "chunkZ": 2,
                         "colorRaw": "#112233",
+                        "mode": "simmc",
                     }
                 },
             }
@@ -106,6 +107,7 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
     assert snapshot_full["type"] == "snapshot_full"
     assert snapshot_full["players"]["player-1"]["dimension"] == "minecraft:overworld"
     assert snapshot_full["battleChunks"]["minecraft:overworld|1|2"]["colorRaw"] == "#112233"
+    assert snapshot_full["battleChunks"]["minecraft:overworld|1|2"]["mode"] == "simmc"
 
     patch = CODEC.decode(
         CODEC.encode(
@@ -127,6 +129,7 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
                             "chunkX": 1,
                             "chunkZ": 2,
                             "colorRaw": "#445566",
+                            "mode": "nodemc",
                         }
                     },
                     "delete": ["minecraft:overworld|2|3"],
@@ -138,6 +141,7 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
     assert patch["_payload_case"] == "patch"
     assert patch["players"]["delete"] == ["player-2"]
     assert patch["battleChunks"]["delete"] == ["minecraft:overworld|2|3"]
+    assert patch["battleChunks"]["upsert"]["minecraft:overworld|1|2"]["mode"] == "nodemc"
 
     digest = CODEC.decode(CODEC.encode({"type": "digest", "hashes": {"players": "a", "entities": "b", "waypoints": "c"}}))
     assert digest["type"] == "digest"
@@ -228,6 +232,7 @@ def test_player_outbound_digest_view_matches_client_visible_battle_chunk_shape()
                 "roomCode": "default",
                 "colorMode": "raw_observed",
                 "colorSemanticKey": None,
+                "mode": "simmc",
             }
         },
     }
@@ -245,4 +250,5 @@ def test_player_outbound_digest_view_matches_client_visible_battle_chunk_shape()
         "colorRaw": "#112233",
         "roomCode": "default",
         "colorMode": "raw_observed",
+        "mode": "simmc",
     }

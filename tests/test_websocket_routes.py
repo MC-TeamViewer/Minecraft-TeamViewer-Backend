@@ -74,7 +74,7 @@ def live_server() -> str:
 def build_handshake(
     *,
     channel: str,
-    protocol_version: str = "0.6.1",
+    protocol_version: str = "0.6.2",
     room_code: str = "test-room",
     submit_player_id: str | None = None,
 ) -> bytes:
@@ -213,8 +213,25 @@ async def test_adminws_alias_accepts_web_map_handshake_and_logs_deprecation(
 
     assert handshake_ack["type"] == "handshake_ack"
     assert handshake_ack.get("ready") is True
+    assert handshake_ack.get("networkProtocolVersion") == "0.6.2"
+    assert handshake_ack.get("minimumCompatibleNetworkProtocolVersion") == "0.6.1"
     assert snapshot_full["type"] == "snapshot_full"
     assert "Deprecated websocket route /adminws used" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_web_map_route_accepts_061_client_with_062_backend(live_server: str) -> None:
+    async with websockets.connect(f"{live_server}/web-map/ws") as websocket:
+        await websocket.send(build_handshake(channel="web_map", protocol_version="0.6.1"))
+
+        handshake_ack = decode_packet(await asyncio.wait_for(websocket.recv(), timeout=5.0))
+        snapshot_full = decode_packet(await asyncio.wait_for(websocket.recv(), timeout=5.0))
+
+    assert handshake_ack["type"] == "handshake_ack"
+    assert handshake_ack.get("ready") is True
+    assert handshake_ack.get("networkProtocolVersion") == "0.6.2"
+    assert handshake_ack.get("minimumCompatibleNetworkProtocolVersion") == "0.6.1"
+    assert snapshot_full["type"] == "snapshot_full"
 
 
 @pytest.mark.asyncio

@@ -39,6 +39,7 @@ def test_codec_decodes_bundle_nested_messages_with_internal_types() -> None:
     envelope.player_report_bundle.battle_map_observation.anchor_col = 0
     envelope.player_report_bundle.battle_map_observation.snapshot_observed_at = 123
     envelope.player_report_bundle.battle_map_observation.parsed_at = 456
+    envelope.player_report_bundle.battle_map_observation.mode = "simmc"
 
     decoded = codec.decode(envelope.SerializeToString())
 
@@ -47,3 +48,4 @@ def test_codec_decodes_bundle_nested_messages_with_internal_types() -> None:
     assert decoded["sourceStateClear"]["scopes"] == ["players", "entities"]
     assert decoded["battleMapObservation"]["type"] == "battle_map_observation"
     assert decoded["battleMapObservation"]["dimension"] == "minecraft:overworld"
+    assert decoded["battleMapObservation"]["mode"] == "simmc"

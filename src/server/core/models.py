@@ -82,6 +82,7 @@ class BattleChunkData(BaseModel):
     roomCode: Optional[str] = Field(default=None, description="房间号", json_schema_extra={"reliableTransport": True})
     colorMode: Optional[str] = Field(default=None, description="颜色解释模式", json_schema_extra={"reliableTransport": True})
     colorSemanticKey: Optional[str] = Field(default=None, description="颜色语义键", json_schema_extra={"reliableTransport": True})
+    mode: Optional[str] = Field(default=None, description="战局地图来源模式", json_schema_extra={"reliableTransport": True})
     observedAt: Optional[int] = Field(default=None, description="客户端观测时间(ms)", json_schema_extra={"reliableTransport": True})
     positionSampledAt: Optional[int] = Field(default=None, description="用于对齐的本地位置采样时间(ms)", json_schema_extra={"reliableTransport": True})
     alignmentSource: Optional[str] = Field(default=None, description="绝对定位对齐来源", json_schema_extra={"reliableTransport": True})

@@ -160,6 +160,7 @@ class WaypointsEntityDeathCancelPacket(PacketModel):
 class BattleMapObservationPacket(PacketModel):
     type: Literal["battle_map_observation"]
     submitPlayerId: str | None = None
+    mode: str | None = None
     dimension: str
     mapSize: int
     anchorRow: int

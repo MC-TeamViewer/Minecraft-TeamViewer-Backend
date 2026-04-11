@@ -970,6 +970,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     result = runtime.state.apply_battle_map_observation(
                         submit_player_id=submit_player_id,
                         room_code=runtime.state.get_player_room(submit_player_id),
+                        mode=expanded_packet.mode,
                         dimension=expanded_packet.dimension,
                         map_size=expanded_packet.mapSize,
                         anchor_row=expanded_packet.anchorRow,
