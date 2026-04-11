@@ -216,6 +216,24 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
         await app_runtime.admin_traffic_service.record(channel="player", direction="ingress", byte_count=2048)
         await app_runtime.admin_traffic_service.record(channel="web_map", direction="egress", byte_count=1024)
         await app_runtime.admin_traffic_service.flush_pending()
+        current_local = app_runtime.admin_store.local_datetime().replace(second=0, microsecond=0)
+        current_minute = current_local.strftime("%Y-%m-%dT%H:%M:00")
+        current_hour = current_local.replace(minute=0).strftime("%Y-%m-%dT%H:00:00")
+        current_day = current_local.strftime("%Y-%m-%d")
+        await app_runtime.admin_store.apply_traffic_increments(
+            minute_increments={
+                ("application", current_minute, "player", "ingress"): 2048,
+                ("application", current_minute, "web_map", "egress"): 1024,
+            },
+            hourly_increments={
+                ("application", current_hour, "player", "ingress"): 2048,
+                ("application", current_hour, "web_map", "egress"): 1024,
+            },
+            daily_increments={
+                ("application", current_day, "player", "ingress"): 2048,
+                ("application", current_day, "web_map", "egress"): 1024,
+            },
+        )
 
         app_runtime.state.connections["player-1"] = _connected_websocket_stub()  # type: ignore[assignment]
         app_runtime.state.set_player_room("player-1", "room-admin-test")
