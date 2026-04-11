@@ -124,11 +124,11 @@ class AdminPayloadService:
             builder=self._build_live_traffic,
         )
 
-    async def build_hourly_traffic_payload(self, *, hours: int = 48) -> dict[str, Any]:
+    async def build_hourly_traffic_payload(self, *, hours: int = 48, start_at: str | None = None) -> dict[str, Any]:
         return await self._get_cached_payload(
-            ("hourly_traffic", (("hours", hours),)),
+            ("hourly_traffic", (("hours", hours), ("start_at", start_at))),
             ttl_sec=1.0,
-            builder=lambda: self._store.query_hourly_traffic(hours=hours),
+            builder=lambda: self._store.query_hourly_traffic(hours=hours, start_at=start_at),
         )
 
     async def build_daily_traffic_payload(self, *, days: int = 30) -> dict[str, Any]:

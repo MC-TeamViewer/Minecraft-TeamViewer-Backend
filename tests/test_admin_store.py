@@ -112,6 +112,36 @@ async def test_metrics_queries_support_explicit_start_date_and_start_at(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_hourly_traffic_query_supports_explicit_start_at(tmp_path: Path) -> None:
+    store = AdminStore(AdminStoreConfig(db_path=str(tmp_path / "traffic-hourly-start.db")))
+    await store.initialize()
+    try:
+        base = _local_base(8, 37)
+        aligned_start = base.replace(minute=0, second=0, microsecond=0)
+        await store.apply_traffic_increments(
+            minute_increments={},
+            hourly_increments={
+                ("application", aligned_start.strftime("%Y-%m-%dT%H:00:00"), "player", "ingress"): 2048,
+                ("application", aligned_start.strftime("%Y-%m-%dT%H:00:00"), "web_map", "egress"): 1024,
+            },
+            daily_increments={},
+        )
+
+        hourly = await store.query_hourly_traffic(hours=2, start_at=base.strftime("%Y-%m-%dT%H:%M:%S"))
+
+        assert hourly["startAt"] == aligned_start.strftime("%Y-%m-%dT%H:00:00")
+        assert [item["bucket"] for item in hourly["items"]] == [
+            aligned_start.strftime("%Y-%m-%dT%H:00:00"),
+            (aligned_start + timedelta(hours=1)).strftime("%Y-%m-%dT%H:00:00"),
+        ]
+        assert hourly["items"][0]["totalBytes"] == 3072
+        assert hourly["items"][1]["totalBytes"] == 0
+        assert hourly["totalBytes"] == 3072
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_audit_query_supports_filters_and_pagination(tmp_path: Path) -> None:
     store = AdminStore(AdminStoreConfig(db_path=str(tmp_path / "audit.db")))
     await store.initialize()

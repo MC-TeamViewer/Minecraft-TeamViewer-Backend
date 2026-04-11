@@ -421,13 +421,17 @@ async def admin_traffic_history(
 async def admin_hourly_traffic(
     request: Request,
     hours: int = Query(default=48, ge=1, le=240),
+    startAt: str | None = None,
 ):
     auth_result = await authenticate_admin_request(request)
     if isinstance(auth_result, JSONResponse):
         return auth_result
     await record_admin_access(request, auth_result, "admin_api_access")
+    normalized_start_at, start_error = _normalize_local_start_at_or_response(startAt)
+    if start_error is not None:
+        return start_error
     try:
-        return JSONResponse(await build_admin_hourly_traffic_payload(hours=hours))
+        return JSONResponse(await build_admin_hourly_traffic_payload(hours=hours, start_at=normalized_start_at))
     except Exception:
         runtime.admin_runtime_stats["apiErrors"] += 1
         raise

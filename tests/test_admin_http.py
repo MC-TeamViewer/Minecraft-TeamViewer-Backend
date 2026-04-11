@@ -261,7 +261,7 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
             hourly = await client.get("/admin/api/metrics/hourly?hours=3")
             live_traffic = await client.get("/admin/api/traffic/live")
             history_traffic = await client.get("/admin/api/traffic/history?range=6h&granularity=5m")
-            hourly_traffic = await client.get("/admin/api/traffic/hourly?hours=2")
+            hourly_traffic = await client.get(f"/admin/api/traffic/hourly?hours=2&startAt={current_hour}")
             daily_traffic = await client.get("/admin/api/traffic/daily?days=2")
             audit = await client.get("/admin/api/audit?limit=200&success=true")
             assert page.status_code == 200, page.text
@@ -304,6 +304,7 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
     assert history_traffic_payload["selectedLayer"] == "application"
     assert history_traffic_payload["application"]["totalBytes"] >= 3072
     assert history_traffic_payload["wire"]["totalBytes"] == 0
+    assert hourly_traffic_payload["startAt"] == current_hour
     assert hourly_traffic_payload["totalBytes"] >= 3072
     assert daily_traffic_payload["totalBytes"] >= 3072
 
@@ -393,7 +394,9 @@ async def test_admin_traffic_http_totals_include_previous_buckets_when_latest_bu
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             await _login(client)
             history_traffic = await client.get("/admin/api/traffic/history?range=6h&granularity=5m")
-            hourly_traffic = await client.get("/admin/api/traffic/hourly?hours=2")
+            hourly_traffic = await client.get(
+                f"/admin/api/traffic/hourly?hours=2&startAt={previous_hour.strftime('%Y-%m-%dT%H:%M:%S')}"
+            )
 
     history_payload = history_traffic.json()
     hourly_payload = hourly_traffic.json()
@@ -413,6 +416,20 @@ async def test_admin_traffic_http_totals_include_previous_buckets_when_latest_bu
         item["bucket"] == previous_hour.strftime("%Y-%m-%dT%H:00:00") and item["totalBytes"] == 3072
         for item in hourly_payload["items"]
     )
+
+
+@pytest.mark.asyncio
+async def test_admin_hourly_traffic_rejects_invalid_start_at(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    main = _load_main_module(monkeypatch, tmp_path)
+
+    async with main.app.router.lifespan_context(main.app):
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            await _login(client)
+            response = await client.get("/admin/api/traffic/hourly?hours=2&startAt=not-a-date")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "invalid_start_at"
 
 
 @pytest.mark.asyncio

@@ -437,8 +437,8 @@ async def build_admin_live_traffic_payload() -> dict:
     return await ensure_admin_payload_service().build_live_traffic_payload()
 
 
-async def build_admin_hourly_traffic_payload(hours: int = 48) -> dict:
-    return await ensure_admin_payload_service().build_hourly_traffic_payload(hours=hours)
+async def build_admin_hourly_traffic_payload(hours: int = 48, start_at: str | None = None) -> dict:
+    return await ensure_admin_payload_service().build_hourly_traffic_payload(hours=hours, start_at=start_at)
 
 
 async def build_admin_daily_traffic_payload(days: int = 30) -> dict:

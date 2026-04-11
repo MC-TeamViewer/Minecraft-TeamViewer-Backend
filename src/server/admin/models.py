@@ -120,6 +120,7 @@ class TrafficMetricsPayload(TypedDict):
     totalBytes: int
     days: NotRequired[int]
     hours: NotRequired[int]
+    startAt: NotRequired[str | None]
     serverTime: NotRequired[float]
 
 

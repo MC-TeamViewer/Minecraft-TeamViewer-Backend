@@ -693,9 +693,22 @@ class AdminStore:
             "items": [{"bucket": label, "label": label, "activePlayers": counts[label]} for label in labels],
         }
 
-    async def query_hourly_traffic(self, *, hours: int, scope: str = "application") -> dict[str, Any]:
-        end_dt = self._local_datetime().replace(minute=0, second=0, microsecond=0)
-        start_dt = end_dt - timedelta(hours=max(hours - 1, 0))
+    async def query_hourly_traffic(
+        self,
+        *,
+        hours: int,
+        scope: str = "application",
+        start_at: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_start_at = self.normalize_local_datetime(start_at)
+        if normalized_start_at is not None:
+            start_dt = self._floor_datetime(
+                datetime.strptime(normalized_start_at, "%Y-%m-%dT%H:%M:%S"),
+                60 * 60,
+            )
+        else:
+            end_dt = self._local_datetime().replace(minute=0, second=0, microsecond=0)
+            start_dt = end_dt - timedelta(hours=max(hours - 1, 0))
         labels = [(start_dt + timedelta(hours=index)).strftime("%Y-%m-%dT%H:00:00") for index in range(hours)]
         table_name = self._traffic_table_name(scope=scope, bucket_kind="hourly")
         rows = await self._fetchall(
@@ -707,7 +720,12 @@ class AdminStore:
             """,
             (labels[0], labels[-1]),
         )
-        return self._build_traffic_payload(labels=labels, rows=rows, hours=hours)
+        return self._build_traffic_payload(
+            labels=labels,
+            rows=rows,
+            hours=hours,
+            start_at=self._format_local_datetime(start_dt) if normalized_start_at is not None else None,
+        )
 
     async def query_daily_traffic(self, *, days: int, scope: str = "application") -> dict[str, Any]:
         end_dt = self._local_datetime()
