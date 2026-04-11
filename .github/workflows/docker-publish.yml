@@ -26,7 +26,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false
+
+      - name: Sync protocol submodule
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            echo "Submodule sync attempt ${attempt}"
+            git submodule sync --recursive
+            if git -c protocol.version=2 submodule update --init --force --depth=1 --recursive; then
+              test -d third_party/TeamViewRelay-Protocol/proto
+              git submodule status
+              exit 0
+            fi
+            if [[ "${attempt}" -eq 5 ]]; then
+              echo "Submodule update failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+            rm -rf third_party/TeamViewRelay-Protocol
+            sleep $((attempt * 5))
+          done
 
       - name: Set up Buf
         uses: bufbuild/buf-setup-action@v1
@@ -66,7 +86,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false
+
+      - name: Sync protocol submodule
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            echo "Submodule sync attempt ${attempt}"
+            git submodule sync --recursive
+            if git -c protocol.version=2 submodule update --init --force --depth=1 --recursive; then
+              test -d third_party/TeamViewRelay-Protocol/proto
+              git submodule status
+              exit 0
+            fi
+            if [[ "${attempt}" -eq 5 ]]; then
+              echo "Submodule update failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+            rm -rf third_party/TeamViewRelay-Protocol
+            sleep $((attempt * 5))
+          done
 
       - name: Set up Buf
         uses: bufbuild/buf-setup-action@v1
