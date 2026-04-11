@@ -284,9 +284,9 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
     assert history_traffic_payload["range"] == "6h"
     assert history_traffic_payload["granularity"] == "5m"
     assert history_traffic_payload["selectedLayer"] == "application"
-    assert history_traffic_payload["application"]["items"][-1]["totalBytes"] >= 3072
+    assert history_traffic_payload["application"]["totalBytes"] >= 3072
     assert history_traffic_payload["wire"]["totalBytes"] == 0
-    assert hourly_traffic_payload["items"][-1]["totalBytes"] >= 3072
+    assert hourly_traffic_payload["totalBytes"] >= 3072
     assert daily_traffic_payload["totalBytes"] >= 3072
 
     assert audit.status_code == 200
@@ -339,6 +339,62 @@ async def test_admin_traffic_history_exposes_distinct_application_and_wire_layer
     assert payload["application"]["totalBytes"] == 5000
     assert payload["wire"]["totalBytes"] == 2300
     assert payload["application"]["items"] != payload["wire"]["items"]
+
+
+@pytest.mark.asyncio
+async def test_admin_traffic_http_totals_include_previous_buckets_when_latest_bucket_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    main = _load_main_module(monkeypatch, tmp_path)
+
+    async with main.app.router.lifespan_context(main.app):
+        now_local = app_runtime.admin_store.local_datetime().replace(second=0, microsecond=0)
+        current_5m = now_local.replace(minute=(now_local.minute // 5) * 5)
+        previous_5m = current_5m - timedelta(minutes=5)
+        current_hour = now_local.replace(minute=0)
+        previous_hour = current_hour - timedelta(hours=1)
+        current_day = now_local.strftime("%Y-%m-%d")
+
+        await app_runtime.admin_store.apply_traffic_increments(
+            minute_increments={
+                ("application", previous_5m.strftime("%Y-%m-%dT%H:%M:00"), "player", "ingress"): 2048,
+                ("application", previous_5m.strftime("%Y-%m-%dT%H:%M:00"), "web_map", "egress"): 1024,
+            },
+            hourly_increments={
+                ("application", previous_hour.strftime("%Y-%m-%dT%H:00:00"), "player", "ingress"): 2048,
+                ("application", previous_hour.strftime("%Y-%m-%dT%H:00:00"), "web_map", "egress"): 1024,
+            },
+            daily_increments={
+                ("application", current_day, "player", "ingress"): 2048,
+                ("application", current_day, "web_map", "egress"): 1024,
+            },
+        )
+
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            await _login(client)
+            history_traffic = await client.get("/admin/api/traffic/history?range=6h&granularity=5m")
+            hourly_traffic = await client.get("/admin/api/traffic/hourly?hours=2")
+
+    history_payload = history_traffic.json()
+    hourly_payload = hourly_traffic.json()
+
+    assert history_traffic.status_code == 200
+    assert history_payload["application"]["totalBytes"] == 3072
+    assert history_payload["application"]["items"][-1]["totalBytes"] == 0
+    assert any(
+        item["bucket"] == previous_5m.strftime("%Y-%m-%dT%H:%M:00") and item["totalBytes"] == 3072
+        for item in history_payload["application"]["items"]
+    )
+
+    assert hourly_traffic.status_code == 200
+    assert hourly_payload["totalBytes"] == 3072
+    assert hourly_payload["items"][-1]["totalBytes"] == 0
+    assert any(
+        item["bucket"] == previous_hour.strftime("%Y-%m-%dT%H:00:00") and item["totalBytes"] == 3072
+        for item in hourly_payload["items"]
+    )
 
 
 @pytest.mark.asyncio
