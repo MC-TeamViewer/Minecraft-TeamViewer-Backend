@@ -334,8 +334,10 @@ def build_room_overview() -> list[dict]:
                 "roomCode": room_code,
                 "playerConnections": 0,
                 "webMapConnections": 0,
+                "externalSourceConnections": 0,
                 "playerIds": [],
                 "webMapIds": [],
+                "externalSourceIds": [],
             }
             room_index[room_code] = room
         return room
@@ -343,6 +345,10 @@ def build_room_overview() -> list[dict]:
     for player_id in sorted(runtime.state.connections.keys()):
         room_code = runtime.state.get_player_room(player_id)
         room = ensure_room(room_code)
+        if runtime.state.is_external_source(player_id):
+            room["externalSourceConnections"] += 1
+            room["externalSourceIds"].append(player_id)
+            continue
         room["playerConnections"] += 1
         room["playerIds"].append(player_id)
 
@@ -361,6 +367,26 @@ def build_connection_details() -> list[dict]:
     for player_id in sorted(runtime.state.connections.keys()):
         room_code = runtime.state.get_player_room(player_id)
         caps = runtime.state.connection_caps.get(player_id, {})
+        if runtime.state.is_external_source(player_id):
+            source_status = runtime.state.external_source_statuses.get(player_id, {})
+            details.append(
+                {
+                    "channel": "external_source",
+                    "actorId": player_id,
+                    "displayName": runtime.state.connection_display_names.get(player_id) or player_id,
+                    "roomCode": room_code,
+                    "protocolVersion": caps.get("protocol"),
+                    "programVersion": caps.get("programVersion"),
+                    "remoteAddr": caps.get("remoteAddr"),
+                    "connected": True,
+                    "health": source_status.get("health") or "EXTERNAL_SOURCE_HEALTH_STARTING",
+                    "failureCode": source_status.get("failureCode"),
+                    "statusReceivedAt": source_status.get("statusReceivedAt"),
+                    "lastHealthyAt": source_status.get("lastHealthyAt"),
+                }
+            )
+            continue
+
         player_node = runtime.state.players.get(player_id, {})
         player_data = player_node.get("data", {}) if isinstance(player_node, dict) else {}
         if not isinstance(player_data, dict):
@@ -376,6 +402,26 @@ def build_connection_details() -> list[dict]:
                 "protocolVersion": caps.get("protocol"),
                 "programVersion": caps.get("programVersion"),
                 "remoteAddr": caps.get("remoteAddr"),
+            }
+        )
+
+    for source_id, record in runtime.state.disconnected_external_sources.items():
+        caps = record.get("capabilities", {}) if isinstance(record, dict) else {}
+        source_status = record.get("status", {}) if isinstance(record, dict) else {}
+        details.append(
+            {
+                "channel": "external_source",
+                "actorId": source_id,
+                "displayName": record.get("displayName") or source_id,
+                "roomCode": record.get("roomCode"),
+                "protocolVersion": caps.get("protocol"),
+                "programVersion": caps.get("programVersion"),
+                "remoteAddr": caps.get("remoteAddr"),
+                "connected": False,
+                "health": source_status.get("health") or "EXTERNAL_SOURCE_HEALTH_UNAVAILABLE",
+                "failureCode": source_status.get("failureCode"),
+                "statusReceivedAt": source_status.get("statusReceivedAt"),
+                "lastHealthyAt": source_status.get("lastHealthyAt"),
             }
         )
 

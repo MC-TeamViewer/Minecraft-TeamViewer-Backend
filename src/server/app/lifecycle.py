@@ -22,7 +22,7 @@ from ..admin.traffic import TrafficStatsService
 async def run_broadcast_scheduler() -> None:
     previous_hz: float | None = None
     while True:
-        tick_start = time.time()
+        tick_start = time.monotonic()
         try:
             current_hz = runtime.state.update_broadcast_hz_for_congestion()
             if previous_hz is None or abs(current_hz - previous_hz) > 1e-6:
@@ -48,7 +48,7 @@ async def run_broadcast_scheduler() -> None:
             )
 
         interval_sec = 1.0 / max(runtime.state.MIN_BROADCAST_HZ, runtime.state.broadcast_hz)
-        elapsed = time.time() - tick_start
+        elapsed = time.monotonic() - tick_start
         await asyncio.sleep(max(0.0, interval_sec - elapsed))
 
 

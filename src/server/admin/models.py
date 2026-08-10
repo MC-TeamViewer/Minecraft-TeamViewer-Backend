@@ -9,6 +9,8 @@ class RoomOverviewItem(TypedDict):
     webMapConnections: int
     playerIds: list[str]
     webMapIds: list[str]
+    externalSourceConnections: int
+    externalSourceIds: list[str]
 
 
 class ConnectionDetailItem(TypedDict):
@@ -19,6 +21,11 @@ class ConnectionDetailItem(TypedDict):
     protocolVersion: str | None
     programVersion: str | None
     remoteAddr: str | None
+    connected: NotRequired[bool]
+    health: NotRequired[str | None]
+    failureCode: NotRequired[str | None]
+    statusReceivedAt: NotRequired[float | None]
+    lastHealthyAt: NotRequired[float | None]
 
 
 class MetricItem(TypedDict):
@@ -148,6 +155,7 @@ class AdminSessionPayload(TypedDict):
 class OverviewPayload(TypedDict):
     playerConnections: int
     webMapConnections: int
+    externalSourceConnections: int
     activeRooms: int
     rooms: list[RoomOverviewItem]
     connectionDetails: list[ConnectionDetailItem]

@@ -9,6 +9,7 @@ from ..core.protocol import (
     BattleMapObservationPacket,
     EntitiesPatchPacket,
     EntitiesUpdatePacket,
+    ExternalSourceStatusPacket,
     HandshakeAckPacket,
     HandshakeHelpers,
     HandshakePacket,
@@ -267,7 +268,7 @@ def expand_player_packets(packet) -> list:
     submit_player_id = packet.submitPlayerId
     expanded: list = []
 
-    if packet.playersReplace:
+    if packet.playersReplace is not None:
         expanded.append(
             PlayersUpdatePacket(
                 type="players_update",
@@ -284,7 +285,7 @@ def expand_player_packets(packet) -> list:
                 delete=packet.playersPatch.delete,
             )
         )
-    if packet.entitiesReplace:
+    if packet.entitiesReplace is not None:
         expanded.append(
             EntitiesUpdatePacket(
                 type="entities_update",
@@ -301,7 +302,7 @@ def expand_player_packets(packet) -> list:
                 delete=packet.entitiesPatch.delete,
             )
         )
-    if packet.waypointsReplace:
+    if packet.waypointsReplace is not None:
         expanded.append(
             WaypointsUpdatePacket(
                 type="waypoints_update",
@@ -318,7 +319,7 @@ def expand_player_packets(packet) -> list:
                 delete=packet.waypointsPatch.delete,
             )
         )
-    if packet.tabPlayersReplace:
+    if packet.tabPlayersReplace is not None:
         expanded.append(
             TabPlayersUpdatePacket(
                 type="tab_players_update",
@@ -373,6 +374,14 @@ def expand_player_packets(packet) -> list:
                 type="waypoints_entity_death_cancel",
                 submitPlayerId=submit_player_id,
                 **packet.waypointsEntityDeathCancel.model_dump(exclude={"type", "submitPlayerId"}, exclude_none=True),
+            )
+        )
+    if packet.externalSourceStatus is not None:
+        expanded.append(
+            ExternalSourceStatusPacket(
+                type="external_source_status",
+                submitPlayerId=submit_player_id,
+                **packet.externalSourceStatus.model_dump(exclude={"type", "submitPlayerId"}, exclude_none=True),
             )
         )
 

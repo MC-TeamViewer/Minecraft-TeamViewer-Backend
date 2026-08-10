@@ -49,6 +49,7 @@ import {
 
 const RoomOverviewTable = defineAsyncComponent(() => import("@/components/RoomOverviewTable.vue"));
 const ConnectionStatusTable = defineAsyncComponent(() => import("@/components/ConnectionStatusTable.vue"));
+const ExternalSourceStatusTable = defineAsyncComponent(() => import("@/components/ExternalSourceStatusTable.vue"));
 const AuditFilters = defineAsyncComponent(() => import("@/components/AuditFilters.vue"));
 const AuditTable = defineAsyncComponent(() => import("@/components/AuditTable.vue"));
 
@@ -591,6 +592,7 @@ function updateHistoryTrafficMixedView(value: TrafficMixedViewMode) {
 
       <RoomOverviewTable :overview="overview" />
       <ConnectionStatusTable :overview="overview" />
+      <ExternalSourceStatusTable :overview="overview" />
 
       <section class="audit-stack">
         <AuditFilters

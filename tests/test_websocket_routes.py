@@ -77,6 +77,8 @@ def build_handshake(
     protocol_version: str = "0.6.2",
     room_code: str = "test-room",
     submit_player_id: str | None = None,
+    client_role: str | None = None,
+    client_display_name: str | None = None,
 ) -> bytes:
     payload = {
         "type": "handshake",
@@ -88,6 +90,10 @@ def build_handshake(
     }
     if submit_player_id:
         payload["submitPlayerId"] = submit_player_id
+    if client_role:
+        payload["clientRole"] = client_role
+    if client_display_name:
+        payload["clientDisplayName"] = client_display_name
     return CODEC.encode(payload)
 
 
@@ -122,6 +128,25 @@ def build_players_patch_bundle(
     bundle.submit_player_id = submit_player_id
     for player_id, player_data in upsert.items():
         bundle.players_patch.upsert.add(id=player_id, data=teamviewer_pb2.PlayerDelta(**player_data))
+    return envelope.SerializeToString()
+
+
+def build_external_status_bundle(*, submit_player_id: str, health: int, failure_code: str | None = None) -> bytes:
+    envelope = teamviewer_pb2.WireEnvelope(channel=teamviewer_pb2.WIRE_CHANNEL_PLAYER)
+    bundle = envelope.player_report_bundle
+    bundle.submit_player_id = submit_player_id
+    bundle.external_source_status.health = health
+    if failure_code:
+        bundle.external_source_status.failure_code = failure_code
+    return envelope.SerializeToString()
+
+
+def build_empty_player_and_tab_replace_bundle(*, submit_player_id: str) -> bytes:
+    envelope = teamviewer_pb2.WireEnvelope(channel=teamviewer_pb2.WIRE_CHANNEL_PLAYER)
+    bundle = envelope.player_report_bundle
+    bundle.submit_player_id = submit_player_id
+    bundle.players_replace.SetInParent()
+    bundle.tab_players_replace.SetInParent()
     return envelope.SerializeToString()
 
 
@@ -213,14 +238,14 @@ async def test_adminws_alias_accepts_web_map_handshake_and_logs_deprecation(
 
     assert handshake_ack["type"] == "handshake_ack"
     assert handshake_ack.get("ready") is True
-    assert handshake_ack.get("networkProtocolVersion") == "0.6.2"
+    assert handshake_ack.get("networkProtocolVersion") == "0.6.3"
     assert handshake_ack.get("minimumCompatibleNetworkProtocolVersion") == "0.6.1"
     assert snapshot_full["type"] == "snapshot_full"
     assert "Deprecated websocket route /adminws used" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_web_map_route_accepts_061_client_with_062_backend(live_server: str) -> None:
+async def test_web_map_route_accepts_061_client_with_063_backend(live_server: str) -> None:
     async with websockets.connect(f"{live_server}/web-map/ws") as websocket:
         await websocket.send(build_handshake(channel="web_map", protocol_version="0.6.1"))
 
@@ -229,7 +254,7 @@ async def test_web_map_route_accepts_061_client_with_062_backend(live_server: st
 
     assert handshake_ack["type"] == "handshake_ack"
     assert handshake_ack.get("ready") is True
-    assert handshake_ack.get("networkProtocolVersion") == "0.6.2"
+    assert handshake_ack.get("networkProtocolVersion") == "0.6.3"
     assert handshake_ack.get("minimumCompatibleNetworkProtocolVersion") == "0.6.1"
     assert snapshot_full["type"] == "snapshot_full"
 
@@ -469,3 +494,83 @@ async def test_player_route_learns_identity_from_players_patch_bundle(live_serve
     assert identity_rows
     assert identity_rows[0]["player_id"] == submit_player_id
     assert identity_rows[0]["username"] == "Bob"
+
+
+@pytest.mark.asyncio
+async def test_external_source_role_status_and_authoritative_empty_replace(live_server: str) -> None:
+    source_id = "00000000-0000-0000-0000-000000000303"
+    target_id = "00000000-0000-0000-0000-000000000999"
+
+    async with websockets.connect(f"{live_server}/mc-client") as websocket:
+        await websocket.send(
+            build_handshake(
+                channel="player",
+                protocol_version="0.6.3",
+                submit_player_id=source_id,
+                client_role="CLIENT_ROLE_EXTERNAL_SOURCE",
+                client_display_name="SIMMC Test Source",
+            )
+        )
+        handshake_ack = decode_packet(await asyncio.wait_for(websocket.recv(), timeout=5.0))
+        assert handshake_ack["ready"] is True
+        assert handshake_ack["acceptedClientRole"] == "CLIENT_ROLE_EXTERNAL_SOURCE"
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(websocket.recv(), timeout=0.2)
+
+        await websocket.send(
+            build_players_replace_bundle(
+                submit_player_id=source_id,
+                players={
+                    target_id: {
+                        "x": 1.0,
+                        "y": 64.0,
+                        "z": 2.0,
+                        "dimension": "minecraft_overworld",
+                        "player_name": "Target",
+                        "player_uuid": target_id,
+                    }
+                },
+            )
+        )
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while source_id not in app_runtime.state.player_reports.get(target_id, {}):
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+        report_timestamp = app_runtime.state.player_reports[target_id][source_id]["timestamp"]
+
+        await websocket.send(
+            build_external_status_bundle(
+                submit_player_id=source_id,
+                health=teamviewer_pb2.EXTERNAL_SOURCE_HEALTH_HEALTHY,
+            )
+        )
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while app_runtime.state.external_source_statuses.get(source_id, {}).get("health") != (
+            "EXTERNAL_SOURCE_HEALTH_HEALTHY"
+        ):
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+
+        assert app_runtime.state.player_reports[target_id][source_id]["timestamp"] == report_timestamp
+        assert source_id not in app_runtime.state.get_player_connection_ids()
+
+        await websocket.send(build_empty_player_and_tab_replace_bundle(submit_player_id=source_id))
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while source_id in app_runtime.state.player_reports.get(target_id, {}):
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+
+        assert app_runtime.state.tab_player_reports[source_id]["players"] == []
+
+    audit_rows = app_runtime.admin_store._fetchall_sync(  # noqa: SLF001
+        """
+        SELECT actor_type
+        FROM audit_events
+        WHERE event_type = 'external_source_handshake_success' AND actor_id = ?
+        ORDER BY id DESC
+        """,
+        (source_id,),
+    )
+    assert audit_rows
+    assert audit_rows[0]["actor_type"] == "external_source"

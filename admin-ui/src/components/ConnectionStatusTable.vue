@@ -10,7 +10,7 @@ const props = defineProps<{
   overview: OverviewPayload | null;
 }>();
 
-const rows = computed(() => props.overview?.connectionDetails ?? []);
+const rows = computed(() => (props.overview?.connectionDetails ?? []).filter((row) => row.channel !== "external_source"));
 const expandedKeys = ref<string[]>([]);
 
 function formatChannel(value: ConnectionDetail["channel"]): string {

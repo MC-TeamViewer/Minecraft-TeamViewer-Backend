@@ -48,12 +48,20 @@ const rows = computed(() => props.overview?.rooms ?? []);
               </div>
               <span v-else>-</span>
             </div>
+            <div>
+              <span class="detail-key">外部源 ID</span>
+              <div v-if="row.externalSourceIds?.length" class="room-id-list">
+                <span v-for="sourceId in row.externalSourceIds" :key="sourceId" class="room-id-chip mono-text">{{ sourceId }}</span>
+              </div>
+              <span v-else>-</span>
+            </div>
           </div>
         </template>
       </el-table-column>
       <el-table-column prop="roomCode" label="房间" min-width="180" show-overflow-tooltip resizable />
       <el-table-column prop="playerConnections" label="玩家连接" width="110" resizable />
       <el-table-column prop="webMapConnections" label="网页端" width="100" resizable />
+      <el-table-column prop="externalSourceConnections" label="外部源" width="100" resizable />
       <el-table-column label="玩家 ID" width="120" resizable>
         <template #default="{ row }">
           <span>{{ summarizeRoomIds(row.playerIds) }}</span>

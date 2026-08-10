@@ -26,6 +26,8 @@ class Broadcaster:
         self.state = state
         self._codec = ProtobufMessageCodec()
         self._web_map_last_states: dict[str, dict] = {}
+        self._player_last_states: dict[str, dict] = {}
+        self._resolved_source_views: dict[tuple[str, tuple[str, ...]], dict] = {}
         self._last_player_report_hints: dict[str, int] = {}
         self._player_sync_scopes = ("players", "entities", "waypoints", "battleChunks")
         self._web_map_sync_scopes = ("players", "entities", "waypoints", "battleChunks", "playerMarks")
@@ -80,29 +82,28 @@ class Broadcaster:
     def _build_web_map_view_state(self, web_map_room: str | None = None) -> dict:
         normalized_room = self.state.normalize_room_code(web_map_room)
         allowed_sources = self.state.get_active_sources_in_room(normalized_room)
-        room_players = self.state.filter_state_map_by_sources(self.state.players, allowed_sources)
-        room_entities = self.state.filter_state_map_by_sources(self.state.entities, allowed_sources)
-        room_waypoints = self.state.filter_waypoint_state_by_sources_and_room(
-            self.state.waypoints,
-            allowed_sources,
-            normalized_room,
-        )
-        room_battle_chunks = self.state.filter_battle_chunk_state_by_sources_and_room(
-            self.state.battle_chunks,
-            allowed_sources,
-            normalized_room,
-        )
+        player_sources = allowed_sources.intersection(self.state.get_player_connection_ids())
+        resolved = self._resolve_source_view(allowed_sources, normalized_room)
         return {
-            "players": self._snapshot_scope_from_state_map(room_players),
-            "entities": self._snapshot_scope_from_state_map(room_entities),
-            "waypoints": self._snapshot_scope_from_state_map(room_waypoints),
-            "battleChunks": self._snapshot_scope_from_state_map(room_battle_chunks),
+            "players": self._snapshot_scope_from_state_map(resolved["players"]),
+            "entities": self._snapshot_scope_from_state_map(resolved["entities"]),
+            "waypoints": self._snapshot_scope_from_state_map(resolved["waypoints"]),
+            "battleChunks": self._snapshot_scope_from_state_map(resolved["battleChunks"]),
             "playerMarks": dict(self.state.player_marks),
             "tabState": self.state.build_web_map_tab_snapshot(normalized_room),
             "roomCode": normalized_room,
-            "connections": sorted(allowed_sources),
-            "connections_count": len(allowed_sources),
+            "connections": sorted(player_sources),
+            "connections_count": len(player_sources),
         }
+
+    def _resolve_source_view(self, allowed_sources: set[str], room_code: str) -> dict:
+        normalized_room = self.state.normalize_room_code(room_code)
+        cache_key = (normalized_room, tuple(sorted(allowed_sources)))
+        resolved = self._resolved_source_views.get(cache_key)
+        if resolved is None:
+            resolved = self.state.resolve_states_for_sources(allowed_sources, normalized_room)
+            self._resolved_source_views[cache_key] = resolved
+        return resolved
 
     @staticmethod
     def _wrap_plain_scope(scope_map: dict) -> dict:
@@ -262,27 +263,13 @@ class Broadcaster:
     def _build_visible_state_for_player(self, player_id: str) -> dict:
         allowed_sources = self.state.get_allowed_sources_for_player(player_id)
         player_room = self.state.get_player_room(player_id)
-        visible_players = self.state.filter_state_map_by_sources(self.state.players, allowed_sources)
-        visible_entities = self.state.filter_state_map_by_sources(self.state.entities, allowed_sources)
-        visible_waypoints = self.state.filter_waypoint_state_by_sources_and_room(
-            self.state.waypoints,
-            allowed_sources,
-            player_room,
-        )
-        visible_battle_chunks = self.state.filter_battle_chunk_state_by_sources_and_room(
-            self.state.battle_chunks,
-            allowed_sources,
-            player_room,
-        )
-        return {
-            "players": visible_players,
-            "entities": visible_entities,
-            "waypoints": visible_waypoints,
-            "battleChunks": visible_battle_chunks,
-        }
+        return self._resolve_source_view(allowed_sources, player_room)
 
     async def send_snapshot_full_to_player(self, player_id: str) -> None:
         """向指定玩家推送完整快照（重同步场景）。"""
+        if self.state.is_external_source(player_id):
+            return
+        self._resolved_source_views.clear()
         ws = self.state.connections.get(player_id)
         if ws is None:
             return
@@ -291,15 +278,22 @@ class Broadcaster:
         sync_view_state["playerMarks"] = dict(self.state.player_marks)
         message = self._build_full_message(sync_view_state)
         await self._send_encoded(ws, self._encode_message(message), channel="player")
+        sync_view_state.pop("playerMarks", None)
+        if self.state.requires_scoped_delivery(player_id):
+            self._player_last_states[player_id] = sync_view_state
+        else:
+            self._player_last_states.pop(player_id, None)
 
     async def maybe_send_digest(self, player_id: str, visible_state: dict | None = None) -> None:
         """按节流周期发送摘要，帮助客户端做状态一致性检测。"""
+        if self.state.is_external_source(player_id):
+            return
         ws = self.state.connections.get(player_id)
         caps = self.state.connection_caps.get(player_id)
         if ws is None or caps is None:
             return
 
-        now = time.time()
+        now = time.monotonic()
         if now - float(caps.get("lastDigestSent", 0.0)) < self.state.DIGEST_INTERVAL_SEC:
             return
 
@@ -320,6 +314,7 @@ class Broadcaster:
 
     async def broadcast_web_map_updates(self, force_full: bool = False) -> None:
         """向网页地图观察端广播增量（必要时全量）。"""
+        self._resolved_source_views.clear()
         if not self.state.web_map_connections:
             self._web_map_last_states = {}
             return
@@ -415,12 +410,15 @@ class Broadcaster:
         await self.request_preexpiry_refreshes()
         self.state.cleanup_timeouts()
         changes = self.state.refresh_resolved_states()
+        self._resolved_source_views.clear()
 
         changed = self.state.has_patch_changes(changes)
         encoded_cache: dict[str, bytes] = {}
 
         disconnected = []
         for player_id, ws in list(self.state.connections.items()):
+            if self.state.is_external_source(player_id):
+                continue
             if not self.state.websocket_is_connected(ws):
                 logger.debug(
                     f"Skip delta broadcast to disconnected websocket player={player_id} "
@@ -433,12 +431,21 @@ class Broadcaster:
                 requires_scoped = self.state.requires_scoped_delivery(player_id)
                 if requires_scoped:
                     visible = self._build_visible_state_for_player(player_id)
-                    if force_full_to_delta or changed:
-                        sync_view_state = self._build_player_sync_view_state(visible)
+                    sync_view_state = self._build_player_sync_view_state(visible)
+                    scoped_changed = self._player_last_states.get(player_id) != sync_view_state
+                    if force_full_to_delta or scoped_changed:
                         sync_view_state["playerMarks"] = dict(self.state.player_marks)
                         full_msg = self._build_full_message(sync_view_state)
                         await self._send_encoded(ws, self._encode_message(full_msg), channel="player")
+                        sync_view_state.pop("playerMarks", None)
+                    self._player_last_states[player_id] = sync_view_state
                     await self.maybe_send_digest(player_id, visible)
+                elif player_id in self._player_last_states:
+                    sync_view_state = self._build_player_sync_view_state(self._build_global_player_sync_node_state())
+                    sync_view_state["playerMarks"] = dict(self.state.player_marks)
+                    full_msg = self._build_full_message(sync_view_state)
+                    await self._send_encoded(ws, self._encode_message(full_msg), channel="player")
+                    self._player_last_states.pop(player_id, None)
                 elif force_full_to_delta:
                     sync_view_state = self._build_player_sync_view_state(self._build_global_player_sync_node_state())
                     sync_view_state["playerMarks"] = dict(self.state.player_marks)
@@ -475,12 +482,13 @@ class Broadcaster:
 
         for player_id in disconnected:
             self.state.remove_connection(player_id)
+            self._player_last_states.pop(player_id, None)
 
         await self.broadcast_web_map_updates()
 
     async def request_preexpiry_refreshes(self) -> None:
         """在对象即将超时前，向对应来源客户端请求该范围内的全量确认。"""
-        current_time = time.time()
+        current_time = time.monotonic()
         refresh_targets = self.state.collect_preexpiry_refresh_requests(current_time)
         if not refresh_targets:
             return
@@ -508,6 +516,8 @@ class Broadcaster:
     ) -> None:
         if not isinstance(source_id, str) or not source_id:
             return
+        if self.state.is_external_source(source_id):
+            return
 
         players = [item for item in players if isinstance(item, str) and item]
         entities = [item for item in entities if isinstance(item, str) and item]
@@ -515,7 +525,7 @@ class Broadcaster:
         if not players and not entities and not battle_chunks:
             return
 
-        now = time.time() if current_time is None else current_time
+        now = time.monotonic() if current_time is None else current_time
         if not bypass_cooldown and not self.state.can_send_refresh_request(source_id, now):
             return
 
@@ -528,7 +538,7 @@ class Broadcaster:
 
         message = RefreshRequestOutboundPacket(
             reason=reason,
-            serverTime=now,
+            serverTime=time.time(),
             players=players,
             entities=entities,
             battleChunks=battle_chunks,
@@ -552,6 +562,8 @@ class Broadcaster:
         broadcast_hz = self.state.broadcast_hz
         encoded_cache: dict[tuple[int, float, str | None], bytes] = {}
         for player_id, ws in list(self.state.connections.items()):
+            if self.state.is_external_source(player_id):
+                continue
             if not self.state.websocket_is_connected(ws):
                 continue
 

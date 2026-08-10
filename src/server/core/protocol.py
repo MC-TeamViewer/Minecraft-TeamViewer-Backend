@@ -28,6 +28,8 @@ class HandshakePacket(PacketModel):
     preferredReportIntervalTicks: int | None = None
     minReportIntervalTicks: int | None = None
     maxReportIntervalTicks: int | None = None
+    clientRole: str | int | None = None
+    clientDisplayName: str | None = None
 
 
 class PingPacket(PacketModel):
@@ -132,6 +134,13 @@ class SourceStateClearPacket(PacketModel):
     scopes: list[str] = Field(default_factory=list)
 
 
+class ExternalSourceStatusPacket(PacketModel):
+    type: Literal["external_source_status"]
+    submitPlayerId: str | None = None
+    health: str | int
+    failureCode: str | None = None
+
+
 class WaypointsUpdatePacket(PacketModel):
     type: Literal["waypoints_update"]
     submitPlayerId: str | None = None
@@ -184,19 +193,20 @@ class ScopePatchPacket(PacketModel):
 class PlayerReportBundlePacket(PacketModel):
     type: Literal["player_report_bundle"]
     submitPlayerId: str | None = None
-    playersReplace: dict[str, PlayerData] = Field(default_factory=dict)
+    playersReplace: dict[str, PlayerData] | None = None
     playersPatch: ScopePatchPacket | None = None
-    entitiesReplace: dict[str, EntityData] = Field(default_factory=dict)
+    entitiesReplace: dict[str, EntityData] | None = None
     entitiesPatch: ScopePatchPacket | None = None
-    waypointsReplace: dict[str, WaypointData] = Field(default_factory=dict)
+    waypointsReplace: dict[str, WaypointData] | None = None
     waypointsPatch: ScopePatchPacket | None = None
-    tabPlayersReplace: list[dict[str, Any]] = Field(default_factory=list)
+    tabPlayersReplace: list[dict[str, Any]] | None = None
     tabPlayersPatch: ScopePatchPacket | None = None
     battleMapObservation: BattleMapObservationPacket | None = None
     stateKeepalive: StateKeepalivePacket | None = None
     sourceStateClear: SourceStateClearPacket | None = None
     waypointsDelete: WaypointsDeletePacket | None = None
     waypointsEntityDeathCancel: WaypointsEntityDeathCancelPacket | None = None
+    externalSourceStatus: ExternalSourceStatusPacket | None = None
 
 
 WebMapInboundPacket = Annotated[
@@ -229,6 +239,7 @@ PlayerInboundPacket = Annotated[
     | EntitiesPatchPacket
     | StateKeepalivePacket
     | SourceStateClearPacket
+    | ExternalSourceStatusPacket
     | WaypointsUpdatePacket
     | WaypointsPatchPacket
     | WaypointsDeletePacket
@@ -328,6 +339,7 @@ class HandshakeAckPacket(OutboundPacket):
     playerTimeoutSec: int | None = None
     entityTimeoutSec: int | None = None
     battleChunkTimeoutSec: int | None = None
+    acceptedClientRole: str | int | None = None
 
 
 class WebMapAckPacket(OutboundPacket):

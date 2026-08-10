@@ -68,6 +68,11 @@ class AdminPayloadService:
             return {
                 "playerConnections": sum(1 for item in connection_details if item["channel"] == "player"),
                 "webMapConnections": sum(1 for item in connection_details if item["channel"] == "web_map"),
+                "externalSourceConnections": sum(
+                    1
+                    for item in connection_details
+                    if item["channel"] == "external_source" and item.get("connected", True)
+                ),
                 "activeRooms": len(rooms),
                 "rooms": rooms,
                 "connectionDetails": connection_details,

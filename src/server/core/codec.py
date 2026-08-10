@@ -367,6 +367,22 @@ def _message_to_plain_dict(message: Message) -> dict[str, Any]:
             continue
 
         output[key] = value
+
+    # Proto3 scalars without presence are omitted from ListFields() when they
+    # hold their wire default. They are still real values (for example z=0),
+    # so retain them before validating the decoded packet.
+    for field in message.DESCRIPTOR.fields:
+        key = field.json_name
+        if key in output or field.is_repeated or field.type == FieldDescriptor.TYPE_MESSAGE:
+            continue
+        if field.has_presence:
+            continue
+        value = getattr(message, field.name)
+        if field.type == FieldDescriptor.TYPE_ENUM:
+            enum_value = field.enum_type.values_by_number.get(int(value))
+            output[key] = enum_value.name if enum_value is not None else int(value)
+        else:
+            output[key] = value
     return output
 
 
@@ -627,6 +643,7 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
             "sourceStateClear",
             "waypointsDelete",
             "waypointsEntityDeathCancel",
+            "externalSourceStatus",
         ):
             value = data.get(key)
             if value is not None:
@@ -644,6 +661,8 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
                     value["type"] = "waypoints_delete"
                 elif key == "waypointsEntityDeathCancel":
                     value["type"] = "waypoints_entity_death_cancel"
+                elif key == "externalSourceStatus":
+                    value["type"] = "external_source_status"
                 bundle[key] = value
 
         return bundle

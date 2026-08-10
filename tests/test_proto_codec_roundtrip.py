@@ -22,6 +22,41 @@ def test_wire_envelope_payload_field_numbers_are_contiguous() -> None:
     assert teamviewer_pb2.WireEnvelope.DESCRIPTOR.fields_by_name["channel"].number == 1
 
 
+def test_optional_client_role_presence_and_external_status_roundtrip() -> None:
+    role_field = teamviewer_pb2.PlayerHandshakeRequest.DESCRIPTOR.fields_by_name["client_role"]
+    assert role_field.has_presence is True
+
+    absent = teamviewer_pb2.PlayerHandshakeRequest()
+    assert absent.HasField("client_role") is False
+
+    handshake = CODEC.decode(
+        CODEC.encode(
+            {
+                "type": "handshake",
+                "channel": "player",
+                "networkProtocolVersion": "0.6.3",
+                "minimumCompatibleNetworkProtocolVersion": "0.6.1",
+                "localProgramVersion": "external-test",
+                "submitPlayerId": "source-1",
+                "clientRole": "CLIENT_ROLE_EXTERNAL_SOURCE",
+                "clientDisplayName": "SIMMC",
+            }
+        )
+    )
+    assert handshake["clientRole"] == "CLIENT_ROLE_EXTERNAL_SOURCE"
+    assert handshake["clientDisplayName"] == "SIMMC"
+
+    envelope = teamviewer_pb2.WireEnvelope(channel=teamviewer_pb2.WIRE_CHANNEL_PLAYER)
+    envelope.player_report_bundle.submit_player_id = "source-1"
+    envelope.player_report_bundle.external_source_status.health = (
+        teamviewer_pb2.EXTERNAL_SOURCE_HEALTH_DEGRADED
+    )
+    envelope.player_report_bundle.external_source_status.failure_code = "timeout"
+    decoded = CODEC.decode(envelope.SerializeToString())
+    assert decoded["externalSourceStatus"]["health"] == "EXTERNAL_SOURCE_HEALTH_DEGRADED"
+    assert decoded["externalSourceStatus"]["failureCode"] == "timeout"
+
+
 def test_codec_roundtrip_core_outbound_payloads() -> None:
     handshake = CODEC.decode(
         CODEC.encode(

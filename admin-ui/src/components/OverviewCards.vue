@@ -18,6 +18,10 @@ const cards = computed(() => [
     value: props.overview?.webMapConnections ?? "-",
   },
   {
+    label: "外部数据源",
+    value: props.overview?.externalSourceConnections ?? 0,
+  },
+  {
     label: "活跃房间",
     value: props.overview?.activeRooms ?? "-",
   },

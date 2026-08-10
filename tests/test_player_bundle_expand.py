@@ -49,3 +49,39 @@ def test_codec_decodes_bundle_nested_messages_with_internal_types() -> None:
     assert decoded["battleMapObservation"]["type"] == "battle_map_observation"
     assert decoded["battleMapObservation"]["dimension"] == "minecraft:overworld"
     assert decoded["battleMapObservation"]["mode"] == "simmc"
+
+
+def test_present_empty_replace_scopes_are_preserved() -> None:
+    codec = ProtobufMessageCodec()
+    envelope = teamviewer_pb2.WireEnvelope(channel=teamviewer_pb2.WIRE_CHANNEL_PLAYER)
+    envelope.player_report_bundle.submit_player_id = "source-1"
+    envelope.player_report_bundle.players_replace.SetInParent()
+    envelope.player_report_bundle.tab_players_replace.SetInParent()
+
+    decoded = codec.decode(envelope.SerializeToString())
+    expanded = expand_player_packets(PlayerReportBundlePacket(**decoded))
+
+    assert [item.type for item in expanded] == ["players_update", "tab_players_update"]
+    assert expanded[0].players == {}
+    assert expanded[1].tabPlayers == []
+
+
+def test_proto3_zero_coordinates_are_not_treated_as_missing() -> None:
+    codec = ProtobufMessageCodec()
+    envelope = teamviewer_pb2.WireEnvelope(channel=teamviewer_pb2.WIRE_CHANNEL_PLAYER)
+    bundle = envelope.player_report_bundle
+    bundle.submit_player_id = "source-1"
+    bundle.players_replace.players["target"].CopyFrom(
+        teamviewer_pb2.PlayerData(
+            x=0.0,
+            y=64.0,
+            z=0.0,
+            dimension="minecraft_overworld",
+        )
+    )
+
+    decoded = codec.decode(envelope.SerializeToString())
+    expanded = expand_player_packets(PlayerReportBundlePacket(**decoded))
+
+    assert expanded[0].players["target"].x == 0.0
+    assert expanded[0].players["target"].z == 0.0

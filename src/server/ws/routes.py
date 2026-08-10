@@ -25,6 +25,7 @@ from ..core.protocol import (
     HandshakeAckPacket,
     HandshakeHelpers,
     HandshakePacket,
+    ExternalSourceStatusPacket,
     PacketDecodeError,
     PacketParsers,
     PingPacket,
@@ -381,7 +382,7 @@ async def web_map_ws(websocket: WebSocket):
                     continue
 
                 web_map_source_id = runtime.state.build_web_map_tactical_source_id(room_code)
-                node = runtime.state.build_state_node(web_map_source_id, time.time(), validated.model_dump())
+                node = runtime.state.build_state_node(web_map_source_id, time.monotonic(), validated.model_dump())
                 runtime.state.upsert_report(runtime.state.waypoint_reports, waypoint_id, web_map_source_id, node)
 
                 await send_packet(
@@ -633,6 +634,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         packet.minReportIntervalTicks,
                         packet.maxReportIntervalTicks,
                     )
+                    client_role = runtime.state.set_connection_identity(
+                        submit_player_id,
+                        packet.clientRole,
+                        packet.clientDisplayName,
+                    )
+                    is_external_source = client_role == runtime.state.CLIENT_ROLE_EXTERNAL_SOURCE
                     negotiated_ticks = runtime.state.negotiate_report_interval_ticks(
                         submit_player_id,
                         packet.preferredReportIntervalTicks,
@@ -657,6 +664,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "playerTimeoutSec": runtime.state.PLAYER_TIMEOUT,
                         "entityTimeoutSec": runtime.state.ENTITY_TIMEOUT,
                         "battleChunkTimeoutSec": runtime.state.BATTLE_CHUNK_TIMEOUT,
+                        "acceptedClientRole": client_role,
                     }
                     await send_packet(websocket, HandshakeAckPacket(**ack))
                     runtime.state.connections[submit_player_id] = websocket
@@ -669,10 +677,11 @@ async def websocket_endpoint(websocket: WebSocket):
                         client_room,
                     )
                     trigger_admin_sse_overview()
-                    await record_player_activity(submit_player_id, client_room)
+                    if not is_external_source:
+                        await record_player_activity(submit_player_id, client_room)
                     await record_audit_event(
-                        event_type="player_handshake_success",
-                        actor_type="player",
+                        event_type="external_source_handshake_success" if is_external_source else "player_handshake_success",
+                        actor_type="external_source" if is_external_source else "player",
                         actor_id=submit_player_id,
                         room_code=client_room,
                         success=True,
@@ -680,9 +689,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         detail={
                             "clientProtocol": client_protocol,
                             "clientProgramVersion": client_program_version,
+                            "clientRole": client_role,
+                            "clientDisplayName": packet.clientDisplayName,
                         },
                     )
-                    await runtime.broadcaster.send_snapshot_full_to_player(submit_player_id)
+                    if not is_external_source:
+                        await runtime.broadcaster.send_snapshot_full_to_player(submit_player_id)
                 continue
 
             if not submit_player_id or submit_player_id not in runtime.state.connections:
@@ -692,20 +704,36 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
                 continue
 
-            await record_player_activity(
-                submit_player_id,
-                runtime.state.get_player_room(submit_player_id),
-            )
+            if not runtime.state.is_external_source(submit_player_id):
+                await record_player_activity(
+                    submit_player_id,
+                    runtime.state.get_player_room(submit_player_id),
+                )
 
             for expanded_packet in expand_player_packets(packet):
+                if isinstance(expanded_packet, ExternalSourceStatusPacket):
+                    if not runtime.state.is_external_source(submit_player_id):
+                        runtime.logger.warning(
+                            "Ignore external source status from player role submitPlayerId=%s",
+                            submit_player_id,
+                        )
+                        continue
+                    runtime.state.update_external_source_status(
+                        submit_player_id,
+                        expanded_packet.health,
+                        expanded_packet.failureCode,
+                    )
+                    trigger_admin_sse_overview()
+                    continue
+
                 if (
                     expanded_packet.type not in {"tab_players_update", "tab_players_patch"}
                     and not isinstance(expanded_packet, SourceStateClearPacket)
                 ):
-                    runtime.state.touch_tab_player_report(submit_player_id, time.time())
+                    runtime.state.touch_tab_player_report(submit_player_id, time.monotonic())
 
                 if expanded_packet.type == "state_keepalive":
-                    current_time = time.time()
+                    current_time = time.monotonic()
                     touched_players = runtime.state.touch_reports(
                         runtime.state.player_reports,
                         expanded_packet.players,
@@ -744,7 +772,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 if expanded_packet.type == "players_update":
-                    current_time = time.time()
+                    current_time = time.monotonic()
+                    source_key = submit_player_id if isinstance(submit_player_id, str) else ""
+                    for player_id in list(runtime.state.player_reports.keys()):
+                        source_bucket = runtime.state.player_reports.get(player_id, {})
+                        if source_key in source_bucket:
+                            runtime.state.delete_report(runtime.state.player_reports, player_id, submit_player_id)
+
                     for pid, player_data in expanded_packet.players.items():
                         try:
                             normalized = player_data.model_dump()
@@ -759,14 +793,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 if expanded_packet.type == "tab_players_update":
                     if isinstance(submit_player_id, str) and submit_player_id:
-                        current_time = time.time()
+                        current_time = time.monotonic()
                         runtime.state.upsert_tab_player_report(submit_player_id, expanded_packet.tabPlayers, current_time)
                         await runtime.broadcaster.broadcast_web_map_updates()
                     continue
 
                 if expanded_packet.type == "tab_players_patch":
                     if isinstance(submit_player_id, str) and submit_player_id:
-                        current_time = time.time()
+                        current_time = time.monotonic()
                         runtime.state.patch_tab_player_report(
                             submit_player_id,
                             expanded_packet.upsert,
@@ -777,7 +811,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 if expanded_packet.type == "players_patch":
-                    current_time = time.time()
+                    current_time = time.monotonic()
                     missing_baseline_players = []
                     for pid, player_data in expanded_packet.upsert.items():
                         source_key = submit_player_id if isinstance(submit_player_id, str) else ""
@@ -828,7 +862,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 if expanded_packet.type == "entities_update":
-                    current_time = time.time()
+                    current_time = time.monotonic()
                     source_key = submit_player_id if isinstance(submit_player_id, str) else ""
                     for entity_id in list(runtime.state.entity_reports.keys()):
                         source_bucket = runtime.state.entity_reports.get(entity_id, {})
@@ -845,7 +879,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 if expanded_packet.type == "entities_patch":
-                    current_time = time.time()
+                    current_time = time.monotonic()
                     missing_baseline_entities = []
                     for entity_id, entity_data in expanded_packet.upsert.items():
                         source_key = submit_player_id if isinstance(submit_player_id, str) else ""
@@ -893,7 +927,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 if expanded_packet.type == "waypoints_patch":
-                    current_time = time.time()
+                    current_time = time.monotonic()
                     for waypoint_id, waypoint_data in expanded_packet.upsert.items():
                         source_key = submit_player_id if isinstance(submit_player_id, str) else ""
                         existing_node = runtime.state.waypoint_reports.get(waypoint_id, {}).get(source_key)
@@ -925,7 +959,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 if expanded_packet.type == "waypoints_update":
-                    current_time = time.time()
+                    current_time = time.monotonic()
                     for waypoint_id, waypoint_data in expanded_packet.waypoints.items():
                         try:
                             normalized = waypoint_data.model_dump()
@@ -966,7 +1000,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 if expanded_packet.type == "battle_map_observation":
-                    current_time = time.time()
+                    current_time = time.monotonic()
                     result = runtime.state.apply_battle_map_observation(
                         submit_player_id=submit_player_id,
                         room_code=runtime.state.get_player_room(submit_player_id),
@@ -1064,7 +1098,11 @@ async def websocket_endpoint(websocket: WebSocket):
         runtime.logger.exception("Error handling player message: %s", exc)
         await record_audit_event(
             event_type="backend_error",
-            actor_type="player",
+            actor_type=(
+                "external_source"
+                if submit_player_id and runtime.state.is_external_source(submit_player_id)
+                else "player"
+            ),
             actor_id=submit_player_id,
             room_code=runtime.state.get_player_room(submit_player_id) if submit_player_id else None,
             success=False,
@@ -1077,10 +1115,11 @@ async def websocket_endpoint(websocket: WebSocket):
         )
     finally:
         if submit_player_id:
+            is_external_source = runtime.state.is_external_source(submit_player_id)
             trigger_admin_sse_overview()
             await record_audit_event(
-                event_type="player_disconnected",
-                actor_type="player",
+                event_type="external_source_disconnected" if is_external_source else "player_disconnected",
+                actor_type="external_source" if is_external_source else "player",
                 actor_id=submit_player_id,
                 room_code=runtime.state.get_player_room(submit_player_id),
                 success=True,

@@ -94,6 +94,8 @@ class ServerState:
     WEB_MAP_TACTICAL_SOURCE_PREFIX = "__web_map_tactical__:"
     BATTLE_CHUNK_CACHE_SOURCE_PREFIX = "__battle_chunk_cache__:"
     BATTLE_CHUNK_COLOR_MODE_RAW_OBSERVED = "raw_observed"
+    CLIENT_ROLE_PLAYER = "CLIENT_ROLE_PLAYER"
+    CLIENT_ROLE_EXTERNAL_SOURCE = "CLIENT_ROLE_EXTERNAL_SOURCE"
 
     # 服务端配置文件（TOML）路径。
     CONFIG_FILE_NAME = "server_state_config.toml"
@@ -118,6 +120,10 @@ class ServerState:
         self.connections: Dict[str, WebSocket] = {}
         self.connection_caps: Dict[str, dict] = {}
         self.connection_rooms: Dict[str, str] = {}
+        self.connection_roles: Dict[str, str] = {}
+        self.connection_display_names: Dict[str, str] = {}
+        self.external_source_statuses: Dict[str, dict] = {}
+        self.disconnected_external_sources: Dict[str, dict] = {}
         self.web_map_connections: Dict[str, WebSocket] = {}
         self.web_map_connection_rooms: Dict[str, str] = {}
 
@@ -132,6 +138,7 @@ class ServerState:
         self.entity_selected_sources: Dict[str, str] = {}
         self.waypoint_selected_sources: Dict[str, str] = {}
         self.battle_chunk_selected_sources: Dict[str, str] = {}
+        self._scoped_selected_sources: Dict[tuple[str, tuple[str, ...]], dict[str, Dict[str, str]]] = {}
         self.battle_map_reporter_state: Dict[str, dict] = {}
 
         self.broadcast_hz = float(self.DEFAULT_BROADCAST_HZ)
@@ -285,6 +292,7 @@ class ServerState:
         normalized = self.normalize_room_code(room_code)
         if isinstance(player_id, str) and player_id:
             self.connection_rooms[player_id] = normalized
+            self._scoped_selected_sources.clear()
         return normalized
 
     def get_player_room(self, player_id: str) -> str:
@@ -292,6 +300,59 @@ class ServerState:
         if isinstance(room_code, str) and room_code.strip():
             return room_code
         return self.DEFAULT_ROOM_CODE
+
+    @classmethod
+    def normalize_client_role(cls, value) -> str:
+        if value in {2, "2", cls.CLIENT_ROLE_EXTERNAL_SOURCE}:
+            return cls.CLIENT_ROLE_EXTERNAL_SOURCE
+        return cls.CLIENT_ROLE_PLAYER
+
+    def set_connection_identity(self, source_id: str, role, display_name=None) -> str:
+        normalized_role = self.normalize_client_role(role)
+        self.disconnected_external_sources.pop(source_id, None)
+        self.connection_roles[source_id] = normalized_role
+        normalized_name = str(display_name or "").strip()
+        if normalized_name:
+            self.connection_display_names[source_id] = normalized_name[:120]
+        else:
+            self.connection_display_names.pop(source_id, None)
+        return normalized_role
+
+    def get_connection_role(self, source_id: str) -> str:
+        return self.connection_roles.get(source_id, self.CLIENT_ROLE_PLAYER)
+
+    def is_external_source(self, source_id: str) -> bool:
+        return self.get_connection_role(source_id) == self.CLIENT_ROLE_EXTERNAL_SOURCE
+
+    def get_player_connection_ids(self) -> set[str]:
+        return {
+            source_id for source_id in self.connections
+            if not self.is_external_source(source_id)
+        }
+
+    def update_external_source_status(
+        self,
+        source_id: str,
+        health,
+        failure_code=None,
+        *,
+        received_at: Optional[float] = None,
+    ) -> dict:
+        normalized_health = str(health or "EXTERNAL_SOURCE_HEALTH_UNSPECIFIED").strip()
+        if not normalized_health.startswith("EXTERNAL_SOURCE_HEALTH_"):
+            normalized_health = "EXTERNAL_SOURCE_HEALTH_UNSPECIFIED"
+        wall_time = time.time() if received_at is None else float(received_at)
+        previous = self.external_source_statuses.get(source_id, {})
+        status = {
+            "health": normalized_health,
+            "failureCode": str(failure_code or "").strip()[:120] or None,
+            "statusReceivedAt": wall_time,
+            "lastHealthyAt": previous.get("lastHealthyAt"),
+        }
+        if normalized_health == "EXTERNAL_SOURCE_HEALTH_HEALTHY":
+            status["lastHealthyAt"] = wall_time
+        self.external_source_statuses[source_id] = status
+        return dict(status)
 
     def set_web_map_room(self, web_map_id: str, room_code) -> str:
         normalized = self.normalize_room_code(room_code)
@@ -442,7 +503,8 @@ class ServerState:
             if isinstance(key, str) and key and isinstance(value, dict)
         }
         return {
-            "timestamp": float(current_time),
+            "timestamp": time.time(),
+            "_livenessTimestamp": float(current_time),
             "submitPlayerId": submit_player_id,
             "players": list(sanitized_players_by_key.values()),
             "playersByKey": sanitized_players_by_key,
@@ -502,7 +564,7 @@ class ServerState:
         return report
 
     def cleanup_tab_reports(self, current_time: Optional[float] = None) -> None:
-        now = time.time() if current_time is None else float(current_time)
+        now = time.monotonic() if current_time is None else float(current_time)
         for source_id in list(self.tab_player_reports.keys()):
             report = self.tab_player_reports.get(source_id)
             if not isinstance(report, dict):
@@ -513,7 +575,7 @@ class ServerState:
                 del self.tab_player_reports[source_id]
                 continue
 
-            ts = report.get("timestamp")
+            ts = report.get("_livenessTimestamp")
             if not isinstance(ts, (int, float)):
                 del self.tab_player_reports[source_id]
                 continue
@@ -529,7 +591,8 @@ class ServerState:
         if not isinstance(report, dict):
             return False
 
-        report["timestamp"] = float(current_time)
+        report["timestamp"] = time.time()
+        report["_livenessTimestamp"] = float(current_time)
         return True
 
     def _build_same_server_groups(
@@ -670,6 +733,105 @@ class ServerState:
                 continue
             filtered[object_id] = node
         return filtered
+
+    @staticmethod
+    def _filter_report_map_by_sources(
+        report_map: Dict[str, Dict[str, dict]],
+        allowed_sources: set[str],
+        extra_source_predicate=None,
+    ) -> Dict[str, Dict[str, dict]]:
+        filtered: Dict[str, Dict[str, dict]] = {}
+        for object_id, source_bucket in report_map.items():
+            if not isinstance(source_bucket, dict):
+                continue
+            allowed_bucket = {
+                source_id: node
+                for source_id, node in source_bucket.items()
+                if isinstance(node, dict)
+                and (
+                    source_id in allowed_sources
+                    or (callable(extra_source_predicate) and extra_source_predicate(source_id, node))
+                )
+            }
+            if allowed_bucket:
+                filtered[object_id] = allowed_bucket
+        return filtered
+
+    def resolve_states_for_sources(self, allowed_sources: set[str], room_code: str) -> dict:
+        """先限定房间/同服来源，再执行多来源仲裁。"""
+        normalized_room = self.normalize_room_code(room_code)
+        normalized_sources = {
+            source_id for source_id in allowed_sources
+            if isinstance(source_id, str) and source_id
+        }
+        scope_key = (normalized_room, tuple(sorted(normalized_sources)))
+        selected = self._scoped_selected_sources.get(scope_key)
+        if selected is None:
+            selected = {
+                "players": {},
+                "entities": {},
+                "waypoints": {},
+                "battleChunks": {},
+            }
+            self._scoped_selected_sources[scope_key] = selected
+            if len(self._scoped_selected_sources) > 128:
+                oldest_key = next(iter(self._scoped_selected_sources))
+                if oldest_key != scope_key:
+                    self._scoped_selected_sources.pop(oldest_key, None)
+
+        players = self.resolve_report_map(
+            self._filter_report_map_by_sources(self.player_reports, normalized_sources),
+            selected["players"],
+            self.SOURCE_SWITCH_THRESHOLD_SEC,
+            prefer_object_id_source=True,
+        )
+        entities = self.resolve_report_map(
+            self._filter_report_map_by_sources(self.entity_reports, normalized_sources),
+            selected["entities"],
+            self.SOURCE_SWITCH_THRESHOLD_SEC,
+        )
+
+        def waypoint_source_allowed(source_id: str, node: dict) -> bool:
+            if not self.is_web_map_tactical_source_id(source_id):
+                return False
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            data_room = data.get("roomCode")
+            source_room = self.parse_web_map_tactical_room_code(source_id)
+            return self.normalize_room_code(data_room or source_room) == normalized_room
+
+        waypoints = self.resolve_report_map(
+            self._filter_report_map_by_sources(
+                self.waypoint_reports,
+                normalized_sources,
+                waypoint_source_allowed,
+            ),
+            selected["waypoints"],
+            self.SOURCE_SWITCH_THRESHOLD_SEC,
+        )
+
+        active_battle_chunks = self.resolve_report_map(
+            self._filter_report_map_by_sources(self.battle_chunk_reports, normalized_sources),
+            selected["battleChunks"],
+            self.SOURCE_SWITCH_THRESHOLD_SEC,
+        )
+        battle_chunks = {
+            chunk_id: self.normalize_battle_chunk_node(node)
+            for chunk_id, node in self.battle_chunk_cache.items()
+            if isinstance(node, dict)
+            and self.normalize_room_code((node.get("data") or {}).get("roomCode")) == normalized_room
+        }
+        battle_chunks.update({
+            chunk_id: self.normalize_battle_chunk_node(node)
+            for chunk_id, node in active_battle_chunks.items()
+            if isinstance(node, dict)
+        })
+
+        return {
+            "players": players,
+            "entities": entities,
+            "waypoints": waypoints,
+            "battleChunks": battle_chunks,
+        }
 
     @classmethod
     def build_web_map_tactical_source_id(cls, room_code: str) -> str:
@@ -941,7 +1103,7 @@ class ServerState:
         cells: list[dict],
         current_time: Optional[float] = None,
     ) -> dict:
-        now = time.time() if current_time is None else float(current_time)
+        now = time.monotonic() if current_time is None else float(current_time)
         normalized_room = self.normalize_room_code(room_code)
         normalized_dimension = str(dimension or "").strip() or "minecraft:overworld"
         normalized_mode = str(mode or "").strip().lower()
@@ -1443,7 +1605,7 @@ class ServerState:
         return node_timestamp(node)
 
     def prune_battle_chunk_cache(self, current_time: Optional[float] = None) -> int:
-        now = time.time() if current_time is None else float(current_time)
+        now = time.monotonic() if current_time is None else float(current_time)
         before_count = len(self.battle_chunk_cache)
         for chunk_id in list(self.battle_chunk_cache.keys()):
             node = self.battle_chunk_cache.get(chunk_id)
@@ -1456,7 +1618,7 @@ class ServerState:
         return before_count - len(self.battle_chunk_cache)
 
     def update_battle_chunk_cache(self, active_battle_chunks: Dict[str, dict], current_time: Optional[float] = None) -> None:
-        now = time.time() if current_time is None else float(current_time)
+        now = time.monotonic() if current_time is None else float(current_time)
         self.prune_battle_chunk_cache(now)
 
         for chunk_id, node in active_battle_chunks.items():
@@ -1480,7 +1642,7 @@ class ServerState:
         active_battle_chunks: Dict[str, dict],
         current_time: Optional[float] = None,
     ) -> tuple[Dict[str, dict], Dict[str, dict]]:
-        now = time.time() if current_time is None else float(current_time)
+        now = time.monotonic() if current_time is None else float(current_time)
         self.update_battle_chunk_cache(active_battle_chunks, now)
 
         effective = {
@@ -1528,7 +1690,7 @@ class ServerState:
 
     def refresh_resolved_states(self) -> dict:
         """刷新最终视图并返回相对于上一帧的 patch。"""
-        current_time = time.time()
+        current_time = time.monotonic()
         old_players = dict(self.players)
         old_entities = dict(self.entities)
         old_waypoints = dict(self.waypoints)
@@ -1608,7 +1770,7 @@ class ServerState:
         }
 
     def update_broadcast_hz_for_congestion(self) -> float:
-        load = len(self.connections)
+        load = len(self.get_player_connection_ids())
         hz = float(self.DEFAULT_BROADCAST_HZ)
         for threshold, lowered_hz in self.CONGESTION_LEVELS:
             if load >= threshold:
@@ -1619,7 +1781,7 @@ class ServerState:
 
     def cleanup_timeouts(self) -> None:
         """按来源维度清理超时上报，避免脏数据长期占用最终视图。"""
-        current_time = time.time()
+        current_time = time.monotonic()
         self.cleanup_tab_reports(current_time)
         removed_summary = {
             "players": 0,
@@ -1839,10 +2001,27 @@ class ServerState:
 
     def remove_connection(self, player_id: str) -> None:
         """连接断开时，移除该来源在所有上报池中的数据。"""
+        was_external_source = self.is_external_source(player_id)
+        if was_external_source:
+            self.disconnected_external_sources.pop(player_id, None)
+            self.disconnected_external_sources[player_id] = {
+                "displayName": self.connection_display_names.get(player_id) or player_id,
+                "roomCode": self.get_player_room(player_id),
+                "capabilities": dict(self.connection_caps.get(player_id, {})),
+                "status": dict(self.external_source_statuses.get(player_id, {})),
+                "connected": False,
+            }
+            while len(self.disconnected_external_sources) > 128:
+                oldest_source_id = next(iter(self.disconnected_external_sources))
+                self.disconnected_external_sources.pop(oldest_source_id, None)
         if player_id in self.connections:
             del self.connections[player_id]
         if player_id in self.connection_caps:
             del self.connection_caps[player_id]
         if player_id in self.connection_rooms:
             del self.connection_rooms[player_id]
+        self.connection_roles.pop(player_id, None)
+        self.connection_display_names.pop(player_id, None)
+        self.external_source_statuses.pop(player_id, None)
+        self._scoped_selected_sources.clear()
         self.clear_source_state(player_id)

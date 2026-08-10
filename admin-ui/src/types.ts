@@ -2,8 +2,10 @@ export interface RoomOverview {
   roomCode: string;
   playerConnections: number;
   webMapConnections: number;
+  externalSourceConnections?: number;
   playerIds: string[];
   webMapIds: string[];
+  externalSourceIds?: string[];
 }
 
 export interface ConnectionDetail {
@@ -14,11 +16,17 @@ export interface ConnectionDetail {
   protocolVersion: string | null;
   programVersion: string | null;
   remoteAddr: string | null;
+  connected?: boolean;
+  health?: string | null;
+  failureCode?: string | null;
+  statusReceivedAt?: number | null;
+  lastHealthyAt?: number | null;
 }
 
 export interface OverviewPayload {
   playerConnections: number;
   webMapConnections: number;
+  externalSourceConnections?: number;
   activeRooms: number;
   rooms: RoomOverview[];
   connectionDetails: ConnectionDetail[];
@@ -190,7 +198,7 @@ export type LiveStatus = "connecting" | "live" | "reconnecting";
 
 export const DEFAULT_AUDIT_FILTERS: AuditFilters = {
   eventType: "",
-  actorTypes: ["player", "web_map", "system", "admin"],
+  actorTypes: ["player", "external_source", "web_map", "system", "admin"],
   success: "",
 };
 
