@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Optional
 
 from pydantic import ValidationError
@@ -25,8 +26,8 @@ def prune_none_fields(value):
 def canonical_number(value: float) -> str:
     if not math.isfinite(value):
         return "null"
-    rounded = round(float(value), 6)
-    text = f"{rounded:.6f}".rstrip("0").rstrip(".")
+    rounded = Decimal(str(float(value))).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    text = format(rounded, "f").rstrip("0").rstrip(".")
     if text in ("", "-0"):
         return "0"
     return text

@@ -9,9 +9,24 @@ from server.core.broadcaster import Broadcaster
 from server.core.codec import ProtobufMessageCodec
 from server.proto_generated.teamviewer.v1 import teamviewer_pb2
 from server.state import ServerState
+from server.state.delta import canonical_number, state_digest_plain
 
 
 CODEC = ProtobufMessageCodec()
+
+
+def test_nullable_patch_field_forces_full_snapshot() -> None:
+    patch = {"players": {"upsert": {"player-1": {"playerName": None}}, "delete": []}}
+    assert Broadcaster._patch_requires_full_snapshot(patch, ("players",)) is True
+    assert Broadcaster._patch_requires_full_snapshot(
+        {"players": {"upsert": {"player-1": {"x": 2.0}}, "delete": []}},
+        ("players",),
+    ) is False
+
+
+def test_digest_number_and_string_canonicalization_matches_mod() -> None:
+    assert canonical_number(1.2345645) == "1.234565"
+    assert state_digest_plain({"<id>&": {"name": "<A&B>", "x": 1.2345645}}) == "0cabc8c9afc26756"
 
 
 def test_wire_envelope_payload_field_numbers_are_contiguous() -> None:

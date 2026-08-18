@@ -133,6 +133,18 @@ class Broadcaster:
                 return True
         return False
 
+    @staticmethod
+    def _patch_requires_full_snapshot(patch: dict, scopes: tuple[str, ...]) -> bool:
+        """ProtoBuf merge patches cannot represent clearing a field back to null."""
+        for scope in scopes:
+            upsert = patch.get(scope, {}).get("upsert")
+            if not isinstance(upsert, dict):
+                continue
+            for value in upsert.values():
+                if isinstance(value, dict) and any(item is None for item in value.values()):
+                    return True
+        return False
+
     def _compute_web_map_patch(self, old_state: dict, new_state: dict) -> dict:
         scope_patch = self._compute_scope_patch_for_scopes(old_state, new_state, self._web_map_sync_scopes)
 
@@ -284,7 +296,12 @@ class Broadcaster:
         else:
             self._player_last_states.pop(player_id, None)
 
-    async def maybe_send_digest(self, player_id: str, visible_state: dict | None = None) -> None:
+    async def maybe_send_digest(
+        self,
+        player_id: str,
+        visible_state: dict | None = None,
+        sync_view_state: dict | None = None,
+    ) -> None:
         """按节流周期发送摘要，帮助客户端做状态一致性检测。"""
         if self.state.is_external_source(player_id):
             return
@@ -298,13 +315,14 @@ class Broadcaster:
             return
 
         caps["lastDigestSent"] = now
-        if visible_state is None:
-            visible_state = (
-                self._build_visible_state_for_player(player_id)
-                if self.state.requires_scoped_delivery(player_id)
-                else self._build_global_player_sync_node_state()
-            )
-        sync_view_state = self._build_player_sync_view_state(visible_state)
+        if sync_view_state is None:
+            if visible_state is None:
+                visible_state = (
+                    self._build_visible_state_for_player(player_id)
+                    if self.state.requires_scoped_delivery(player_id)
+                    else self._build_global_player_sync_node_state()
+                )
+            sync_view_state = self._build_player_sync_view_state(visible_state)
         hashes = self._build_player_sync_digests(sync_view_state)
         logger.debug("Sending player digest player=%s source=outbound_projected hashes=%s", player_id, hashes)
         message = DigestPacket(
@@ -357,7 +375,15 @@ class Broadcaster:
                     await self._send_encoded(ws, encoded, channel="web_map")
                 else:
                     patch_state = self._compute_web_map_patch(previous_state, current_state)
-                    if self._has_web_map_patch_changes(patch_state):
+                    if self._patch_requires_full_snapshot(patch_state, self._web_map_sync_scopes):
+                        message_kind = "snapshot_full"
+                        message = self._build_full_message(
+                            current_state,
+                            channel="web_map",
+                            extra={"server_time": time.time()},
+                        )
+                        await self._send_encoded(ws, self._encode_message(message), channel="web_map")
+                    elif self._has_web_map_patch_changes(patch_state):
                         message_kind = "patch"
                         message = self._build_patch_message(
                             patch_state,
@@ -413,6 +439,8 @@ class Broadcaster:
         self._resolved_source_views.clear()
 
         changed = self.state.has_patch_changes(changes)
+        global_sync_view = self._build_player_sync_view_state(self._build_global_player_sync_node_state())
+        global_requires_full = self._patch_requires_full_snapshot(changes, self._player_sync_scopes)
         encoded_cache: dict[str, bytes] = {}
 
         disconnected = []
@@ -434,22 +462,25 @@ class Broadcaster:
                     sync_view_state = self._build_player_sync_view_state(visible)
                     scoped_changed = self._player_last_states.get(player_id) != sync_view_state
                     if force_full_to_delta or scoped_changed:
-                        sync_view_state["playerMarks"] = dict(self.state.player_marks)
-                        full_msg = self._build_full_message(sync_view_state)
+                        full_msg = self._build_full_message({
+                            **sync_view_state,
+                            "playerMarks": dict(self.state.player_marks),
+                        })
                         await self._send_encoded(ws, self._encode_message(full_msg), channel="player")
-                        sync_view_state.pop("playerMarks", None)
                     self._player_last_states[player_id] = sync_view_state
-                    await self.maybe_send_digest(player_id, visible)
+                    await self.maybe_send_digest(player_id, sync_view_state=sync_view_state)
                 elif player_id in self._player_last_states:
-                    sync_view_state = self._build_player_sync_view_state(self._build_global_player_sync_node_state())
-                    sync_view_state["playerMarks"] = dict(self.state.player_marks)
-                    full_msg = self._build_full_message(sync_view_state)
+                    full_msg = self._build_full_message({
+                        **global_sync_view,
+                        "playerMarks": dict(self.state.player_marks),
+                    })
                     await self._send_encoded(ws, self._encode_message(full_msg), channel="player")
                     self._player_last_states.pop(player_id, None)
-                elif force_full_to_delta:
-                    sync_view_state = self._build_player_sync_view_state(self._build_global_player_sync_node_state())
-                    sync_view_state["playerMarks"] = dict(self.state.player_marks)
-                    full_msg = self._build_full_message(sync_view_state)
+                elif force_full_to_delta or global_requires_full:
+                    full_msg = self._build_full_message({
+                        **global_sync_view,
+                        "playerMarks": dict(self.state.player_marks),
+                    })
                     encoded = self._encode_message_once(full_msg, encoded_cache, "global_player_full")
                     await self._send_encoded(ws, encoded, channel="player")
                 elif changed:
@@ -464,7 +495,7 @@ class Broadcaster:
                     await self._send_encoded(ws, encoded, channel="player")
 
                 if not requires_scoped:
-                    await self.maybe_send_digest(player_id)
+                    await self.maybe_send_digest(player_id, sync_view_state=global_sync_view)
             except RuntimeError as e:
                 logger.warning(
                     f"RuntimeError sending delta update to player={player_id} "
