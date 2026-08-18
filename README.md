@@ -164,6 +164,12 @@ docker compose up -d --build
 docker compose up -d --build
 ```
 
+当前发布版本为 `v0.5.9-proto0.6.3`。构建带版本号的本地镜像：
+
+```bash
+docker build -t professornuo/team-view-relay:v0.5.9-proto0.6.3 .
+```
+
 默认暴露：
 
 - `http://127.0.0.1:8765/admin`
@@ -245,9 +251,9 @@ Vite 开发服务器会把 `/admin/api/*`、`/admin/api/events` 和 `/admin` 代
 
 ## 协议 / 版本兼容
 
-当前协议常量位于 `src/main.py`：
+当前协议常量位于 `src/server/app/runtime.py`：
 
-- `NETWORK_PROTOCOL_VERSION = 0.6.1`
+- `NETWORK_PROTOCOL_VERSION = 0.6.3`
 - `SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = 0.6.1`
 
 共享 ProtoBuf 协议源位于：
@@ -268,7 +274,7 @@ Python 协议产物通过下面脚本生成：
 
 ```bash
 git -C third_party/TeamViewRelay-Protocol fetch --tags
-git -C third_party/TeamViewRelay-Protocol checkout proto/v0.6.1
+git -C third_party/TeamViewRelay-Protocol checkout proto/v0.6.3
 git add third_party/TeamViewRelay-Protocol
 ./scripts/generate_proto_python.sh
 uv run pytest -q

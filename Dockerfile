@@ -1,4 +1,7 @@
-FROM node:24-bookworm-slim AS admin-ui-build
+ARG NODE_IMAGE=node:24-bookworm-slim
+ARG UV_IMAGE=astral/uv:python3.13-bookworm-slim
+
+FROM ${NODE_IMAGE} AS admin-ui-build
 
 WORKDIR /admin-ui
 
@@ -10,7 +13,7 @@ COPY admin-ui/src /admin-ui/src
 RUN pnpm install --frozen-lockfile
 RUN pnpm build
 
-FROM astral/uv:python3.13-bookworm-slim
+FROM ${UV_IMAGE}
 
 WORKDIR /app
 
