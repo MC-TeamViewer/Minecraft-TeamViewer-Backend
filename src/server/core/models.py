@@ -1,6 +1,6 @@
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class PlayerData(BaseModel):
@@ -22,6 +22,32 @@ class PlayerData(BaseModel):
     height: float = Field(default=1.8, gt=0, description="碰撞箱高度", json_schema_extra={"reliableTransport": True})
 
     model_config = ConfigDict(extra="ignore")
+
+
+class LastSeenPlayerData(BaseModel):
+    """外部权威来源记录的玩家最后在线位置和 UTC 时间。"""
+
+    x: float
+    y: float
+    z: float
+    dimension: str = Field(min_length=1, max_length=256)
+    playerName: str = Field(min_length=1, max_length=64)
+    playerUUID: str = Field(min_length=1, max_length=64)
+    lastSeenAtUtcMs: int = Field(ge=0)
+    positionObservedAtUtcMs: int = Field(ge=0)
+    offlineDetectedAtUtcMs: int = Field(ge=0)
+
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_time_order(self):
+        if not (
+            self.positionObservedAtUtcMs
+            <= self.lastSeenAtUtcMs
+            <= self.offlineDetectedAtUtcMs
+        ):
+            raise ValueError("last-seen timestamps must be ordered")
+        return self
 
 
 class EntityData(BaseModel):

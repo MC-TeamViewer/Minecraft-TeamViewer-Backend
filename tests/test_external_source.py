@@ -30,6 +30,20 @@ def _node(source_id: str, timestamp: float, x: float) -> dict:
     return ServerState.build_state_node(source_id, timestamp, _player_data(x))
 
 
+def _last_seen_data(uuid: str = "00000000-0000-0000-0000-000000000999") -> dict:
+    return {
+        "x": 10.0,
+        "y": 64.0,
+        "z": 20.0,
+        "dimension": "minecraft:overworld",
+        "playerName": "Target",
+        "playerUUID": uuid,
+        "lastSeenAtUtcMs": 1_000,
+        "positionObservedAtUtcMs": 900,
+        "offlineDetectedAtUtcMs": 1_100,
+    }
+
+
 def _connected_socket() -> SimpleNamespace:
     connected = SimpleNamespace(name="CONNECTED")
     return SimpleNamespace(
@@ -204,3 +218,58 @@ def test_disconnected_external_source_keeps_bounded_admin_record() -> None:
     assert record["roomCode"] == "room-a"
     assert record["status"]["lastHealthyAt"] == 456.0
     assert source_id not in state.connections
+
+
+def test_last_seen_history_survives_source_disconnect_and_is_room_isolated() -> None:
+    state = ServerState()
+    source_id = "external-source"
+    state.connections[source_id] = _connected_socket()  # type: ignore[assignment]
+    state.set_connection_identity(source_id, "CLIENT_ROLE_EXTERNAL_SOURCE")
+    state.set_player_room(source_id, "room-a")
+    state.replace_last_seen_players(
+        source_id,
+        "room-a",
+        {"00000000-0000-0000-0000-000000000999": _last_seen_data()},
+        10.0,
+    )
+
+    state.remove_connection(source_id)
+
+    assert len(state.resolve_states_for_sources(set(), "room-a")["lastSeenPlayers"]) == 1
+    assert state.resolve_states_for_sources(set(), "room-b")["lastSeenPlayers"] == {}
+
+
+def test_online_player_suppresses_matching_last_seen_history() -> None:
+    state = ServerState()
+    source_id = "external-source"
+    player_id = "00000000-0000-0000-0000-000000000999"
+    state.connections[source_id] = _connected_socket()  # type: ignore[assignment]
+    state.set_connection_identity(source_id, "CLIENT_ROLE_EXTERNAL_SOURCE")
+    state.set_player_room(source_id, "room-a")
+    state.replace_last_seen_players(
+        source_id,
+        "room-a",
+        {player_id: _last_seen_data(player_id)},
+        10.0,
+    )
+    state.player_reports[player_id] = {source_id: _node(source_id, 11.0, 30.0)}
+
+    resolved = state.resolve_states_for_sources({source_id}, "room-a")
+
+    assert player_id in resolved["players"]
+    assert player_id not in resolved["lastSeenPlayers"]
+
+
+def test_protocol_gate_keeps_history_out_of_old_clients() -> None:
+    state = ServerState()
+    broadcaster = Broadcaster(state)
+    state.connection_caps["old"] = {"protocol": "0.6.3"}
+    state.connection_caps["new"] = {"protocol": "0.6.4"}
+    state.web_map_connection_protocols["old-web"] = "0.6.3"
+    state.web_map_connection_protocols["new-web"] = "0.6.4"
+    view = {"players": {}, "lastSeenPlayers": {"target": _last_seen_data()}}
+
+    assert broadcaster._player_supports_last_seen("old") is False
+    assert broadcaster._player_supports_last_seen("new") is True
+    assert "lastSeenPlayers" not in broadcaster._web_map_state_for_client("old-web", view)
+    assert "lastSeenPlayers" in broadcaster._web_map_state_for_client("new-web", view)

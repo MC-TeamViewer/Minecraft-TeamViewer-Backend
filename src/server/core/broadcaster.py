@@ -29,8 +29,21 @@ class Broadcaster:
         self._player_last_states: dict[str, dict] = {}
         self._resolved_source_views: dict[tuple[str, tuple[str, ...]], dict] = {}
         self._last_player_report_hints: dict[str, int] = {}
-        self._player_sync_scopes = ("players", "entities", "waypoints", "battleChunks")
-        self._web_map_sync_scopes = ("players", "entities", "waypoints", "battleChunks", "playerMarks")
+        self._player_sync_scopes = (
+            "players",
+            "entities",
+            "waypoints",
+            "battleChunks",
+            "lastSeenPlayers",
+        )
+        self._web_map_sync_scopes = (
+            "players",
+            "entities",
+            "waypoints",
+            "battleChunks",
+            "playerMarks",
+            "lastSeenPlayers",
+        )
 
     def _encode_message(self, packet) -> bytes:
         return self._codec.encode(packet)
@@ -89,6 +102,7 @@ class Broadcaster:
             "entities": self._snapshot_scope_from_state_map(resolved["entities"]),
             "waypoints": self._snapshot_scope_from_state_map(resolved["waypoints"]),
             "battleChunks": self._snapshot_scope_from_state_map(resolved["battleChunks"]),
+            "lastSeenPlayers": self._snapshot_scope_from_state_map(resolved["lastSeenPlayers"]),
             "playerMarks": dict(self.state.player_marks),
             "tabState": self.state.build_web_map_tab_snapshot(normalized_room),
             "roomCode": normalized_room,
@@ -206,10 +220,34 @@ class Broadcaster:
             "entities": self.state.entities,
             "waypoints": self.state.waypoints,
             "battleChunks": self.state.battle_chunks,
+            "lastSeenPlayers": {},
         }
 
-    def _build_player_sync_view_state(self, node_scope_state: dict) -> dict:
-        return self._compact_scope_state(node_scope_state, self._player_sync_scopes)
+    def _build_player_sync_view_state(
+        self,
+        node_scope_state: dict,
+        *,
+        include_last_seen: bool = True,
+    ) -> dict:
+        state = self._compact_scope_state(node_scope_state, self._player_sync_scopes)
+        if not include_last_seen:
+            state.pop("lastSeenPlayers", None)
+        return state
+
+    def _player_supports_last_seen(self, player_id: str) -> bool:
+        caps = self.state.connection_caps.get(player_id, {})
+        return self.state._protocol_at_least(caps.get("protocol"), "0.6.4")
+
+    def _web_map_supports_last_seen(self, web_map_id: str) -> bool:
+        return self.state._protocol_at_least(
+            self.state.web_map_connection_protocols.get(web_map_id),
+            "0.6.4",
+        )
+
+    def _web_map_state_for_client(self, web_map_id: str, state: dict) -> dict:
+        if self._web_map_supports_last_seen(web_map_id):
+            return state
+        return {key: value for key, value in state.items() if key != "lastSeenPlayers"}
 
     def _build_player_outbound_digest_view(self, sync_view_state: dict) -> dict[str, dict]:
         return {
@@ -220,10 +258,9 @@ class Broadcaster:
     def _build_player_sync_digests(self, sync_view_state: dict) -> dict[str, str]:
         digest_view = self._build_player_outbound_digest_view(sync_view_state)
         return {
-            "players": self.state.state_digest_plain(digest_view.get("players", {})),
-            "entities": self.state.state_digest_plain(digest_view.get("entities", {})),
-            "waypoints": self.state.state_digest_plain(digest_view.get("waypoints", {})),
-            "battleChunks": self.state.state_digest_plain(digest_view.get("battleChunks", {})),
+            scope: self.state.state_digest_plain(digest_view.get(scope, {}))
+            for scope in self._player_sync_scopes
+            if scope in sync_view_state
         }
 
     def _has_web_map_patch_changes(self, patch: dict) -> bool:
@@ -244,6 +281,7 @@ class Broadcaster:
             del self.state.web_map_connections[web_map_id]
         if web_map_id in self.state.web_map_connection_rooms:
             del self.state.web_map_connection_rooms[web_map_id]
+        self.state.web_map_connection_protocols.pop(web_map_id, None)
         if web_map_id in self._web_map_last_states:
             del self._web_map_last_states[web_map_id]
 
@@ -262,7 +300,10 @@ class Broadcaster:
             return
 
         web_map_room = self.state.get_web_map_room(web_map_id)
-        view_state = self._build_web_map_view_state(web_map_room)
+        view_state = self._web_map_state_for_client(
+            web_map_id,
+            self._build_web_map_view_state(web_map_room),
+        )
         message = self._build_full_message(
             view_state,
             channel="web_map",
@@ -286,12 +327,16 @@ class Broadcaster:
         if ws is None:
             return
         visible = self._build_visible_state_for_player(player_id)
-        sync_view_state = self._build_player_sync_view_state(visible)
+        supports_last_seen = self._player_supports_last_seen(player_id)
+        sync_view_state = self._build_player_sync_view_state(
+            visible,
+            include_last_seen=supports_last_seen,
+        )
         sync_view_state["playerMarks"] = dict(self.state.player_marks)
         message = self._build_full_message(sync_view_state)
         await self._send_encoded(ws, self._encode_message(message), channel="player")
         sync_view_state.pop("playerMarks", None)
-        if self.state.requires_scoped_delivery(player_id):
+        if self.state.requires_scoped_delivery(player_id) or supports_last_seen:
             self._player_last_states[player_id] = sync_view_state
         else:
             self._player_last_states.pop(player_id, None)
@@ -320,9 +365,13 @@ class Broadcaster:
                 visible_state = (
                     self._build_visible_state_for_player(player_id)
                     if self.state.requires_scoped_delivery(player_id)
+                    or self._player_supports_last_seen(player_id)
                     else self._build_global_player_sync_node_state()
                 )
-            sync_view_state = self._build_player_sync_view_state(visible_state)
+            sync_view_state = self._build_player_sync_view_state(
+                visible_state,
+                include_last_seen=self._player_supports_last_seen(player_id),
+            )
         hashes = self._build_player_sync_digests(sync_view_state)
         logger.debug("Sending player digest player=%s source=outbound_projected hashes=%s", player_id, hashes)
         message = DigestPacket(
@@ -339,7 +388,7 @@ class Broadcaster:
 
         disconnected = []
         room_states: dict[str, dict] = {}
-        encoded_full_by_room: dict[str, bytes] = {}
+        encoded_full_by_room: dict[tuple[str, bool], bytes] = {}
         for web_map_id, ws in list(self.state.web_map_connections.items()):
             web_map_room = self.state.get_web_map_room(web_map_id)
             if not self.state.websocket_is_connected(ws):
@@ -354,16 +403,18 @@ class Broadcaster:
                 continue
             try:
                 room_key = self.state.normalize_room_code(web_map_room)
-                current_state = room_states.get(room_key)
-                if current_state is None:
-                    current_state = self._build_web_map_view_state(web_map_room)
-                    room_states[room_key] = current_state
+                room_state = room_states.get(room_key)
+                if room_state is None:
+                    room_state = self._build_web_map_view_state(web_map_room)
+                    room_states[room_key] = room_state
+                current_state = self._web_map_state_for_client(web_map_id, room_state)
                 previous_state = self._web_map_last_states.get(web_map_id)
                 message_kind = "idle"
 
                 if force_full or previous_state is None:
                     message_kind = "snapshot_full"
-                    encoded = encoded_full_by_room.get(room_key)
+                    full_cache_key = (room_key, self._web_map_supports_last_seen(web_map_id))
+                    encoded = encoded_full_by_room.get(full_cache_key)
                     if encoded is None:
                         message = self._build_full_message(
                             current_state,
@@ -371,7 +422,7 @@ class Broadcaster:
                             extra={"server_time": time.time()},
                         )
                         encoded = self._encode_message(message)
-                        encoded_full_by_room[room_key] = encoded
+                        encoded_full_by_room[full_cache_key] = encoded
                     await self._send_encoded(ws, encoded, channel="web_map")
                 else:
                     patch_state = self._compute_web_map_patch(previous_state, current_state)
@@ -439,7 +490,10 @@ class Broadcaster:
         self._resolved_source_views.clear()
 
         changed = self.state.has_patch_changes(changes)
-        global_sync_view = self._build_player_sync_view_state(self._build_global_player_sync_node_state())
+        global_sync_view = self._build_player_sync_view_state(
+            self._build_global_player_sync_node_state(),
+            include_last_seen=False,
+        )
         global_requires_full = self._patch_requires_full_snapshot(changes, self._player_sync_scopes)
         encoded_cache: dict[str, bytes] = {}
 
@@ -456,10 +510,14 @@ class Broadcaster:
                 continue
 
             try:
-                requires_scoped = self.state.requires_scoped_delivery(player_id)
+                supports_last_seen = self._player_supports_last_seen(player_id)
+                requires_scoped = self.state.requires_scoped_delivery(player_id) or supports_last_seen
                 if requires_scoped:
                     visible = self._build_visible_state_for_player(player_id)
-                    sync_view_state = self._build_player_sync_view_state(visible)
+                    sync_view_state = self._build_player_sync_view_state(
+                        visible,
+                        include_last_seen=supports_last_seen,
+                    )
                     scoped_changed = self._player_last_states.get(player_id) != sync_view_state
                     if force_full_to_delta or scoped_changed:
                         full_msg = self._build_full_message({

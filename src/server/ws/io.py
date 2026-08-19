@@ -15,6 +15,8 @@ from ..core.protocol import (
     HandshakePacket,
     PacketDecodeError,
     PlayerReportBundlePacket,
+    LastSeenPlayersPatchPacket,
+    LastSeenPlayersUpdatePacket,
     PlayersPatchPacket,
     PlayersUpdatePacket,
     SourceStateClearPacket,
@@ -382,6 +384,26 @@ def expand_player_packets(packet) -> list:
                 type="external_source_status",
                 submitPlayerId=submit_player_id,
                 **packet.externalSourceStatus.model_dump(exclude={"type", "submitPlayerId"}, exclude_none=True),
+            )
+        )
+
+    if packet.lastSeenPlayersReplace is not None:
+        expanded.append(
+            LastSeenPlayersUpdatePacket(
+                type="last_seen_players_update",
+                submitPlayerId=submit_player_id,
+                players=packet.lastSeenPlayersReplace,
+            )
+        )
+    if packet.lastSeenPlayersPatch is not None and (
+        packet.lastSeenPlayersPatch.upsert or packet.lastSeenPlayersPatch.delete
+    ):
+        expanded.append(
+            LastSeenPlayersPatchPacket(
+                type="last_seen_players_patch",
+                submitPlayerId=submit_player_id,
+                upsert=packet.lastSeenPlayersPatch.upsert,
+                delete=packet.lastSeenPlayersPatch.delete,
             )
         )
 

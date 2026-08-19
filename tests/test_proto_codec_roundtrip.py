@@ -151,6 +151,19 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
                         "mode": "simmc",
                     }
                 },
+                "lastSeenPlayers": {
+                    "player-2": {
+                        "x": 4.0,
+                        "y": 65.0,
+                        "z": 6.0,
+                        "dimension": "minecraft:overworld",
+                        "playerName": "Offline",
+                        "playerUUID": "00000000-0000-0000-0000-000000000002",
+                        "lastSeenAtUtcMs": 1000,
+                        "positionObservedAtUtcMs": 900,
+                        "offlineDetectedAtUtcMs": 1100,
+                    }
+                },
             }
         )
     )
@@ -158,6 +171,7 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
     assert snapshot_full["players"]["player-1"]["dimension"] == "minecraft:overworld"
     assert snapshot_full["battleChunks"]["minecraft:overworld|1|2"]["colorRaw"] == "#112233"
     assert snapshot_full["battleChunks"]["minecraft:overworld|1|2"]["mode"] == "simmc"
+    assert snapshot_full["lastSeenPlayers"]["player-2"]["playerName"] == "Offline"
 
     patch = CODEC.decode(
         CODEC.encode(
@@ -184,6 +198,22 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
                     },
                     "delete": ["minecraft:overworld|2|3"],
                 },
+                "lastSeenPlayers": {
+                    "upsert": {
+                        "player-2": {
+                            "x": 4.0,
+                            "y": 65.0,
+                            "z": 6.0,
+                            "dimension": "minecraft:overworld",
+                            "playerName": "Offline",
+                            "playerUUID": "00000000-0000-0000-0000-000000000002",
+                            "lastSeenAtUtcMs": 1000,
+                            "positionObservedAtUtcMs": 900,
+                            "offlineDetectedAtUtcMs": 1100,
+                        }
+                    },
+                    "delete": ["player-3"],
+                },
             }
         )
     )
@@ -192,6 +222,7 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
     assert patch["players"]["delete"] == ["player-2"]
     assert patch["battleChunks"]["delete"] == ["minecraft:overworld|2|3"]
     assert patch["battleChunks"]["upsert"]["minecraft:overworld|1|2"]["mode"] == "nodemc"
+    assert patch["lastSeenPlayers"]["delete"] == ["player-3"]
 
     digest = CODEC.decode(CODEC.encode({"type": "digest", "hashes": {"players": "a", "entities": "b", "waypoints": "c"}}))
     assert digest["type"] == "digest"

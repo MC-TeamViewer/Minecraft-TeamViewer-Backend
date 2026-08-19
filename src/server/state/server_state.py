@@ -115,6 +115,9 @@ class ServerState:
         self.entity_reports: Dict[str, Dict[str, dict]] = {}
         self.waypoint_reports: Dict[str, Dict[str, dict]] = {}
         self.battle_chunk_reports: Dict[str, Dict[str, dict]] = {}
+        self.last_seen_player_reports: Dict[str, Dict[str, dict]] = {}
+        self.last_seen_source_rooms: Dict[str, str] = {}
+        self.last_seen_revision = 0
 
         # 连接与能力信息。
         self.connections: Dict[str, WebSocket] = {}
@@ -126,6 +129,7 @@ class ServerState:
         self.disconnected_external_sources: Dict[str, dict] = {}
         self.web_map_connections: Dict[str, WebSocket] = {}
         self.web_map_connection_rooms: Dict[str, str] = {}
+        self.web_map_connection_protocols: Dict[str, str] = {}
 
         # 管理端指挥态：用于玩家敌我/颜色标记。
         self.player_marks: Dict[str, dict] = {}
@@ -772,6 +776,7 @@ class ServerState:
                 "entities": {},
                 "waypoints": {},
                 "battleChunks": {},
+                "lastSeenPlayers": {},
             }
             self._scoped_selected_sources[scope_key] = selected
             if len(self._scoped_selected_sources) > 128:
@@ -826,12 +831,95 @@ class ServerState:
             if isinstance(node, dict)
         })
 
+        history_sources = {
+            source_id
+            for source_id, source_room in self.last_seen_source_rooms.items()
+            if self.normalize_room_code(source_room) == normalized_room
+        }
+        last_seen_players = self.resolve_report_map(
+            self._filter_report_map_by_sources(
+                self.last_seen_player_reports,
+                history_sources,
+            ),
+            selected["lastSeenPlayers"],
+            self.SOURCE_SWITCH_THRESHOLD_SEC,
+        )
+        online_ids: set[str] = set()
+        for player_id, node in players.items():
+            normalized_id = self._normalize_tab_uuid(player_id)
+            if normalized_id:
+                online_ids.add(normalized_id)
+            data = node.get("data") if isinstance(node, dict) else None
+            if isinstance(data, dict):
+                normalized_uuid = self._normalize_tab_uuid(data.get("playerUUID"))
+                if normalized_uuid:
+                    online_ids.add(normalized_uuid)
+        last_seen_players = {
+            player_id: node
+            for player_id, node in last_seen_players.items()
+            if self._normalize_tab_uuid(player_id) not in online_ids
+        }
+
         return {
             "players": players,
             "entities": entities,
             "waypoints": waypoints,
             "battleChunks": battle_chunks,
+            "lastSeenPlayers": last_seen_players,
         }
+
+    def replace_last_seen_players(
+        self,
+        source_id: str,
+        room_code: str,
+        players: Dict[str, dict],
+        received_monotonic: float,
+    ) -> None:
+        self._remove_last_seen_source_reports(source_id)
+        self.last_seen_source_rooms[source_id] = self.normalize_room_code(room_code)
+        for object_id, data in players.items():
+            self._upsert_last_seen_player(source_id, object_id, data, received_monotonic)
+        self.last_seen_revision += 1
+        self._scoped_selected_sources.clear()
+
+    def patch_last_seen_players(
+        self,
+        source_id: str,
+        room_code: str,
+        upsert: Dict[str, dict],
+        delete: list[str],
+        received_monotonic: float,
+    ) -> None:
+        self.last_seen_source_rooms[source_id] = self.normalize_room_code(room_code)
+        for object_id, data in upsert.items():
+            self._upsert_last_seen_player(source_id, object_id, data, received_monotonic)
+        for object_id in delete:
+            normalized_id = self._normalize_tab_uuid(object_id)
+            if normalized_id:
+                self.delete_report(self.last_seen_player_reports, normalized_id, source_id)
+        self.last_seen_revision += 1
+        self._scoped_selected_sources.clear()
+
+    def _upsert_last_seen_player(
+        self,
+        source_id: str,
+        object_id: str,
+        data: dict,
+        received_monotonic: float,
+    ) -> None:
+        normalized_id = self._normalize_tab_uuid(
+            data.get("playerUUID") if isinstance(data, dict) else object_id
+        ) or self._normalize_tab_uuid(object_id)
+        if not normalized_id or not isinstance(data, dict):
+            return
+        normalized_data = dict(data)
+        normalized_data["playerUUID"] = normalized_id
+        node = self.build_state_node(source_id, received_monotonic, normalized_data)
+        self.upsert_report(self.last_seen_player_reports, normalized_id, source_id, node)
+
+    def _remove_last_seen_source_reports(self, source_id: str) -> None:
+        for object_id in list(self.last_seen_player_reports):
+            self.delete_report(self.last_seen_player_reports, object_id, source_id)
 
     @classmethod
     def build_web_map_tactical_source_id(cls, room_code: str) -> str:
@@ -1970,7 +2058,14 @@ class ServerState:
                 scope = raw_scope.strip().lower()
                 if scope == "tab":
                     scope = "tab_players"
-                if scope in {"players", "entities", "tab_players", "waypoints", "battle_chunks"}:
+                if scope in {
+                    "players",
+                    "entities",
+                    "tab_players",
+                    "waypoints",
+                    "battle_chunks",
+                    "last_seen_players",
+                }:
                     requested_scopes.add(scope)
 
         if not requested_scopes:
@@ -1998,6 +2093,11 @@ class ServerState:
         if "battle_chunks" in requested_scopes:
             remove_source_reports(self.battle_chunk_reports)
             self.battle_map_reporter_state.pop(player_id, None)
+        if "last_seen_players" in requested_scopes:
+            self._remove_last_seen_source_reports(player_id)
+            self.last_seen_source_rooms.pop(player_id, None)
+            self.last_seen_revision += 1
+            self._scoped_selected_sources.clear()
 
     def remove_connection(self, player_id: str) -> None:
         """连接断开时，移除该来源在所有上报池中的数据。"""

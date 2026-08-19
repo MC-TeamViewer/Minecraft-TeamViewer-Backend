@@ -637,6 +637,17 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
                 "delete": list(tab_players_patch.get("delete", [])),
             }
 
+        last_seen_replace = data.get("lastSeenPlayersReplace")
+        if isinstance(last_seen_replace, dict):
+            bundle["lastSeenPlayersReplace"] = last_seen_replace.get("players", {})
+
+        last_seen_patch = data.get("lastSeenPlayersPatch")
+        if isinstance(last_seen_patch, dict):
+            bundle["lastSeenPlayersPatch"] = {
+                "upsert": _patch_upserts_to_map(last_seen_patch.get("upsert", [])),
+                "delete": list(last_seen_patch.get("delete", [])),
+            }
+
         for key in (
             "battleMapObservation",
             "stateKeepalive",
@@ -712,6 +723,12 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
                 "upsert": _battle_chunk_entries_to_local_map(battle_chunk_scope.get("upsert")),
                 "delete": _battle_chunk_refs_to_local_ids(battle_chunk_scope.get("delete")),
             }
+        last_seen_scope = data.get("lastSeenPlayers")
+        if isinstance(last_seen_scope, dict):
+            data["lastSeenPlayers"] = {
+                "upsert": _patch_upserts_to_map(last_seen_scope.get("upsert", [])),
+                "delete": list(last_seen_scope.get("delete", [])),
+            }
         data["type"] = "patch"
         data["_payload_case"] = payload_name
         return data
@@ -778,6 +795,7 @@ def _convert_patch_body(body: dict[str, Any]) -> dict[str, Any]:
         ("entities", "entities"),
         ("waypoints", "waypoints"),
         ("playerMarks", "playerMarks"),
+        ("lastSeenPlayers", "lastSeenPlayers"),
     ):
         converted = _scope_patch_to_proto(body.get(old_key))
         if converted:
@@ -812,7 +830,15 @@ def _convert_patch_body(body: dict[str, Any]) -> dict[str, Any]:
 
 def _convert_snapshot_body(body: dict[str, Any]) -> dict[str, Any]:
     proto_body: dict[str, Any] = {}
-    for key in ("players", "entities", "waypoints", "playerMarks", "tabState", "connections"):
+    for key in (
+        "players",
+        "entities",
+        "waypoints",
+        "playerMarks",
+        "tabState",
+        "connections",
+        "lastSeenPlayers",
+    ):
         value = body.get(key)
         if value is not None:
             proto_body[key] = value

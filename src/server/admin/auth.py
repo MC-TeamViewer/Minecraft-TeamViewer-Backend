@@ -383,6 +383,11 @@ def build_connection_details() -> list[dict]:
                     "failureCode": source_status.get("failureCode"),
                     "statusReceivedAt": source_status.get("statusReceivedAt"),
                     "lastHealthyAt": source_status.get("lastHealthyAt"),
+                    "lastSeenPlayerCount": sum(
+                        1
+                        for bucket in runtime.state.last_seen_player_reports.values()
+                        if player_id in bucket
+                    ),
                 }
             )
             continue
@@ -422,6 +427,11 @@ def build_connection_details() -> list[dict]:
                 "failureCode": source_status.get("failureCode"),
                 "statusReceivedAt": source_status.get("statusReceivedAt"),
                 "lastHealthyAt": source_status.get("lastHealthyAt"),
+                "lastSeenPlayerCount": sum(
+                    1
+                    for bucket in runtime.state.last_seen_player_reports.values()
+                    if source_id in bucket
+                ),
             }
         )
 

@@ -9,6 +9,7 @@ from .models import (
     BattleMapObservationCandidate,
     BattleMapObservationCell,
     EntityData,
+    LastSeenPlayerData,
     PlayerData,
     WaypointData,
 )
@@ -141,6 +142,19 @@ class ExternalSourceStatusPacket(PacketModel):
     failureCode: str | None = None
 
 
+class LastSeenPlayersUpdatePacket(PacketModel):
+    type: Literal["last_seen_players_update"]
+    submitPlayerId: str | None = None
+    players: dict[str, LastSeenPlayerData] = Field(default_factory=dict)
+
+
+class LastSeenPlayersPatchPacket(PacketModel):
+    type: Literal["last_seen_players_patch"]
+    submitPlayerId: str | None = None
+    upsert: dict[str, LastSeenPlayerData] = Field(default_factory=dict)
+    delete: list[str] = Field(default_factory=list)
+
+
 class WaypointsUpdatePacket(PacketModel):
     type: Literal["waypoints_update"]
     submitPlayerId: str | None = None
@@ -207,6 +221,8 @@ class PlayerReportBundlePacket(PacketModel):
     waypointsDelete: WaypointsDeletePacket | None = None
     waypointsEntityDeathCancel: WaypointsEntityDeathCancelPacket | None = None
     externalSourceStatus: ExternalSourceStatusPacket | None = None
+    lastSeenPlayersReplace: dict[str, LastSeenPlayerData] | None = None
+    lastSeenPlayersPatch: ScopePatchPacket | None = None
 
 
 WebMapInboundPacket = Annotated[
@@ -240,6 +256,8 @@ PlayerInboundPacket = Annotated[
     | StateKeepalivePacket
     | SourceStateClearPacket
     | ExternalSourceStatusPacket
+    | LastSeenPlayersUpdatePacket
+    | LastSeenPlayersPatchPacket
     | WaypointsUpdatePacket
     | WaypointsPatchPacket
     | WaypointsDeletePacket
@@ -377,6 +395,7 @@ class SnapshotFullPacket(OutboundPacket):
     connections: list[str] | None = None
     connections_count: int | None = None
     server_time: float | None = None
+    lastSeenPlayers: dict[str, Any] | None = None
 
 
 class PatchPacket(OutboundPacket):
@@ -388,6 +407,7 @@ class PatchPacket(OutboundPacket):
     battleChunks: dict[str, Any] | None = None
     playerMarks: dict[str, Any] | None = None
     meta: dict[str, Any] | None = None
+    lastSeenPlayers: dict[str, Any] | None = None
 
 
 class DigestPacket(OutboundPacket):

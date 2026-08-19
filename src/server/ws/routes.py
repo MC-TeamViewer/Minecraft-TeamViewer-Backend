@@ -26,6 +26,8 @@ from ..core.protocol import (
     HandshakeHelpers,
     HandshakePacket,
     ExternalSourceStatusPacket,
+    LastSeenPlayersPatchPacket,
+    LastSeenPlayersUpdatePacket,
     PacketDecodeError,
     PacketParsers,
     PingPacket,
@@ -193,6 +195,7 @@ async def web_map_ws(websocket: WebSocket):
                 )
                 runtime.state.web_map_connections[web_map_id] = websocket
                 runtime.state.set_web_map_room(web_map_id, web_map_room)
+                runtime.state.web_map_connection_protocols[web_map_id] = client_protocol
                 runtime.web_map_connection_meta[web_map_id] = {
                     "protocolVersion": client_protocol,
                     "programVersion": client_program_version,
@@ -497,6 +500,7 @@ async def web_map_ws(websocket: WebSocket):
             del runtime.state.web_map_connections[web_map_id]
         if web_map_id in runtime.state.web_map_connection_rooms:
             del runtime.state.web_map_connection_rooms[web_map_id]
+        runtime.state.web_map_connection_protocols.pop(web_map_id, None)
         runtime.web_map_connection_meta.pop(web_map_id, None)
 
 
@@ -726,8 +730,50 @@ async def websocket_endpoint(websocket: WebSocket):
                     trigger_admin_sse_overview()
                     continue
 
+                if isinstance(
+                    expanded_packet,
+                    (LastSeenPlayersUpdatePacket, LastSeenPlayersPatchPacket),
+                ):
+                    if not runtime.state.is_external_source(submit_player_id):
+                        runtime.logger.warning(
+                            "Ignore last-seen history from player role submitPlayerId=%s",
+                            submit_player_id,
+                        )
+                        continue
+                    current_time = time.monotonic()
+                    room_code = runtime.state.get_player_room(submit_player_id)
+                    if isinstance(expanded_packet, LastSeenPlayersUpdatePacket):
+                        runtime.state.replace_last_seen_players(
+                            submit_player_id,
+                            room_code,
+                            {
+                                player_id: player.model_dump()
+                                for player_id, player in expanded_packet.players.items()
+                            },
+                            current_time,
+                        )
+                    else:
+                        runtime.state.patch_last_seen_players(
+                            submit_player_id,
+                            room_code,
+                            {
+                                player_id: player.model_dump()
+                                for player_id, player in expanded_packet.upsert.items()
+                            },
+                            expanded_packet.delete,
+                            current_time,
+                        )
+                    await runtime.broadcaster.broadcast_web_map_updates()
+                    continue
+
                 if (
-                    expanded_packet.type not in {"tab_players_update", "tab_players_patch"}
+                    expanded_packet.type
+                    not in {
+                        "tab_players_update",
+                        "tab_players_patch",
+                        "last_seen_players_update",
+                        "last_seen_players_patch",
+                    }
                     and not isinstance(expanded_packet, SourceStateClearPacket)
                 ):
                     runtime.state.touch_tab_player_report(submit_player_id, time.monotonic())
