@@ -24,6 +24,27 @@ def test_nullable_patch_field_forces_full_snapshot() -> None:
     ) is False
 
 
+def test_patch_clear_fields_roundtrip_as_explicit_none() -> None:
+    encoded = CODEC.encode({
+        "type": "patch",
+        "players": {
+            "upsert": {"player-1": {"x": 2.0, "playerName": None}},
+            "delete": [],
+        },
+    })
+
+    envelope = teamviewer_pb2.WireEnvelope.FromString(encoded)
+    upsert = envelope.patch.players.upsert[0]
+    assert upsert.data.x == 2.0
+    assert list(upsert.clear_fields) == ["playerName"]
+
+    decoded = CODEC.decode(encoded)
+    assert decoded["players"]["upsert"]["player-1"] == {
+        "x": 2.0,
+        "playerName": None,
+    }
+
+
 def test_digest_number_and_string_canonicalization_matches_mod() -> None:
     assert canonical_number(1.2345645) == "1.234565"
     assert state_digest_plain({"<id>&": {"name": "<A&B>", "x": 1.2345645}}) == "0cabc8c9afc26756"

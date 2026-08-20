@@ -44,6 +44,7 @@ class Broadcaster:
             "playerMarks",
             "lastSeenPlayers",
         )
+        self._player_delivery_scopes = self._player_sync_scopes + ("playerMarks",)
 
     def _encode_message(self, packet) -> bytes:
         return self._codec.encode(packet)
@@ -92,18 +93,26 @@ class Broadcaster:
             return {}
         return {object_id: node.get("data", {}) for object_id, node in state_map.items() if isinstance(node, dict)}
 
+    def _client_visible_scope_from_state_map(self, scope_name: str, state_map: dict) -> dict:
+        return self.state.build_player_outbound_digest_scope(
+            scope_name,
+            self._snapshot_scope_from_state_map(state_map),
+        )
+
     def _build_web_map_view_state(self, web_map_room: str | None = None) -> dict:
         normalized_room = self.state.normalize_room_code(web_map_room)
         allowed_sources = self.state.get_active_sources_in_room(normalized_room)
         player_sources = allowed_sources.intersection(self.state.get_player_connection_ids())
         resolved = self._resolve_source_view(allowed_sources, normalized_room)
         return {
-            "players": self._snapshot_scope_from_state_map(resolved["players"]),
-            "entities": self._snapshot_scope_from_state_map(resolved["entities"]),
-            "waypoints": self._snapshot_scope_from_state_map(resolved["waypoints"]),
-            "battleChunks": self._snapshot_scope_from_state_map(resolved["battleChunks"]),
-            "lastSeenPlayers": self._snapshot_scope_from_state_map(resolved["lastSeenPlayers"]),
-            "playerMarks": dict(self.state.player_marks),
+            "players": self._client_visible_scope_from_state_map("players", resolved["players"]),
+            "entities": self._client_visible_scope_from_state_map("entities", resolved["entities"]),
+            "waypoints": self._client_visible_scope_from_state_map("waypoints", resolved["waypoints"]),
+            "battleChunks": self._client_visible_scope_from_state_map("battleChunks", resolved["battleChunks"]),
+            "lastSeenPlayers": self._client_visible_scope_from_state_map(
+                "lastSeenPlayers", resolved["lastSeenPlayers"]
+            ),
+            "playerMarks": self.state.prune_none_fields(dict(self.state.player_marks)),
             "tabState": self.state.build_web_map_tab_snapshot(normalized_room),
             "roomCode": normalized_room,
             "connections": sorted(player_sources),
@@ -134,7 +143,7 @@ class Broadcaster:
             scope_patch = self.state.compute_scope_patch(
                 self._wrap_plain_scope(old_state.get(scope, {})),
                 self._wrap_plain_scope(new_state.get(scope, {})),
-                full_replace=(scope == "battleChunks"),
+                full_replace=(scope in {"battleChunks", "playerMarks", "lastSeenPlayers"}),
             )
             if scope_patch.get("upsert") or scope_patch.get("delete"):
                 patch[scope] = scope_patch
@@ -149,7 +158,7 @@ class Broadcaster:
 
     @staticmethod
     def _patch_requires_full_snapshot(patch: dict, scopes: tuple[str, ...]) -> bool:
-        """ProtoBuf merge patches cannot represent clearing a field back to null."""
+        """Return whether this patch contains explicit field removals."""
         for scope in scopes:
             upsert = patch.get(scope, {}).get("upsert")
             if not isinstance(upsert, dict):
@@ -158,6 +167,72 @@ class Broadcaster:
                 if isinstance(value, dict) and any(item is None for item in value.values()):
                     return True
         return False
+
+    @staticmethod
+    def _protocol_supports_clear_fields(protocol_version: str | None) -> bool:
+        return ServerState._protocol_at_least(protocol_version, "0.6.5")
+
+    def _split_patch_for_legacy_client(
+        self,
+        patch: dict,
+        current_state: dict,
+        scopes: tuple[str, ...],
+    ) -> list[dict]:
+        """Replace clear_fields with delete + full upsert for pre-0.6.5 clients."""
+        if not self._patch_requires_full_snapshot(patch, scopes):
+            return [patch]
+
+        delete_phase: dict = {}
+        upsert_phase: dict = {}
+        for scope in scopes:
+            scope_patch = patch.get(scope)
+            if not isinstance(scope_patch, dict):
+                continue
+            upsert = scope_patch.get("upsert") if isinstance(scope_patch.get("upsert"), dict) else {}
+            delete_ids = [item for item in scope_patch.get("delete", []) if isinstance(item, str) and item]
+            replacement_ids = [
+                object_id for object_id, delta in upsert.items()
+                if isinstance(delta, dict) and any(value is None for value in delta.values())
+            ]
+            phase_delete_ids = list(dict.fromkeys(delete_ids + replacement_ids))
+            if phase_delete_ids:
+                delete_phase[scope] = {"upsert": {}, "delete": phase_delete_ids}
+
+            phase_upsert: dict = {}
+            current_scope = current_state.get(scope) if isinstance(current_state.get(scope), dict) else {}
+            for object_id, delta in upsert.items():
+                if object_id in replacement_ids:
+                    current_value = current_scope.get(object_id)
+                    if isinstance(current_value, dict):
+                        phase_upsert[object_id] = dict(current_value)
+                elif isinstance(delta, dict):
+                    phase_upsert[object_id] = dict(delta)
+            if phase_upsert:
+                upsert_phase[scope] = {"upsert": phase_upsert, "delete": []}
+
+        if isinstance(patch.get("meta"), dict) and patch["meta"]:
+            upsert_phase["meta"] = dict(patch["meta"])
+        return [phase for phase in (delete_phase, upsert_phase) if phase]
+
+    async def _send_compatible_patch(
+        self,
+        ws,
+        patch: dict,
+        current_state: dict,
+        scopes: tuple[str, ...],
+        protocol_version: str | None,
+        *,
+        channel: str,
+        extra: dict | None = None,
+    ) -> None:
+        phases = (
+            [patch]
+            if self._protocol_supports_clear_fields(protocol_version)
+            else self._split_patch_for_legacy_client(patch, current_state, scopes)
+        )
+        for phase in phases:
+            message = self._build_patch_message(phase, channel=channel if channel == "web_map" else None, extra=extra)
+            await self._send_encoded(ws, self._encode_message(message), channel=channel)
 
     def _compute_web_map_patch(self, old_state: dict, new_state: dict) -> dict:
         scope_patch = self._compute_scope_patch_for_scopes(old_state, new_state, self._web_map_sync_scopes)
@@ -207,10 +282,12 @@ class Broadcaster:
 
         return patch
 
-    @staticmethod
-    def _compact_scope_state(node_scope_state: dict, scopes: tuple[str, ...]) -> dict:
+    def _compact_scope_state(self, node_scope_state: dict, scopes: tuple[str, ...]) -> dict:
         return {
-            scope: ServerState.compact_state_map(node_scope_state.get(scope, {}))
+            scope: self.state.build_player_outbound_digest_scope(
+                scope,
+                ServerState.compact_state_map(node_scope_state.get(scope, {})),
+            )
             for scope in scopes
         }
 
@@ -349,14 +426,13 @@ class Broadcaster:
             visible,
             include_last_seen=supports_last_seen,
         )
-        sync_view_state["playerMarks"] = dict(self.state.player_marks)
-        message = self._build_full_message(sync_view_state)
+        delivery_state = {
+            **sync_view_state,
+            "playerMarks": self.state.prune_none_fields(dict(self.state.player_marks)),
+        }
+        message = self._build_full_message(delivery_state)
         await self._send_encoded(ws, self._encode_message(message), channel="player")
-        sync_view_state.pop("playerMarks", None)
-        if self.state.requires_scoped_delivery(player_id) or supports_last_seen:
-            self._player_last_states[player_id] = sync_view_state
-        else:
-            self._player_last_states.pop(player_id, None)
+        self._player_last_states[player_id] = delivery_state
 
     async def maybe_send_digest(
         self,
@@ -446,22 +522,17 @@ class Broadcaster:
                     await self._send_encoded(ws, encoded, channel="web_map")
                 else:
                     patch_state = self._compute_web_map_patch(previous_state, current_state)
-                    if self._patch_requires_full_snapshot(patch_state, self._web_map_sync_scopes):
-                        message_kind = "snapshot_full"
-                        message = self._build_full_message(
-                            current_state,
-                            channel="web_map",
-                            extra={"server_time": time.time()},
-                        )
-                        await self._send_encoded(ws, self._encode_message(message), channel="web_map")
-                    elif self._has_web_map_patch_changes(patch_state):
+                    if self._has_web_map_patch_changes(patch_state):
                         message_kind = "patch"
-                        message = self._build_patch_message(
+                        await self._send_compatible_patch(
+                            ws,
                             patch_state,
+                            current_state,
+                            self._web_map_sync_scopes,
+                            self.state.web_map_connection_protocols.get(web_map_id),
                             channel="web_map",
                             extra={"server_time": time.time()},
                         )
-                        await self._send_encoded(ws, self._encode_message(message), channel="web_map")
 
                 self._web_map_last_states[web_map_id] = current_state
             except WebSocketDisconnect as e:
@@ -506,16 +577,8 @@ class Broadcaster:
         """统一广播入口：清理超时、计算 patch、按能力下发。"""
         await self.request_preexpiry_refreshes()
         self.state.cleanup_timeouts()
-        changes = self.state.refresh_resolved_states()
+        self.state.refresh_resolved_states()
         self._resolved_source_views.clear()
-
-        changed = self.state.has_patch_changes(changes)
-        global_sync_view = self._build_player_sync_view_state(
-            self._build_global_player_sync_node_state(),
-            include_last_seen=False,
-        )
-        global_requires_full = self._patch_requires_full_snapshot(changes, self._player_sync_scopes)
-        encoded_cache: dict[str, bytes] = {}
 
         disconnected = []
         for player_id, ws in list(self.state.connections.items()):
@@ -524,67 +587,55 @@ class Broadcaster:
             if not self.state.websocket_is_connected(ws):
                 logger.debug(
                     f"Skip delta broadcast to disconnected websocket player={player_id} "
-                    f"state=({self.state.websocket_state_label(ws)}) changed={changed}"
+                    f"state=({self.state.websocket_state_label(ws)})"
                 )
                 disconnected.append(player_id)
                 continue
 
             try:
                 supports_last_seen = self._player_supports_last_seen(player_id)
-                requires_scoped = self.state.requires_scoped_delivery(player_id) or supports_last_seen
-                if requires_scoped:
-                    visible = self._build_visible_state_for_player(player_id)
-                    sync_view_state = self._build_player_sync_view_state(
-                        visible,
-                        include_last_seen=supports_last_seen,
-                    )
-                    scoped_changed = self._player_last_states.get(player_id) != sync_view_state
-                    if force_full_to_delta or scoped_changed:
-                        full_msg = self._build_full_message({
-                            **sync_view_state,
-                            "playerMarks": dict(self.state.player_marks),
-                        })
-                        await self._send_encoded(ws, self._encode_message(full_msg), channel="player")
-                    self._player_last_states[player_id] = sync_view_state
-                    await self.maybe_send_digest(player_id, sync_view_state=sync_view_state)
-                elif player_id in self._player_last_states:
-                    full_msg = self._build_full_message({
-                        **global_sync_view,
-                        "playerMarks": dict(self.state.player_marks),
-                    })
+                visible = self._build_visible_state_for_player(player_id)
+                sync_view_state = self._build_player_sync_view_state(
+                    visible,
+                    include_last_seen=supports_last_seen,
+                )
+                delivery_state = {
+                    **sync_view_state,
+                    "playerMarks": self.state.prune_none_fields(dict(self.state.player_marks)),
+                }
+                previous_state = self._player_last_states.get(player_id)
+                if force_full_to_delta or previous_state is None:
+                    full_msg = self._build_full_message(delivery_state)
                     await self._send_encoded(ws, self._encode_message(full_msg), channel="player")
-                    self._player_last_states.pop(player_id, None)
-                elif force_full_to_delta or global_requires_full:
-                    full_msg = self._build_full_message({
-                        **global_sync_view,
-                        "playerMarks": dict(self.state.player_marks),
-                    })
-                    encoded = self._encode_message_once(full_msg, encoded_cache, "global_player_full")
-                    await self._send_encoded(ws, encoded, channel="player")
-                elif changed:
-                    patch_state = {
-                        "players": changes["players"],
-                        "entities": changes["entities"],
-                        "waypoints": changes["waypoints"],
-                        "battleChunks": changes["battleChunks"],
-                    }
-                    patch_msg = self._build_patch_message(patch_state)
-                    encoded = self._encode_message_once(patch_msg, encoded_cache, "global_player_patch")
-                    await self._send_encoded(ws, encoded, channel="player")
-
-                if not requires_scoped:
-                    await self.maybe_send_digest(player_id, sync_view_state=global_sync_view)
+                elif previous_state != delivery_state:
+                    patch_state = self._compute_scope_patch_for_scopes(
+                        previous_state,
+                        delivery_state,
+                        self._player_delivery_scopes,
+                    )
+                    if self._has_scope_patch_changes(patch_state, self._player_delivery_scopes):
+                        caps = self.state.connection_caps.get(player_id, {})
+                        await self._send_compatible_patch(
+                            ws,
+                            patch_state,
+                            delivery_state,
+                            self._player_delivery_scopes,
+                            caps.get("protocol"),
+                            channel="player",
+                        )
+                self._player_last_states[player_id] = delivery_state
+                await self.maybe_send_digest(player_id, sync_view_state=sync_view_state)
             except RuntimeError as e:
                 logger.warning(
                     f"RuntimeError sending delta update to player={player_id} "
-                    f"state=({self.state.websocket_state_label(ws)}) changed={changed} "
+                    f"state=({self.state.websocket_state_label(ws)}) "
                     f"force_full={force_full_to_delta}: {e}"
                 )
                 disconnected.append(player_id)
             except Exception as e:
                 logger.warning(
                     f"Error sending delta update to player={player_id} "
-                    f"state=({self.state.websocket_state_label(ws)}) changed={changed} "
+                    f"state=({self.state.websocket_state_label(ws)}) "
                     f"force_full={force_full_to_delta}: {e}"
                 )
                 disconnected.append(player_id)

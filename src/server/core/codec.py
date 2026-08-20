@@ -250,6 +250,10 @@ def _battle_chunk_entries_to_local_map(entries: Any) -> dict[str, Any]:
         if local_entry is None:
             continue
         chunk_id, value = local_entry
+        if isinstance(item, dict):
+            for field_name in item.get("clearFields", []):
+                if isinstance(field_name, str) and field_name:
+                    value[field_name] = None
         mapped[chunk_id] = value
     return mapped
 
@@ -296,13 +300,23 @@ def _battle_chunk_patch_to_proto(scope: dict[str, Any] | None) -> dict[str, Any]
             if not isinstance(chunk_id, str) or not isinstance(patch, dict):
                 continue
             ref = _battle_chunk_ref_from_sources(chunk_id, patch)
-            value = _battle_chunk_value_from_data(patch, include_meta=False)
+            value = _battle_chunk_value_from_data(
+                {field_name: value for field_name, value in patch.items() if value is not None},
+                include_meta=False,
+            )
             if ref is None or value is None:
                 continue
-            proto_upsert.append({
+            item = {
                 "ref": ref,
                 "data": value,
-            })
+            }
+            clear_fields = sorted(
+                field_name for field_name, value in patch.items()
+                if isinstance(field_name, str) and field_name and value is None
+            )
+            if clear_fields:
+                item["clearFields"] = clear_fields
+            proto_upsert.append(item)
         if proto_upsert:
             proto_scope["upsert"] = proto_upsert
     if isinstance(delete, list) and delete:
@@ -394,8 +408,11 @@ def _patch_upserts_to_map(items: list[dict[str, Any]]) -> dict[str, Any]:
         item_id = item.get("id")
         if not isinstance(item_id, str) or not item_id:
             continue
-        data = item.get("data")
-        mapped[item_id] = data if isinstance(data, dict) else {}
+        data = dict(item.get("data")) if isinstance(item.get("data"), dict) else {}
+        for field_name in item.get("clearFields", []):
+            if isinstance(field_name, str) and field_name:
+                data[field_name] = None
+        mapped[item_id] = data
     return mapped
 
 
@@ -751,6 +768,13 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
 
     if payload_name == "patch":
         data = _message_to_plain_dict(payload)
+        for scope_name in ("players", "entities", "waypoints", "playerMarks"):
+            scope = data.get(scope_name)
+            if isinstance(scope, dict):
+                data[scope_name] = {
+                    "upsert": _patch_upserts_to_map(scope.get("upsert", [])),
+                    "delete": list(scope.get("delete", [])),
+                }
         battle_chunk_scope = data.get("battleChunks")
         if isinstance(battle_chunk_scope, dict):
             data["battleChunks"] = {
@@ -812,11 +836,23 @@ def _scope_patch_to_proto(scope: dict[str, Any] | None) -> dict[str, Any] | None
     delete = scope.get("delete")
     proto_scope: dict[str, Any] = {}
     if isinstance(upsert, dict) and upsert:
-        proto_scope["upsert"] = [
-            {"id": object_id, "data": patch}
-            for object_id, patch in upsert.items()
-            if isinstance(object_id, str) and object_id and isinstance(patch, dict)
-        ]
+        proto_upsert: list[dict[str, Any]] = []
+        for object_id, patch in upsert.items():
+            if not isinstance(object_id, str) or not object_id or not isinstance(patch, dict):
+                continue
+            item = {
+                "id": object_id,
+                "data": {field_name: value for field_name, value in patch.items() if value is not None},
+            }
+            clear_fields = sorted(
+                field_name for field_name, value in patch.items()
+                if isinstance(field_name, str) and field_name and value is None
+            )
+            if clear_fields:
+                item["clearFields"] = clear_fields
+            proto_upsert.append(item)
+        if proto_upsert:
+            proto_scope["upsert"] = proto_upsert
     if isinstance(delete, list) and delete:
         proto_scope["delete"] = [item for item in delete if isinstance(item, str) and item]
     return proto_scope or None

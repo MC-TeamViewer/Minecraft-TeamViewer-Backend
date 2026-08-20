@@ -206,8 +206,95 @@ async def test_scoped_view_change_is_sent_when_global_winner_does_not_change() -
 
     assert state.players[target]["data"]["x"] == 9.0
     snapshots = [ProtobufMessageCodec().decode(payload) for payload in sent]
-    scoped_snapshot = next(packet for packet in snapshots if packet["type"] == "snapshot_full")
-    assert scoped_snapshot["players"][target]["x"] == 2.0
+    assert all(packet["type"] != "snapshot_full" for packet in snapshots)
+    scoped_patch = next(packet for packet in snapshots if packet["type"] == "patch")
+    assert scoped_patch["players"]["upsert"][target]["x"] == 2.0
+
+
+def test_legacy_field_clear_is_split_into_delete_then_full_object_upsert() -> None:
+    state = ServerState()
+    broadcaster = Broadcaster(state)
+    current = {
+        "players": {
+            "target": {
+                "x": 2.0,
+                "y": 64.0,
+                "z": 3.0,
+                "dimension": "minecraft:overworld",
+            }
+        }
+    }
+    patch = {
+        "players": {
+            "upsert": {"target": {"x": 2.0, "playerName": None}},
+            "delete": [],
+        }
+    }
+
+    phases = broadcaster._split_patch_for_legacy_client(patch, current, ("players",))
+
+    assert phases == [
+        {"players": {"upsert": {}, "delete": ["target"]}},
+        {"players": {"upsert": {"target": current["players"]["target"]}, "delete": []}},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("protocol_version", "expected_packet_count"),
+    (("0.6.4", 2), ("0.6.5", 1)),
+)
+async def test_field_clear_delivery_never_falls_back_to_snapshot_full(
+    protocol_version: str,
+    expected_packet_count: int,
+) -> None:
+    state = ServerState()
+    broadcaster = Broadcaster(state)
+    current = {
+        "players": {
+            "target": {
+                "x": 2.0,
+                "y": 64.0,
+                "z": 3.0,
+                "dimension": "minecraft:overworld",
+            }
+        }
+    }
+    patch = {
+        "players": {
+            "upsert": {"target": {"x": 2.0, "playerName": None}},
+            "delete": [],
+        }
+    }
+    sent: list[bytes] = []
+
+    async def capture_send(self, ws, payload: bytes, *, channel: str) -> None:
+        sent.append(payload)
+
+    broadcaster._send_encoded = MethodType(capture_send, broadcaster)
+    await broadcaster._send_compatible_patch(
+        _connected_socket(),
+        patch,
+        current,
+        ("players",),
+        protocol_version,
+        channel="player",
+    )
+
+    packets = [ProtobufMessageCodec().decode(payload) for payload in sent]
+    assert len(packets) == expected_packet_count
+    assert all(packet["type"] == "patch" for packet in packets)
+    if protocol_version == "0.6.4":
+        assert packets[0]["players"] == {"upsert": {}, "delete": ["target"]}
+        assert packets[1]["players"] == {
+            "upsert": {"target": current["players"]["target"]},
+            "delete": [],
+        }
+    else:
+        assert packets[0]["players"]["upsert"]["target"] == {
+            "x": 2.0,
+            "playerName": None,
+        }
 
 
 def test_wall_clock_jumps_do_not_change_monotonic_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:

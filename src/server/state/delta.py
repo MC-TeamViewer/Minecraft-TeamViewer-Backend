@@ -114,6 +114,8 @@ def compute_field_delta(old_data: Optional[dict], new_data: dict) -> dict:
     for key, value in new_data.items():
         if old_data.get(key) != value:
             delta[key] = value
+    for key in old_data.keys() - new_data.keys():
+        delta[key] = None
     return delta
 
 
@@ -122,7 +124,11 @@ def merge_patch_and_validate(model_cls, existing_node: Optional[dict], patch_dat
     if existing_node and isinstance(existing_node.get("data"), dict):
         merged.update(existing_node["data"])
     if isinstance(patch_data, dict):
-        merged.update(patch_data)
+        for key, value in patch_data.items():
+            if value is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = value
     validated = model_cls(**merged)
     return validated.model_dump()
 
@@ -304,7 +310,11 @@ def compute_scope_patch(old_map: Dict[str, dict], new_map: Dict[str, dict], *, f
         if not isinstance(new_data, dict):
             new_data = {}
         if full_replace:
-            delta = dict(new_data) if old_data != new_data else {}
+            delta = compute_field_delta(old_data if isinstance(old_data, dict) else None, new_data)
+            if delta:
+                # Replacement-style scopes still carry the full current object,
+                # while clear_fields removes optional keys that disappeared.
+                delta.update(new_data)
         else:
             delta = compute_field_delta(old_data if isinstance(old_data, dict) else None, new_data)
         if delta:
