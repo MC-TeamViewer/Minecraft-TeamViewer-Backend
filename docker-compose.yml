@@ -1,5 +1,6 @@
 services:
   backend:
+    image: ${TEAMVIEWER_IMAGE:-professornuo/team-view-relay:v0.5.12-proto0.6.5}
     build:
       context: .
       dockerfile: Dockerfile
