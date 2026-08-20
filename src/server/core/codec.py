@@ -399,6 +399,37 @@ def _patch_upserts_to_map(items: list[dict[str, Any]]) -> dict[str, Any]:
     return mapped
 
 
+def _last_seen_players_to_map(value: Any) -> dict[str, Any]:
+    """Normalize last-seen map values without weakening their model contract.
+
+    Proto map keys carry the player identity as well as the value message.  A
+    proto3 string with its default value is omitted from the wire, so older or
+    corrupted source history can arrive without ``playerUUID``.  The key is
+    the authoritative identity for this scope and can safely restore it.
+    """
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, Any] = {}
+    for raw_id, raw_data in value.items():
+        player_id = str(raw_id or "").strip()
+        if not player_id:
+            continue
+        if not isinstance(raw_data, dict):
+            continue
+        data = dict(raw_data)
+        player_uuid = data.get("playerUUID")
+        if not isinstance(player_uuid, str) or not player_uuid.strip():
+            data["playerUUID"] = player_id
+        normalized[player_id] = data
+    return normalized
+
+
+def _last_seen_patch_upserts_to_map(items: Any) -> dict[str, Any]:
+    if not isinstance(items, list):
+        return {}
+    return _last_seen_players_to_map(_patch_upserts_to_map(items))
+
+
 def _remap_message_value(value: Any, field: FieldDescriptor) -> Any:
     if field.type != FieldDescriptor.TYPE_MESSAGE:
         return value
@@ -639,12 +670,14 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
 
         last_seen_replace = data.get("lastSeenPlayersReplace")
         if isinstance(last_seen_replace, dict):
-            bundle["lastSeenPlayersReplace"] = last_seen_replace.get("players", {})
+            bundle["lastSeenPlayersReplace"] = _last_seen_players_to_map(
+                last_seen_replace.get("players", {})
+            )
 
         last_seen_patch = data.get("lastSeenPlayersPatch")
         if isinstance(last_seen_patch, dict):
             bundle["lastSeenPlayersPatch"] = {
-                "upsert": _patch_upserts_to_map(last_seen_patch.get("upsert", [])),
+                "upsert": _last_seen_patch_upserts_to_map(last_seen_patch.get("upsert", [])),
                 "delete": list(last_seen_patch.get("delete", [])),
             }
 
@@ -711,6 +744,7 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
     if payload_name == "snapshot_full":
         data = _message_to_plain_dict(payload)
         data["battleChunks"] = _battle_chunk_entries_to_local_map(data.get("battleChunks"))
+        data["lastSeenPlayers"] = _last_seen_players_to_map(data.get("lastSeenPlayers"))
         data["type"] = "snapshot_full"
         data["_payload_case"] = payload_name
         return data
@@ -726,7 +760,7 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
         last_seen_scope = data.get("lastSeenPlayers")
         if isinstance(last_seen_scope, dict):
             data["lastSeenPlayers"] = {
-                "upsert": _patch_upserts_to_map(last_seen_scope.get("upsert", [])),
+                "upsert": _last_seen_patch_upserts_to_map(last_seen_scope.get("upsert", [])),
                 "delete": list(last_seen_scope.get("delete", [])),
             }
         data["type"] = "patch"

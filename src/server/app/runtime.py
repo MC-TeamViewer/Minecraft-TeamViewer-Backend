@@ -11,7 +11,7 @@ from ..state import ServerState
 
 NETWORK_PROTOCOL_VERSION = "0.6.4"
 SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.6.1"
-SERVER_PROGRAM_VERSION = "team-view-relay-server-v0.5.10-proto0.6.4"
+SERVER_PROGRAM_VERSION = "team-view-relay-server-v0.5.11-proto0.6.4"
 LEGACY_PROTOCOL_REJECTION_REASON = (
     "unsupported_protocol_version: "
     "当前服务器仅支持 Protobuf 协议（0.6.1 及以上）。"

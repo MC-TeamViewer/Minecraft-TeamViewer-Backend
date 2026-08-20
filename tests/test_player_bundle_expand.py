@@ -85,3 +85,49 @@ def test_proto3_zero_coordinates_are_not_treated_as_missing() -> None:
 
     assert expanded[0].players["target"].x == 0.0
     assert expanded[0].players["target"].z == 0.0
+
+
+def test_last_seen_uuid_is_restored_from_full_map_key() -> None:
+    codec = ProtobufMessageCodec()
+    player_id = "d5be8d2c-548e-38f8-94b6-d275ddc220f2"
+    envelope = teamviewer_pb2.WireEnvelope(channel=teamviewer_pb2.WIRE_CHANNEL_PLAYER)
+    bundle = envelope.player_report_bundle
+    bundle.submit_player_id = "source-1"
+    value = bundle.last_seen_players_replace.players[player_id]
+    value.x = 30203.0
+    value.y = 41.0
+    value.z = 17.0
+    value.dimension = "minecraft:overworld"
+    value.player_name = "Player"
+    value.last_seen_at_utc_ms = 1_000
+    value.position_observed_at_utc_ms = 900
+    value.offline_detected_at_utc_ms = 1_100
+
+    decoded = codec.decode(envelope.SerializeToString())
+    assert decoded["lastSeenPlayersReplace"][player_id]["playerUUID"] == player_id
+    expanded = expand_player_packets(PlayerReportBundlePacket(**decoded))
+    assert expanded[0].players[player_id].playerUUID == player_id
+
+
+def test_last_seen_uuid_is_restored_from_patch_id() -> None:
+    codec = ProtobufMessageCodec()
+    player_id = "227c6060-7661-4c7c-8d17-f5dc0a661b35"
+    envelope = teamviewer_pb2.WireEnvelope(channel=teamviewer_pb2.WIRE_CHANNEL_PLAYER)
+    bundle = envelope.player_report_bundle
+    bundle.submit_player_id = "source-1"
+    upsert = bundle.last_seen_players_patch.upsert.add()
+    upsert.id = player_id
+    value = upsert.data
+    value.x = 27333.0
+    value.y = 49.0
+    value.z = 12.0
+    value.dimension = "minecraft:overworld"
+    value.player_name = "Player"
+    value.last_seen_at_utc_ms = 2_000
+    value.position_observed_at_utc_ms = 1_900
+    value.offline_detected_at_utc_ms = 2_100
+
+    decoded = codec.decode(envelope.SerializeToString())
+    assert decoded["lastSeenPlayersPatch"]["upsert"][player_id]["playerUUID"] == player_id
+    expanded = expand_player_packets(PlayerReportBundlePacket(**decoded))
+    assert expanded[0].upsert[player_id].playerUUID == player_id

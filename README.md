@@ -164,10 +164,10 @@ docker compose up -d --build
 docker compose up -d --build
 ```
 
-当前发布版本为 `v0.5.10-proto0.6.4`。构建带版本号的本地镜像：
+当前发布版本为 `v0.5.11-proto0.6.4`。构建带版本号的本地镜像：
 
 ```bash
-docker build -t professornuo/team-view-relay:v0.5.10-proto0.6.4 .
+docker build -t professornuo/team-view-relay:v0.5.11-proto0.6.4 .
 ```
 
 默认暴露：
