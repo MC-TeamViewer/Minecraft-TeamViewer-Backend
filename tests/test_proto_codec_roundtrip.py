@@ -55,11 +55,13 @@ def test_optional_client_role_presence_and_external_status_roundtrip() -> None:
                 "submitPlayerId": "source-1",
                 "clientRole": "CLIENT_ROLE_EXTERNAL_SOURCE",
                 "clientDisplayName": "SIMMC",
+                "positionResolution": 1.0,
             }
         )
     )
     assert handshake["clientRole"] == "CLIENT_ROLE_EXTERNAL_SOURCE"
     assert handshake["clientDisplayName"] == "SIMMC"
+    assert handshake["positionResolution"] == 1.0
 
     envelope = teamviewer_pb2.WireEnvelope(channel=teamviewer_pb2.WIRE_CHANNEL_PLAYER)
     envelope.player_report_bundle.submit_player_id = "source-1"
@@ -140,6 +142,10 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
                         "y": 64.0,
                         "z": 2.0,
                         "dimension": "minecraft:overworld",
+                        "positionSourceId": "squaremap-source",
+                        "positionSourceKind": "PLAYER_POSITION_SOURCE_KIND_EXTERNAL_SOURCE",
+                        "positionSourceDisplayName": "Squaremap",
+                        "positionResolution": 1.0,
                     }
                 },
                 "battleChunks": {
@@ -169,6 +175,9 @@ def test_codec_roundtrip_core_outbound_payloads() -> None:
     )
     assert snapshot_full["type"] == "snapshot_full"
     assert snapshot_full["players"]["player-1"]["dimension"] == "minecraft:overworld"
+    assert snapshot_full["players"]["player-1"]["positionSourceId"] == "squaremap-source"
+    assert snapshot_full["players"]["player-1"]["positionSourceKind"] == "PLAYER_POSITION_SOURCE_KIND_EXTERNAL_SOURCE"
+    assert snapshot_full["players"]["player-1"]["positionResolution"] == 1.0
     assert snapshot_full["battleChunks"]["minecraft:overworld|1|2"]["colorRaw"] == "#112233"
     assert snapshot_full["battleChunks"]["minecraft:overworld|1|2"]["mode"] == "simmc"
     assert snapshot_full["lastSeenPlayers"]["player-2"]["playerName"] == "Offline"
@@ -291,6 +300,9 @@ def test_player_outbound_digest_view_matches_client_visible_battle_chunk_shape()
                 "dimension": "minecraft:overworld",
                 "playerName": "tester",
                 "playerUUID": None,
+                "positionSourceId": "source-1",
+                "positionSourceKind": "PLAYER_POSITION_SOURCE_KIND_EXTERNAL_SOURCE",
+                "positionResolution": 1.0,
             }
         },
         "entities": {},
@@ -321,6 +333,7 @@ def test_player_outbound_digest_view_matches_client_visible_battle_chunk_shape()
     digest_view = broadcaster._build_player_outbound_digest_view(sync_view_state)
 
     assert digest_view["players"]["player-1"]["playerName"] == "tester"
+    assert digest_view["players"]["player-1"]["positionResolution"] == 1.0
     assert "playerUUID" not in digest_view["players"]["player-1"]
     assert "roomCode" not in digest_view["waypoints"]["wp-1"]
     assert "default|minecraft:overworld|1|2" not in digest_view["battleChunks"]
@@ -332,4 +345,16 @@ def test_player_outbound_digest_view_matches_client_visible_battle_chunk_shape()
         "roomCode": "default",
         "colorMode": "raw_observed",
         "mode": "simmc",
+    }
+
+    legacy_digest_view = broadcaster._build_player_outbound_digest_view(
+        sync_view_state,
+        include_player_source_metadata=False,
+    )
+    assert legacy_digest_view["players"]["player-1"] == {
+        "x": 1.0,
+        "y": 64.0,
+        "z": 2.0,
+        "dimension": "minecraft:overworld",
+        "playerName": "tester",
     }

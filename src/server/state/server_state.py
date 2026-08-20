@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -96,6 +97,15 @@ class ServerState:
     BATTLE_CHUNK_COLOR_MODE_RAW_OBSERVED = "raw_observed"
     CLIENT_ROLE_PLAYER = "CLIENT_ROLE_PLAYER"
     CLIENT_ROLE_EXTERNAL_SOURCE = "CLIENT_ROLE_EXTERNAL_SOURCE"
+    PLAYER_POSITION_SOURCE_KIND_SELF_REPORT = "PLAYER_POSITION_SOURCE_KIND_SELF_REPORT"
+    PLAYER_POSITION_SOURCE_KIND_PLAYER_REPORT = "PLAYER_POSITION_SOURCE_KIND_PLAYER_REPORT"
+    PLAYER_POSITION_SOURCE_KIND_EXTERNAL_SOURCE = "PLAYER_POSITION_SOURCE_KIND_EXTERNAL_SOURCE"
+    PLAYER_POSITION_SOURCE_FIELDS = frozenset({
+        "positionSourceId",
+        "positionSourceKind",
+        "positionSourceDisplayName",
+        "positionResolution",
+    })
 
     # 服务端配置文件（TOML）路径。
     CONFIG_FILE_NAME = "server_state_config.toml"
@@ -327,6 +337,49 @@ class ServerState:
 
     def is_external_source(self, source_id: str) -> bool:
         return self.get_connection_role(source_id) == self.CLIENT_ROLE_EXTERNAL_SOURCE
+
+    @staticmethod
+    def normalize_position_resolution(value) -> Optional[float]:
+        if not isinstance(value, (int, float)):
+            return None
+        normalized = float(value)
+        if not math.isfinite(normalized) or normalized <= 0:
+            return None
+        return normalized
+
+    def player_source_priority(self, object_id: str, source_id: str, node: dict) -> int:
+        if str(object_id).lower() == str(source_id).lower():
+            return 2
+        if self.is_external_source(source_id):
+            return 0
+        return 1
+
+    def decorate_player_source_metadata(self, players: Dict[str, dict]) -> Dict[str, dict]:
+        decorated: Dict[str, dict] = {}
+        for object_id, node in players.items():
+            if not isinstance(node, dict):
+                continue
+            source_id = node.get("submitPlayerId")
+            data = dict(node.get("data")) if isinstance(node.get("data"), dict) else {}
+            if isinstance(source_id, str) and source_id:
+                if str(object_id).lower() == source_id.lower():
+                    source_kind = self.PLAYER_POSITION_SOURCE_KIND_SELF_REPORT
+                elif self.is_external_source(source_id):
+                    source_kind = self.PLAYER_POSITION_SOURCE_KIND_EXTERNAL_SOURCE
+                else:
+                    source_kind = self.PLAYER_POSITION_SOURCE_KIND_PLAYER_REPORT
+                data["positionSourceId"] = source_id
+                data["positionSourceKind"] = source_kind
+                display_name = self.connection_display_names.get(source_id)
+                if isinstance(display_name, str) and display_name:
+                    data["positionSourceDisplayName"] = display_name
+                resolution = self.normalize_position_resolution(
+                    self.connection_caps.get(source_id, {}).get("positionResolution")
+                )
+                if resolution is not None:
+                    data["positionResolution"] = resolution
+            decorated[object_id] = self.clone_state_node_with_data(node, data)
+        return decorated
 
     def get_player_connection_ids(self) -> set[str]:
         return {
@@ -789,7 +842,9 @@ class ServerState:
             selected["players"],
             self.SOURCE_SWITCH_THRESHOLD_SEC,
             prefer_object_id_source=True,
+            source_priority=self.player_source_priority,
         )
+        players = self.decorate_player_source_metadata(players)
         entities = self.resolve_report_map(
             self._filter_report_map_by_sources(self.entity_reports, normalized_sources),
             selected["entities"],
@@ -1576,7 +1631,13 @@ class ServerState:
     def prune_none_fields(cls, value):
         return prune_none_fields(value)
 
-    def build_player_outbound_digest_scope(self, scope_name: str, scope_map: Dict[str, dict]) -> Dict[str, dict]:
+    def build_player_outbound_digest_scope(
+        self,
+        scope_name: str,
+        scope_map: Dict[str, dict],
+        *,
+        include_player_source_metadata: bool = True,
+    ) -> Dict[str, dict]:
         if not isinstance(scope_map, dict):
             return {}
 
@@ -1593,11 +1654,16 @@ class ServerState:
                 )
             return projected
 
-        return {
-            str(object_id): self.prune_none_fields(raw_data if isinstance(raw_data, dict) else {})
-            for object_id, raw_data in scope_map.items()
-            if isinstance(object_id, str) and object_id
-        }
+        projected: Dict[str, dict] = {}
+        for object_id, raw_data in scope_map.items():
+            if not isinstance(object_id, str) or not object_id:
+                continue
+            data = dict(raw_data) if isinstance(raw_data, dict) else {}
+            if scope_name == "players" and not include_player_source_metadata:
+                for field_name in self.PLAYER_POSITION_SOURCE_FIELDS:
+                    data.pop(field_name, None)
+            projected[str(object_id)] = self.prune_none_fields(data)
+        return projected
 
     @staticmethod
     def canonical_number(value: float) -> str:
@@ -1764,12 +1830,14 @@ class ServerState:
         selected_sources: Dict[str, str],
         switch_threshold_sec: float,
         prefer_object_id_source: bool = False,
+        source_priority=None,
     ) -> Dict[str, dict]:
         return resolve_report_map(
             report_map,
             selected_sources,
             switch_threshold_sec,
             prefer_object_id_source=prefer_object_id_source,
+            source_priority=source_priority,
         )
 
     @classmethod
@@ -1789,7 +1857,9 @@ class ServerState:
             self.player_selected_sources,
             self.SOURCE_SWITCH_THRESHOLD_SEC,
             prefer_object_id_source=True,
+            source_priority=self.player_source_priority,
         )
+        self.players = self.decorate_player_source_metadata(self.players)
         self.entities = self.resolve_report_map(
             self.entity_reports,
             self.entity_selected_sources,
@@ -1836,6 +1906,7 @@ class ServerState:
         preferred_report_interval_ticks=None,
         min_report_interval_ticks=None,
         max_report_interval_ticks=None,
+        position_resolution=None,
     ) -> None:
         """记录客户端协议与广播节流状态。"""
         normalized_protocol = self._normalize_protocol_version(protocol_version)
@@ -1855,6 +1926,7 @@ class ServerState:
             "minReportIntervalTicks": min_ticks,
             "maxReportIntervalTicks": max_ticks,
             "negotiatedReportIntervalTicks": max(min_ticks, min(max_ticks, preferred_ticks)),
+            "positionResolution": self.normalize_position_resolution(position_resolution),
         }
 
     def update_broadcast_hz_for_congestion(self) -> float:

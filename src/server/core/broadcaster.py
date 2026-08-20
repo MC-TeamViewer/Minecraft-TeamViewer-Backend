@@ -249,14 +249,31 @@ class Broadcaster:
             return state
         return {key: value for key, value in state.items() if key != "lastSeenPlayers"}
 
-    def _build_player_outbound_digest_view(self, sync_view_state: dict) -> dict[str, dict]:
+    def _build_player_outbound_digest_view(
+        self,
+        sync_view_state: dict,
+        *,
+        include_player_source_metadata: bool = True,
+    ) -> dict[str, dict]:
         return {
-            scope: self.state.build_player_outbound_digest_scope(scope, sync_view_state.get(scope, {}))
+            scope: self.state.build_player_outbound_digest_scope(
+                scope,
+                sync_view_state.get(scope, {}),
+                include_player_source_metadata=include_player_source_metadata,
+            )
             for scope in self._player_sync_scopes
         }
 
-    def _build_player_sync_digests(self, sync_view_state: dict) -> dict[str, str]:
-        digest_view = self._build_player_outbound_digest_view(sync_view_state)
+    def _build_player_sync_digests(
+        self,
+        sync_view_state: dict,
+        *,
+        include_player_source_metadata: bool = True,
+    ) -> dict[str, str]:
+        digest_view = self._build_player_outbound_digest_view(
+            sync_view_state,
+            include_player_source_metadata=include_player_source_metadata,
+        )
         return {
             scope: self.state.state_digest_plain(digest_view.get(scope, {}))
             for scope in self._player_sync_scopes
@@ -372,7 +389,10 @@ class Broadcaster:
                 visible_state,
                 include_last_seen=self._player_supports_last_seen(player_id),
             )
-        hashes = self._build_player_sync_digests(sync_view_state)
+        hashes = self._build_player_sync_digests(
+            sync_view_state,
+            include_player_source_metadata=self.state._protocol_at_least(caps.get("protocol"), "0.6.5"),
+        )
         logger.debug("Sending player digest player=%s source=outbound_projected hashes=%s", player_id, hashes)
         message = DigestPacket(
             hashes=hashes,

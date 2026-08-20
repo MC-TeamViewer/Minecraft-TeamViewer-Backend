@@ -31,6 +31,7 @@ class HandshakePacket(PacketModel):
     maxReportIntervalTicks: int | None = None
     clientRole: str | int | None = None
     clientDisplayName: str | None = None
+    positionResolution: float | None = None
 
 
 class PingPacket(PacketModel):

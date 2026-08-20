@@ -2,7 +2,7 @@ import hashlib
 import json
 import math
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from pydantic import ValidationError
 
@@ -220,6 +220,7 @@ def resolve_report_map(
     switch_threshold_sec: float,
     *,
     prefer_object_id_source: bool = False,
+    source_priority: Optional[Callable[[str, str, dict], int]] = None,
 ) -> Dict[str, dict]:
     resolved: Dict[str, dict] = {}
     next_selected_sources: Dict[str, str] = {}
@@ -236,19 +237,31 @@ def resolve_report_map(
         if not valid_bucket:
             continue
 
+        def priority_for(source_id: str, node: dict) -> int:
+            if source_priority is not None:
+                return int(source_priority(str(object_id), str(source_id), node))
+            if prefer_object_id_source and str(source_id) == str(object_id):
+                return 1
+            return 0
+
         best_source_id = None
         best_node = None
+        best_priority = -(2**31)
         best_timestamp = float("-inf")
         for source_id, node in valid_bucket.items():
+            priority_value = priority_for(source_id, node)
             timestamp_value = node_timestamp(node)
 
-            if timestamp_value > best_timestamp:
+            if priority_value > best_priority or (
+                priority_value == best_priority and timestamp_value > best_timestamp
+            ):
                 best_source_id = source_id
                 best_node = node
+                best_priority = priority_value
                 best_timestamp = timestamp_value
                 continue
 
-            if timestamp_value == best_timestamp:
+            if priority_value == best_priority and timestamp_value == best_timestamp:
                 current_best_key = str(best_source_id) if best_source_id is not None else ""
                 current_key = str(source_id)
                 if current_key < current_best_key:
@@ -258,20 +271,14 @@ def resolve_report_map(
         chosen_source_id = best_source_id
         chosen_node = best_node
 
-        preferred_source = str(object_id) if prefer_object_id_source else None
-        if preferred_source and preferred_source in valid_bucket:
-            preferred_node = valid_bucket[preferred_source]
-            preferred_ts = node_timestamp(preferred_node)
-            if best_timestamp - preferred_ts <= switch_threshold_sec:
-                chosen_source_id = preferred_source
-                chosen_node = preferred_node
-
         previous_source = selected_sources.get(object_id)
         if previous_source in valid_bucket:
             previous_node = valid_bucket[previous_source]
             previous_ts = node_timestamp(previous_node)
             chosen_ts = node_timestamp(chosen_node)
-            if chosen_ts - previous_ts <= switch_threshold_sec:
+            previous_priority = priority_for(previous_source, previous_node)
+            chosen_priority = priority_for(chosen_source_id, chosen_node)
+            if previous_priority == chosen_priority and chosen_ts - previous_ts <= switch_threshold_sec:
                 chosen_source_id = previous_source
                 chosen_node = previous_node
 

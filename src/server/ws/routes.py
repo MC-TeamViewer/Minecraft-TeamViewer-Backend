@@ -637,6 +637,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         packet.preferredReportIntervalTicks,
                         packet.minReportIntervalTicks,
                         packet.maxReportIntervalTicks,
+                        packet.positionResolution,
                     )
                     client_role = runtime.state.set_connection_identity(
                         submit_player_id,
@@ -695,6 +696,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "clientProgramVersion": client_program_version,
                             "clientRole": client_role,
                             "clientDisplayName": packet.clientDisplayName,
+                            "positionResolution": runtime.state.normalize_position_resolution(packet.positionResolution),
                         },
                     )
                     if not is_external_source:

@@ -90,6 +90,58 @@ def test_source_stickiness_switches_only_after_receipt_time_lead() -> None:
     assert switched["target"]["submitPlayerId"] == "source-b"
 
 
+def test_player_resolution_prefers_active_self_report_over_newer_external_report() -> None:
+    state = ServerState()
+    target = "target"
+    external = "external-source"
+    state.connections[target] = _connected_socket()  # type: ignore[assignment]
+    state.connections[external] = _connected_socket()  # type: ignore[assignment]
+    state.set_connection_identity(target, "CLIENT_ROLE_PLAYER")
+    state.set_connection_identity(external, "CLIENT_ROLE_EXTERNAL_SOURCE", "Squaremap")
+    state.mark_player_capability(external, "0.6.5", position_resolution=1.0)
+    state.player_selected_sources[target] = external
+    state.player_reports[target] = {
+        target: _node(target, 10.0, 1.25),
+        external: _node(external, 100.0, 1.0),
+    }
+
+    state.refresh_resolved_states()
+
+    resolved = state.players[target]
+    assert resolved["submitPlayerId"] == target
+    assert resolved["data"]["x"] == 1.25
+    assert resolved["data"]["positionSourceId"] == target
+    assert resolved["data"]["positionSourceKind"] == "PLAYER_POSITION_SOURCE_KIND_SELF_REPORT"
+    assert "positionResolution" not in resolved["data"]
+
+
+def test_player_resolution_prefers_player_report_then_falls_back_to_external() -> None:
+    state = ServerState()
+    observer = "player-source"
+    external = "external-source"
+    state.connections[observer] = _connected_socket()  # type: ignore[assignment]
+    state.connections[external] = _connected_socket()  # type: ignore[assignment]
+    state.set_connection_identity(observer, "CLIENT_ROLE_PLAYER")
+    state.set_connection_identity(external, "CLIENT_ROLE_EXTERNAL_SOURCE", "Squaremap")
+    state.mark_player_capability(external, "0.6.5", position_resolution=1.0)
+    state.player_reports["target"] = {
+        observer: _node(observer, 10.0, 1.25),
+        external: _node(external, 100.0, 1.0),
+    }
+
+    state.refresh_resolved_states()
+    assert state.players["target"]["submitPlayerId"] == observer
+    assert state.players["target"]["data"]["positionSourceKind"] == "PLAYER_POSITION_SOURCE_KIND_PLAYER_REPORT"
+
+    state.clear_source_state(observer, ["players"])
+    state.refresh_resolved_states()
+    resolved = state.players["target"]
+    assert resolved["submitPlayerId"] == external
+    assert resolved["data"]["positionSourceKind"] == "PLAYER_POSITION_SOURCE_KIND_EXTERNAL_SOURCE"
+    assert resolved["data"]["positionSourceDisplayName"] == "Squaremap"
+    assert resolved["data"]["positionResolution"] == 1.0
+
+
 def test_scoped_arbitration_falls_back_when_global_winner_is_not_visible() -> None:
     state = ServerState()
     state.player_reports["target"] = {
