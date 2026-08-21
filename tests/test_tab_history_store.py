@@ -117,3 +117,36 @@ async def test_uuid_fallback_rich_text_degrade_and_retention_tombstone(store: Ta
     )
     assert delta["deleteUuids"] == [player_uuid]
     assert delta["head"]["digestSha256"] == hashlib.sha256(b"").digest()
+
+
+async def test_history_rejects_legacy_prefix_copied_into_display_name(store: TabHistoryStore):
+    player_uuid = "12345678-1234-5678-9234-567812345678"
+    assert await store.upsert_players(
+        "room",
+        [(player_uuid, {
+            "name": "Player",
+            "displayName": "[利雅得] Player",
+            "prefixedName": "nt00011bf146084c",
+            "scoreboardPrefix": "nt00011bf146084c",
+        })],
+        observed_at_ms=1_000,
+    )
+    assert not await store.upsert_players(
+        "room",
+        [(player_uuid, {
+            "name": "Player",
+            "displayName": "nt00011bf146084c",
+            "prefixedName": "nt00011bf146084c",
+            "scoreboardPrefix": "nt00011bf146084c",
+        })],
+        observed_at_ms=2_000,
+    )
+
+    full = await store.sync(
+        "room",
+        preferred_mode="TAB_HISTORY_SYNC_MODE_FULL",
+        base_revision=None,
+        base_digest=None,
+        allow_full_fallback=False,
+    )
+    assert full["upsert"][0]["player"]["displayName"] == "[利雅得] Player"

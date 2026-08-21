@@ -896,16 +896,22 @@ async def websocket_endpoint(websocket: WebSocket):
                 if expanded_packet.type == "tab_players_patch":
                     if isinstance(submit_player_id, str) and submit_player_id:
                         current_time = time.monotonic()
-                        runtime.state.patch_tab_player_report(
+                        report = runtime.state.patch_tab_player_report(
                             submit_player_id,
                             expanded_packet.upsert,
                             expanded_packet.delete,
                             current_time,
                         )
                         if runtime.tab_history_store is not None and tab_history_supported_for_protocol(player_protocol):
+                            players_by_key = report.get("playersByKey") if isinstance(report, dict) else {}
+                            history_updates = [
+                                (key, players_by_key.get(key, value))
+                                for key, value in expanded_packet.upsert.items()
+                                if isinstance(players_by_key, dict) and isinstance(players_by_key.get(key, value), dict)
+                            ]
                             changed = await runtime.tab_history_store.upsert_players(
                                 runtime.state.get_player_room(submit_player_id),
-                                list(expanded_packet.upsert.items()),
+                                history_updates,
                             )
                             if changed:
                                 await broadcast_tab_history_digest(

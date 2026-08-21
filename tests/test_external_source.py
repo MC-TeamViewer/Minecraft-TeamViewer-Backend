@@ -90,6 +90,26 @@ def test_source_stickiness_switches_only_after_receipt_time_lead() -> None:
     assert switched["target"]["submitPlayerId"] == "source-b"
 
 
+def test_tab_patch_preserves_existing_complete_display_name() -> None:
+    state = ServerState()
+    player_uuid = "12345678-1234-5678-9234-567812345678"
+    state.upsert_tab_player_report("source", [{
+        "uuid": player_uuid,
+        "name": "Player",
+        "displayName": "[利雅得] Player",
+        "scoreboardPrefix": "nt00011bf146084c",
+    }], 1.0)
+
+    report = state.patch_tab_player_report("source", {
+        player_uuid: {"uuid": player_uuid, "name": "Renamed"},
+    }, [], 2.0)
+
+    entry = report["playersByKey"][player_uuid]
+    assert entry["name"] == "Renamed"
+    assert entry["displayName"] == "[利雅得] Player"
+    assert entry["scoreboardPrefix"] == "nt00011bf146084c"
+
+
 def test_player_resolution_prefers_active_self_report_over_newer_external_report() -> None:
     state = ServerState()
     target = "target"

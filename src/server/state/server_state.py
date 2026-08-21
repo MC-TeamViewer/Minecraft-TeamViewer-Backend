@@ -553,19 +553,26 @@ class ServerState:
         if entry_uuid is None and entry_name is None and entry_display_name is None and entry_prefixed_name is None:
             return None
 
-        return {
-            "uuid": entry_uuid,
-            "name": entry_name,
-            "displayName": entry_display_name,
-            "prefixedName": entry_prefixed_name,
-            "scoreboardTeamId": scoreboard_team_id,
-            "scoreboardPrefix": scoreboard_prefix if scoreboard_prefix is not None else entry_prefixed_name,
-            "scoreboardSuffix": scoreboard_suffix,
-            "scoreboardColorRgb": item.get("scoreboardColorRgb"),
-            "formattedDisplayName": item.get("formattedDisplayName"),
-            "formattedScoreboardPrefix": item.get("formattedScoreboardPrefix"),
-            "formattedScoreboardSuffix": item.get("formattedScoreboardSuffix"),
-        }
+        # TabPlayerEntry fields are optional in the wire protocol.  Preserve that
+        # distinction so a partial patch cannot erase a previously observed label.
+        entry: dict[str, Any] = {}
+        for key, value in (
+            ("uuid", entry_uuid),
+            ("name", entry_name),
+            ("displayName", entry_display_name),
+            ("prefixedName", entry_prefixed_name),
+            ("scoreboardTeamId", scoreboard_team_id),
+            ("scoreboardPrefix", scoreboard_prefix),
+            ("scoreboardSuffix", scoreboard_suffix),
+        ):
+            if value is not None:
+                entry[key] = value
+        if "scoreboardPrefix" not in entry and entry_prefixed_name is not None:
+            entry["scoreboardPrefix"] = entry_prefixed_name
+        for key in ("scoreboardColorRgb", "formattedDisplayName", "formattedScoreboardPrefix", "formattedScoreboardSuffix"):
+            if item.get(key) is not None:
+                entry[key] = item[key]
+        return entry
 
     def _build_tab_player_report_key(self, entry: dict[str, Any]) -> str | None:
         if not isinstance(entry, dict):
@@ -657,7 +664,8 @@ class ServerState:
                 entry_key = self._normalize_tab_report_key(raw_key) or self._build_tab_player_report_key(entry)
                 if entry_key is None:
                     continue
-                players_by_key[entry_key] = entry
+                previous = players_by_key.get(entry_key)
+                players_by_key[entry_key] = {**previous, **entry} if isinstance(previous, dict) else entry
 
         if isinstance(delete, list):
             for raw_key in delete:

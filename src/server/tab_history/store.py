@@ -220,6 +220,15 @@ class TabHistoryStore:
     def _label_signature(cls, player: dict[str, Any]) -> str:
         return hashlib.sha256(cls._canonical_json(player).encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _display_label_quality(player: dict[str, Any]) -> int:
+        """Rank resolved Tab displays above a legacy prefix copied into displayName."""
+        display_name = str(player.get("displayName") or "").strip()
+        if not display_name:
+            return 0
+        prefix = str(player.get("scoreboardPrefix") or player.get("prefixedName") or "").strip()
+        return 1 if prefix and display_name == prefix else 2
+
     @classmethod
     def _entry_etag(cls, player: dict[str, Any], first_at: int, last_at: int) -> bytes:
         payload = {"player": player, "labelFirstObservedAtUtcMs": first_at, "lastObservedAtUtcMs": last_at}
@@ -251,6 +260,10 @@ class TabHistoryStore:
                     "SELECT * FROM tab_history_entries WHERE room_code = ? AND player_uuid = ?",
                     (room_code, player_uuid),
                 ).fetchone()
+                if row is not None:
+                    persisted_player = json.loads(row["player_json"])
+                    if self._display_label_quality(player) < self._display_label_quality(persisted_player):
+                        continue
                 signature = self._label_signature(player)
                 label_changed = row is None or str(row["label_signature"]) != signature
                 if row is not None and not label_changed:
