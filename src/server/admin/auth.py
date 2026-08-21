@@ -605,5 +605,17 @@ def trigger_admin_sse_audit() -> None:
     runtime.admin_sse_hub.schedule_broadcast("audit", delay_sec=1.0)
 
 
+def trigger_admin_sse_last_seen_history() -> None:
+    runtime.admin_sse_hub.schedule_broadcast("last_seen_history", delay_sec=0.5)
+
+
+def trigger_admin_sse_tab_history() -> None:
+    runtime.admin_sse_hub.schedule_broadcast("tab_history", delay_sec=0.5)
+
+
+def trigger_admin_sse_runtime_state() -> None:
+    runtime.admin_sse_hub.schedule_broadcast("runtime_state", delay_sec=0.5)
+
+
 def admin_ui_is_ready() -> bool:
     return admin_ui_ready()

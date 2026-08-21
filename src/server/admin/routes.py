@@ -6,6 +6,8 @@ from fastapi import Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from ..app import runtime
+from ..tab_history.service import broadcast_digest as broadcast_tab_history_digest
+from ..ws.io import send_packet
 from .store import AdminStore
 from .auth import (
     ADMIN_SESSION_COOKIE_NAME,
@@ -33,11 +35,26 @@ from .auth import (
     parse_login_payload,
     record_admin_access,
     record_audit_event,
+    trigger_admin_sse_last_seen_history,
+    trigger_admin_sse_runtime_state,
+    trigger_admin_sse_tab_history,
     validate_traffic_history_params,
     validate_admin_credentials,
 )
 from .frontend import ADMIN_UI_INDEX_PATH, resolve_admin_asset_path
 from .proxy_ip import get_request_remote_addr
+
+
+ADMIN_DATA_PAGE_SIZE_DEFAULT = 50
+ADMIN_DATA_PAGE_SIZE_MAX = 200
+RUNTIME_DATA_KINDS = {
+    "tab-reports",
+    "players",
+    "entities",
+    "waypoints",
+    "battle-chunks",
+    "player-marks",
+}
 
 
 async def admin_page(_request: Request):
@@ -68,6 +85,29 @@ def _normalize_local_start_at_or_response(value: str | None) -> tuple[str | None
         return AdminStore.normalize_local_datetime(value), None
     except ValueError:
         return None, JSONResponse({"detail": "invalid_start_at"}, status_code=422)
+
+
+def _admin_page_payload(items: list[dict], *, page: int, page_size: int, available_rooms: list[str]) -> dict:
+    start = (page - 1) * page_size
+    return {
+        "items": items[start : start + page_size],
+        "total": len(items),
+        "page": page,
+        "pageSize": page_size,
+        "availableRooms": available_rooms,
+        "serverTime": time.time(),
+    }
+
+
+async def _parse_delete_records(request: Request) -> list[dict] | None:
+    try:
+        payload = await request.json()
+    except Exception:
+        return None
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if not isinstance(records, list) or not records or len(records) > ADMIN_DATA_PAGE_SIZE_MAX:
+        return None
+    return records if all(isinstance(record, dict) for record in records) else None
 
 
 async def admin_session_login(request: Request):
@@ -298,6 +338,8 @@ async def admin_events(
                                 )
                             ),
                         }
+                    elif event_name in {"last_seen_history", "tab_history", "runtime_state"}:
+                        payload = {"serverTime": time.time()}
                     else:
                         continue
                 except Exception:
@@ -486,6 +528,169 @@ async def admin_audit_log(
         raise
 
 
+async def admin_last_seen_history(
+    request: Request,
+    roomCode: str | None = None,
+    search: str | None = None,
+    page: int = Query(default=1, ge=1),
+    pageSize: int = Query(default=ADMIN_DATA_PAGE_SIZE_DEFAULT, ge=1, le=ADMIN_DATA_PAGE_SIZE_MAX),
+):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+
+    await record_admin_access(request, auth_result, "admin_api_access")
+    room_code = normalize_optional_room_code(roomCode)
+    records = runtime.state.list_admin_last_seen_records(room_code=room_code, search=search)
+    all_records = runtime.state.list_admin_last_seen_records()
+    return JSONResponse(
+        _admin_page_payload(
+            records,
+            page=page,
+            page_size=pageSize,
+            available_rooms=sorted({str(item["roomCode"]) for item in all_records}),
+        )
+    )
+
+
+async def admin_delete_last_seen_history(request: Request):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    records = await _parse_delete_records(request)
+    if records is None:
+        return JSONResponse({"detail": "invalid_history_delete_records"}, status_code=422)
+
+    normalized_records: list[dict] = []
+    for record in records:
+        room_code = normalize_optional_room_code(record.get("roomCode"))
+        source_id = record.get("sourceId")
+        player_uuid = runtime.state._normalize_tab_uuid(record.get("playerUuid"))  # noqa: SLF001
+        if room_code is None or not isinstance(source_id, str) or not source_id.strip() or player_uuid is None:
+            return JSONResponse({"detail": "invalid_history_delete_records"}, status_code=422)
+        normalized_records.append({
+            "roomCode": room_code,
+            "sourceId": source_id.strip(),
+            "playerUuid": player_uuid,
+        })
+
+    deleted = runtime.state.delete_admin_last_seen_records(normalized_records)
+    if deleted:
+        await runtime.broadcaster.broadcast_web_map_updates()
+        trigger_admin_sse_last_seen_history()
+        trigger_admin_sse_runtime_state()
+    await record_audit_event(
+        event_type="admin_last_seen_history_deleted",
+        actor_type="admin",
+        actor_id=auth_result["actorId"],
+        success=True,
+        remote_addr=get_request_remote_addr(request),
+        detail={
+            "requested": len(normalized_records),
+            "deleted": len(deleted),
+            "records": deleted,
+        },
+    )
+    return JSONResponse({"requested": len(normalized_records), "deleted": len(deleted), "missing": len(normalized_records) - len(deleted)})
+
+
+async def admin_tab_history(
+    request: Request,
+    roomCode: str | None = None,
+    search: str | None = None,
+    page: int = Query(default=1, ge=1),
+    pageSize: int = Query(default=ADMIN_DATA_PAGE_SIZE_DEFAULT, ge=1, le=ADMIN_DATA_PAGE_SIZE_MAX),
+):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    if runtime.tab_history_store is None:
+        return JSONResponse({"detail": "tab_history_store_unavailable"}, status_code=503)
+
+    await record_admin_access(request, auth_result, "admin_api_access")
+    payload = await runtime.tab_history_store.list_entries(
+        room_code=normalize_optional_room_code(roomCode),
+        search=search,
+        page=page,
+        page_size=pageSize,
+    )
+    payload["serverTime"] = time.time()
+    return JSONResponse(payload)
+
+
+async def admin_delete_tab_history(request: Request):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    if runtime.tab_history_store is None:
+        return JSONResponse({"detail": "tab_history_store_unavailable"}, status_code=503)
+    records = await _parse_delete_records(request)
+    if records is None:
+        return JSONResponse({"detail": "invalid_history_delete_records"}, status_code=422)
+
+    by_room: dict[str, list[str]] = {}
+    requested_records: list[dict] = []
+    for record in records:
+        room_code = normalize_optional_room_code(record.get("roomCode"))
+        player_uuid = runtime.tab_history_store.normalize_uuid(record.get("playerUuid"))
+        if room_code is None or player_uuid is None:
+            return JSONResponse({"detail": "invalid_history_delete_records"}, status_code=422)
+        by_room.setdefault(room_code, []).append(player_uuid)
+        requested_records.append({"roomCode": room_code, "playerUuid": player_uuid})
+
+    deleted_records: list[dict] = []
+    for room_code, player_uuids in by_room.items():
+        deleted_uuids = await runtime.tab_history_store.delete_entries(room_code, player_uuids)
+        if deleted_uuids:
+            deleted_records.extend({"roomCode": room_code, "playerUuid": player_uuid} for player_uuid in deleted_uuids)
+            await broadcast_tab_history_digest(room_code, send_packet)
+    if deleted_records:
+        trigger_admin_sse_tab_history()
+    await record_audit_event(
+        event_type="admin_tab_history_deleted",
+        actor_type="admin",
+        actor_id=auth_result["actorId"],
+        success=True,
+        remote_addr=get_request_remote_addr(request),
+        detail={
+            "requested": len(requested_records),
+            "deleted": len(deleted_records),
+            "records": deleted_records,
+        },
+    )
+    return JSONResponse({
+        "requested": len(requested_records),
+        "deleted": len(deleted_records),
+        "missing": len(requested_records) - len(deleted_records),
+    })
+
+
+async def admin_runtime_state(
+    request: Request,
+    kind: str,
+    roomCode: str | None = None,
+    page: int = Query(default=1, ge=1),
+    pageSize: int = Query(default=ADMIN_DATA_PAGE_SIZE_DEFAULT, ge=1, le=ADMIN_DATA_PAGE_SIZE_MAX),
+):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    if kind not in RUNTIME_DATA_KINDS:
+        return JSONResponse({"detail": "invalid_runtime_kind"}, status_code=422)
+
+    await record_admin_access(request, auth_result, "admin_api_access")
+    room_code, records = runtime.state.list_admin_runtime_records(kind, normalize_optional_room_code(roomCode))
+    payload = _admin_page_payload(
+        records,
+        page=page,
+        page_size=pageSize,
+        available_rooms=runtime.state.admin_runtime_rooms(),
+    )
+    payload["kind"] = kind
+    payload["roomCode"] = room_code
+    return JSONResponse(payload)
+
+
 def register_admin_routes(app) -> None:
     app.get("/admin")(admin_page)
     app.get("/admin/assets/{asset_path:path}")(admin_assets)
@@ -501,3 +706,8 @@ def register_admin_routes(app) -> None:
     app.get("/admin/api/traffic/hourly")(admin_hourly_traffic)
     app.get("/admin/api/traffic/daily")(admin_daily_traffic)
     app.get("/admin/api/audit")(admin_audit_log)
+    app.get("/admin/api/history/last-seen")(admin_last_seen_history)
+    app.delete("/admin/api/history/last-seen")(admin_delete_last_seen_history)
+    app.get("/admin/api/history/tab")(admin_tab_history)
+    app.delete("/admin/api/history/tab")(admin_delete_tab_history)
+    app.get("/admin/api/runtime/{kind}")(admin_runtime_state)

@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import sys
+import time
 from types import MethodType, SimpleNamespace
 
 import httpx
@@ -649,6 +650,19 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         assert audit_name == "audit"
         assert any(item["eventType"] == "player_disconnected" for item in audit_payload["items"])
 
+        admin_auth.trigger_admin_sse_last_seen_history()
+        admin_auth.trigger_admin_sse_tab_history()
+        admin_auth.trigger_admin_sse_runtime_state()
+        management_events = set()
+        for _ in range(3):
+            event_name, payload = await _read_sse_event(
+                lines,
+                expected_names={"last_seen_history", "tab_history", "runtime_state"},
+            )
+            management_events.add(event_name)
+            assert isinstance(payload["serverTime"], float)
+        assert management_events == {"last_seen_history", "tab_history", "runtime_state"}
+
         await iterator.aclose()
 
 
@@ -722,3 +736,117 @@ async def test_untrusted_proxy_headers_are_ignored(monkeypatch: pytest.MonkeyPat
         audit_payload = await admin_auth.build_admin_audit_payload(limit=20, event_type="admin_session_started")
 
     assert audit_payload["items"][0]["remoteAddr"] == "127.0.0.1"
+
+
+@pytest.mark.asyncio
+async def test_admin_history_management_and_runtime_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    main = _load_main_module(monkeypatch, tmp_path)
+    player_id = "00000000-0000-0000-0000-000000000999"
+    tab_player_id = "12345678-1234-5678-9234-567812345678"
+    source_id = "admin-history-source"
+    room_code = "admin-history-room"
+
+    async with main.app.router.lifespan_context(main.app):
+        app_runtime.state.connections[source_id] = _connected_websocket_stub()  # type: ignore[assignment]
+        app_runtime.state.set_player_room(source_id, room_code)
+        app_runtime.state.upsert_tab_player_report(
+            source_id,
+            [{"uuid": tab_player_id, "name": "TabAlice", "displayName": "[A] TabAlice"}],
+            time.monotonic(),
+        )
+        app_runtime.state.replace_last_seen_players(
+            source_id,
+            room_code,
+            {
+                player_id: {
+                    "x": 10.0,
+                    "y": 64.0,
+                    "z": 20.0,
+                    "dimension": "minecraft:overworld",
+                    "playerName": "OfflineAlice",
+                    "playerUUID": player_id,
+                    "lastSeenAtUtcMs": 1_000,
+                    "positionObservedAtUtcMs": 900,
+                    "offlineDetectedAtUtcMs": 1_100,
+                }
+            },
+            10.0,
+        )
+        app_runtime.state.upsert_report(
+            app_runtime.state.player_reports,
+            player_id,
+            source_id,
+            app_runtime.state.build_state_node(
+                source_id,
+                10.0,
+                {
+                    "x": 10.0,
+                    "y": 64.0,
+                    "z": 20.0,
+                    "dimension": "minecraft:overworld",
+                    "playerName": "OnlineAlice",
+                    "playerUUID": player_id,
+                    "health": 20.0,
+                    "maxHealth": 20.0,
+                    "armor": 0.0,
+                    "isRiding": False,
+                    "width": 0.6,
+                    "height": 1.8,
+                },
+            ),
+        )
+        assert await app_runtime.tab_history_store.upsert_players(
+            room_code,
+            [(tab_player_id, {"name": "TabAlice", "displayName": "[A] TabAlice"})],
+            observed_at_ms=1_000,
+        )
+
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            unauthorized = await client.get("/admin/api/history/tab")
+            assert unauthorized.status_code == 401
+            await _login(client)
+
+            last_seen = await client.get(f"/admin/api/history/last-seen?roomCode={room_code}&search=offline")
+            tab_history = await client.get(f"/admin/api/history/tab?roomCode={room_code}&search=tabalice")
+            runtime_players = await client.get(f"/admin/api/runtime/players?roomCode={room_code}")
+            runtime_tab = await client.get(f"/admin/api/runtime/tab-reports?roomCode={room_code}")
+            invalid_kind = await client.get("/admin/api/runtime/not-real")
+
+            assert last_seen.status_code == 200
+            assert last_seen.json()["items"][0]["sourceId"] == source_id
+            assert tab_history.status_code == 200
+            assert tab_history.json()["items"][0]["playerUuid"] == tab_player_id
+            assert runtime_players.json()["items"][0]["data"]["playerName"] == "OnlineAlice"
+            assert runtime_tab.json()["items"][0]["data"]["playerCount"] == 1
+            assert invalid_kind.status_code == 422
+
+            removed_last_seen = await client.request(
+                "DELETE",
+                "/admin/api/history/last-seen",
+                json={"records": [{"roomCode": room_code, "sourceId": source_id, "playerUuid": player_id}]},
+            )
+            removed_tab = await client.request(
+                "DELETE",
+                "/admin/api/history/tab",
+                json={"records": [{"roomCode": room_code, "playerUuid": tab_player_id}]},
+            )
+            invalid_delete = await client.request("DELETE", "/admin/api/history/tab", json={"records": []})
+
+        assert removed_last_seen.json() == {"requested": 1, "deleted": 1, "missing": 0}
+        assert removed_tab.json() == {"requested": 1, "deleted": 1, "missing": 0}
+        assert invalid_delete.status_code == 422
+        assert app_runtime.state.list_admin_last_seen_records(room_code=room_code) == []
+        tab_delta = await app_runtime.tab_history_store.sync(
+            room_code,
+            preferred_mode="TAB_HISTORY_SYNC_MODE_FULL",
+            base_revision=None,
+            base_digest=None,
+            allow_full_fallback=False,
+        )
+        assert tab_delta["upsert"] == []
+        audit = await admin_auth.build_admin_audit_payload(limit=100)
+
+    audit_types = {item["eventType"] for item in audit["items"]}
+    assert "admin_last_seen_history_deleted" in audit_types
+    assert "admin_tab_history_deleted" in audit_types

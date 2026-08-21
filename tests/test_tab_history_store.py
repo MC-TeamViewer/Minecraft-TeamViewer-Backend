@@ -150,3 +150,38 @@ async def test_history_rejects_legacy_prefix_copied_into_display_name(store: Tab
         allow_full_fallback=False,
     )
     assert full["upsert"][0]["player"]["displayName"] == "[利雅得] Player"
+
+
+async def test_admin_listing_and_delete_writes_tombstone(store: TabHistoryStore):
+    player_a = "12345678-1234-5678-9234-567812345678"
+    player_b = "22345678-1234-5678-9234-567812345678"
+    assert await store.upsert_players(
+        "alpha",
+        [
+            (player_a, {"name": "Alice", "displayName": "[A] Alice"}),
+            (player_b, {"name": "Bob", "displayName": "[B] Bob"}),
+        ],
+        observed_at_ms=1_000,
+    )
+    initial_head = await store.head("alpha")
+
+    listed = await store.list_entries(room_code="alpha", search="alice", page=1, page_size=50)
+    assert listed["total"] == 1
+    assert listed["items"][0]["playerUuid"] == player_a
+    assert listed["items"][0]["player"]["displayName"] == "[A] Alice"
+    assert listed["availableRooms"] == ["alpha"]
+
+    deleted = await store.delete_entries("alpha", [player_a], occurred_at_ms=2_000)
+    assert deleted == [player_a]
+    assert await store.delete_entries("alpha", [player_a], occurred_at_ms=2_100) == []
+
+    delta = await store.sync(
+        "alpha",
+        preferred_mode="TAB_HISTORY_SYNC_MODE_DELTA",
+        base_revision=initial_head["revision"],
+        base_digest=initial_head["digestSha256"],
+        allow_full_fallback=False,
+    )
+    assert delta["deleteUuids"] == [player_a]
+    assert delta["head"]["recordCount"] == 1
+    assert delta["head"]["revision"] == initial_head["revision"] + 1

@@ -370,6 +370,104 @@ class TabHistoryStore:
             db.commit()
         return {"expiredEntries": expired_entries, "expiredDeltas": expired_deltas}
 
+    async def list_entries(
+        self,
+        *,
+        room_code: str | None = None,
+        search: str | None = None,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        """Return a paginated admin view of the latest label mirror."""
+        normalized_room = str(room_code or "").strip() or None
+        normalized_search = str(search or "").strip()
+        page = max(1, int(page))
+        page_size = max(1, min(int(page_size), 200))
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if normalized_room is not None:
+            clauses.append("room_code = ?")
+            params.append(normalized_room)
+        if normalized_search:
+            wildcard = f"%{normalized_search.casefold()}%"
+            clauses.append(
+                "(LOWER(player_uuid) LIKE ? OR normalized_name LIKE ? OR LOWER(player_json) LIKE ?)"
+            )
+            params.extend((wildcard, wildcard, wildcard))
+
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        async with self._lock:
+            db = self._require_db()
+            total_row = db.execute(
+                f"SELECT COUNT(*) AS count FROM tab_history_entries {where_clause}", tuple(params)
+            ).fetchone()
+            rows = db.execute(
+                f"""
+                SELECT *
+                FROM tab_history_entries
+                {where_clause}
+                ORDER BY last_observed_at DESC, room_code ASC, player_uuid ASC
+                LIMIT ? OFFSET ?
+                """,
+                (*params, page_size, (page - 1) * page_size),
+            ).fetchall()
+            rooms = db.execute(
+                "SELECT DISTINCT room_code FROM tab_history_entries ORDER BY room_code ASC"
+            ).fetchall()
+
+        return {
+            "items": [self._admin_entry_from_row(row) for row in rows],
+            "total": int(total_row["count"] if total_row is not None else 0),
+            "page": page,
+            "pageSize": page_size,
+            "availableRooms": [str(row["room_code"]) for row in rooms if row["room_code"]],
+        }
+
+    async def delete_entries(self, room_code: str, player_uuids: list[Any], *, occurred_at_ms: int | None = None) -> list[str]:
+        """Delete latest entries and publish tombstones through one room revision."""
+        normalized_room = str(room_code or "").strip()
+        if not normalized_room:
+            return []
+        normalized_uuids = sorted({
+            player_uuid
+            for value in player_uuids
+            if (player_uuid := self.normalize_uuid(value)) is not None
+        })
+        if not normalized_uuids:
+            return []
+
+        stamp = int(occurred_at_ms if occurred_at_ms is not None else time.time() * 1000)
+        placeholders = ", ".join("?" for _ in normalized_uuids)
+        async with self._lock:
+            db = self._require_db()
+            rows = db.execute(
+                f"""
+                SELECT player_uuid
+                FROM tab_history_entries
+                WHERE room_code = ? AND player_uuid IN ({placeholders})
+                """,
+                (normalized_room, *normalized_uuids),
+            ).fetchall()
+            deleted = [str(row["player_uuid"]) for row in rows]
+            if not deleted:
+                return []
+
+            head = self._head_row(normalized_room)
+            revision = int(head["revision"] if head is not None else 0) + 1
+            for player_uuid in deleted:
+                db.execute(
+                    "DELETE FROM tab_history_entries WHERE room_code = ? AND player_uuid = ?",
+                    (normalized_room, player_uuid),
+                )
+                db.execute(
+                    "INSERT OR REPLACE INTO tab_history_deltas VALUES (?, ?, ?, 'delete', NULL, ?)",
+                    (normalized_room, revision, player_uuid, stamp),
+                )
+            self._write_head(normalized_room, revision, stamp)
+            db.commit()
+            return deleted
+
     async def head(self, room_code: str) -> dict[str, Any]:
         async with self._lock:
             row = self._head_row(room_code)
@@ -509,6 +607,18 @@ class TabHistoryStore:
             "lastObservedAtUtcMs": int(row["last_observed_at"]),
             "revision": int(row["revision"]),
             "etagSha256": bytes(row["etag_sha256"]),
+        }
+
+    @classmethod
+    def _admin_entry_from_row(cls, row: sqlite3.Row) -> dict[str, Any]:
+        entry = cls._entry_from_row(row)
+        return {
+            "roomCode": str(row["room_code"]),
+            "playerUuid": str(row["player_uuid"]),
+            "player": entry["player"],
+            "labelFirstObservedAtUtcMs": entry["labelFirstObservedAtUtcMs"],
+            "lastObservedAtUtcMs": entry["lastObservedAtUtcMs"],
+            "revision": entry["revision"],
         }
 
     def _entry_json(self, entry: dict[str, Any]) -> str:

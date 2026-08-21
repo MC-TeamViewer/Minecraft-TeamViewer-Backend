@@ -1034,6 +1034,183 @@ class ServerState:
         for object_id in list(self.last_seen_player_reports):
             self.delete_report(self.last_seen_player_reports, object_id, source_id)
 
+    def list_admin_last_seen_records(
+        self,
+        *,
+        room_code: str | None = None,
+        search: str | None = None,
+    ) -> list[dict]:
+        """Flatten raw external-source last-seen reports for the admin UI."""
+        normalized_room = self.normalize_room_code(room_code) if room_code is not None else None
+        query = str(search or "").strip().casefold()
+        records: list[dict] = []
+        for player_uuid, source_bucket in self.last_seen_player_reports.items():
+            if not isinstance(source_bucket, dict):
+                continue
+            for source_id, node in source_bucket.items():
+                if not isinstance(source_id, str) or not source_id or not isinstance(node, dict):
+                    continue
+                source_room = self.normalize_room_code(self.last_seen_source_rooms.get(source_id))
+                if normalized_room is not None and source_room != normalized_room:
+                    continue
+                data = node.get("data") if isinstance(node.get("data"), dict) else {}
+                resolved_uuid = self._normalize_tab_uuid(data.get("playerUUID")) or self._normalize_tab_uuid(player_uuid)
+                if resolved_uuid is None:
+                    continue
+                searchable = " ".join((
+                    source_room,
+                    source_id,
+                    resolved_uuid,
+                    str(data.get("playerName") or ""),
+                    str(data.get("dimension") or ""),
+                )).casefold()
+                if query and query not in searchable:
+                    continue
+                records.append({
+                    "roomCode": source_room,
+                    "sourceId": source_id,
+                    "playerUuid": resolved_uuid,
+                    "playerName": data.get("playerName"),
+                    "x": data.get("x"),
+                    "y": data.get("y"),
+                    "z": data.get("z"),
+                    "dimension": data.get("dimension"),
+                    "lastSeenAtUtcMs": data.get("lastSeenAtUtcMs"),
+                    "positionObservedAtUtcMs": data.get("positionObservedAtUtcMs"),
+                    "offlineDetectedAtUtcMs": data.get("offlineDetectedAtUtcMs"),
+                })
+        records.sort(
+            key=lambda item: (
+                -int(item.get("offlineDetectedAtUtcMs") or 0),
+                str(item["roomCode"]),
+                str(item["sourceId"]),
+                str(item["playerUuid"]),
+            )
+        )
+        return records
+
+    def delete_admin_last_seen_records(self, records: list[dict]) -> list[dict]:
+        """Delete only the exact raw records selected by an administrator."""
+        deleted: list[dict] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            source_id = str(record.get("sourceId") or "").strip()
+            player_uuid = self._normalize_tab_uuid(record.get("playerUuid"))
+            room_code = str(record.get("roomCode") or "").strip()
+            if not source_id or player_uuid is None or not room_code:
+                continue
+            if self.normalize_room_code(self.last_seen_source_rooms.get(source_id)) != self.normalize_room_code(room_code):
+                continue
+            if self.delete_report(self.last_seen_player_reports, player_uuid, source_id):
+                deleted.append({
+                    "roomCode": self.normalize_room_code(room_code),
+                    "sourceId": source_id,
+                    "playerUuid": player_uuid,
+                })
+        if deleted:
+            self.last_seen_revision += 1
+            self._scoped_selected_sources.clear()
+        return deleted
+
+    def admin_runtime_rooms(self) -> list[str]:
+        rooms = {self.DEFAULT_ROOM_CODE}
+        rooms.update(
+            self.normalize_room_code(room_code)
+            for room_code in self.connection_rooms.values()
+            if isinstance(room_code, str)
+        )
+        rooms.update(
+            self.normalize_room_code(room_code)
+            for room_code in self.web_map_connection_rooms.values()
+            if isinstance(room_code, str)
+        )
+        rooms.update(
+            self.normalize_room_code(room_code)
+            for room_code in self.last_seen_source_rooms.values()
+            if isinstance(room_code, str)
+        )
+        for state_map in (self.waypoint_reports, self.battle_chunk_reports, self.battle_chunk_cache):
+            for value in state_map.values():
+                if not isinstance(value, dict):
+                    continue
+                nodes = [value] if isinstance(value.get("data"), dict) else value.values()
+                for node in nodes:
+                    data = node.get("data") if isinstance(node, dict) and isinstance(node.get("data"), dict) else {}
+                    if data.get("roomCode") is not None:
+                        rooms.add(self.normalize_room_code(data.get("roomCode")))
+        return sorted(rooms)
+
+    def list_admin_runtime_records(self, kind: str, room_code: str | None = None) -> tuple[str, list[dict]]:
+        """Build a room-scoped, read-only diagnostic view for the admin UI."""
+        normalized_room = self.normalize_room_code(room_code)
+        normalized_kind = str(kind or "").strip()
+
+        if normalized_kind == "tab-reports":
+            snapshot = self.build_web_map_tab_snapshot(normalized_room)
+            reports = snapshot.get("reports") if isinstance(snapshot.get("reports"), dict) else {}
+            items = []
+            for source_id, report in reports.items():
+                if not isinstance(source_id, str) or not isinstance(report, dict):
+                    continue
+                reported_at = report.get("timestamp")
+                reported_at_ms = (
+                    int(float(reported_at) * 1000)
+                    if isinstance(reported_at, (int, float)) and not isinstance(reported_at, bool)
+                    else None
+                )
+                players = report.get("players") if isinstance(report.get("players"), list) else []
+                items.append({
+                    "id": source_id,
+                    "sourceId": source_id,
+                    "reportedAtUtcMs": reported_at_ms,
+                    "data": {
+                        "playerCount": len(players),
+                        "players": players,
+                    },
+                })
+            return normalized_room, sorted(items, key=lambda item: item["id"])
+
+        if normalized_kind == "player-marks":
+            items = [
+                {
+                    "id": player_id,
+                    "sourceId": str(mark.get("source") or "") or None,
+                    "reportedAtUtcMs": mark.get("updatedAt"),
+                    "data": dict(mark),
+                }
+                for player_id, mark in self.player_marks.items()
+                if isinstance(player_id, str) and isinstance(mark, dict)
+            ]
+            return normalized_room, sorted(items, key=lambda item: item["id"])
+
+        kind_to_scope = {
+            "players": "players",
+            "entities": "entities",
+            "waypoints": "waypoints",
+            "battle-chunks": "battleChunks",
+        }
+        scope = kind_to_scope.get(normalized_kind)
+        if scope is None:
+            raise ValueError("invalid_runtime_kind")
+        resolved = self.resolve_states_for_sources(
+            self.get_active_sources_in_room(normalized_room),
+            normalized_room,
+        )
+        state_map = resolved.get(scope) if isinstance(resolved.get(scope), dict) else {}
+        items = []
+        for object_id, node in state_map.items():
+            if not isinstance(object_id, str) or not isinstance(node, dict):
+                continue
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            items.append({
+                "id": object_id,
+                "sourceId": node.get("submitPlayerId"),
+                "reportedAtUtcMs": None,
+                "data": dict(data),
+            })
+        return normalized_room, sorted(items, key=lambda item: item["id"])
+
     @classmethod
     def build_web_map_tactical_source_id(cls, room_code: str) -> str:
         normalized_room = cls.normalize_room_code(room_code)

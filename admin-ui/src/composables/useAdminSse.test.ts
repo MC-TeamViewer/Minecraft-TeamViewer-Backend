@@ -90,6 +90,9 @@ describe("useAdminSse", () => {
     const onLiveTraffic = vi.fn();
     const onTrafficHistory = vi.fn();
     const onAudit = vi.fn();
+    const onLastSeenHistory = vi.fn();
+    const onTabHistory = vi.fn();
+    const onRuntimeState = vi.fn();
 
     const scope = effectScope();
     const api = scope.run(() =>
@@ -106,6 +109,9 @@ describe("useAdminSse", () => {
         onLiveTraffic,
         onTrafficHistory,
         onAudit,
+        onLastSeenHistory,
+        onTabHistory,
+        onRuntimeState,
         createEventSource: (url) => new MockEventSource(url),
         reconnectDelayMs: 2000,
       }),
@@ -177,6 +183,13 @@ describe("useAdminSse", () => {
     });
     await expect(bootstrapPromise).resolves.toBe(true);
     expect(onBootstrap).toHaveBeenCalledTimes(1);
+
+    MockEventSource.instances[0].emit("last_seen_history", { serverTime: 1 });
+    MockEventSource.instances[0].emit("tab_history", { serverTime: 1 });
+    MockEventSource.instances[0].emit("runtime_state", { serverTime: 1 });
+    expect(onLastSeenHistory).toHaveBeenCalledTimes(1);
+    expect(onTabHistory).toHaveBeenCalledTimes(1);
+    expect(onRuntimeState).toHaveBeenCalledTimes(1);
 
     MockEventSource.instances[0].fail();
     expect(api!.status.value).toBe("reconnecting");

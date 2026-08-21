@@ -26,6 +26,9 @@ export interface UseAdminSseOptions {
   onLiveTraffic: (payload: LiveTrafficPayload) => void;
   onTrafficHistory: (payload: TrafficHistoryPayload) => void;
   onAudit: (payload: AuditPayload) => void;
+  onLastSeenHistory?: () => void;
+  onTabHistory?: () => void;
+  onRuntimeState?: () => void;
   onHeartbeat?: (serverTime: number | undefined) => void;
   onError?: () => void | Promise<void>;
   createEventSource?: (url: string) => EventSourceLike;
@@ -168,6 +171,21 @@ export function useAdminSse(options: UseAdminSseOptions) {
       const payload = parsePayload<AuditPayload>(event);
       if (payload) {
         options.onAudit(payload);
+      }
+    });
+    source.addEventListener("last_seen_history", (event) => {
+      if (parsePayload<{ serverTime?: number }>(event)) {
+        options.onLastSeenHistory?.();
+      }
+    });
+    source.addEventListener("tab_history", (event) => {
+      if (parsePayload<{ serverTime?: number }>(event)) {
+        options.onTabHistory?.();
+      }
+    });
+    source.addEventListener("runtime_state", (event) => {
+      if (parsePayload<{ serverTime?: number }>(event)) {
+        options.onRuntimeState?.();
       }
     });
     source.addEventListener("heartbeat", (event) => {

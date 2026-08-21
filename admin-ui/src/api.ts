@@ -1,13 +1,20 @@
 import type {
   AdminSessionPayload,
+  AdminPagePayload,
   AuditFilters,
   AuditPayload,
+  DeleteHistoryResponse,
+  HistoryQuery,
+  LastSeenHistoryRecord,
   LiveTrafficPayload,
   MetricsFilters,
   MetricsPayload,
   OverviewPayload,
   TrafficFilters,
   TrafficHistoryPayload,
+  RuntimeStateKind,
+  RuntimeStatePayload,
+  TabHistoryRecord,
 } from "@/types";
 
 export class ApiError extends Error {
@@ -44,7 +51,7 @@ async function requestJson<T>(
     params = {},
     body,
   }: {
-    method?: "GET" | "POST";
+    method?: "GET" | "POST" | "DELETE";
     params?: Record<string, string | string[] | undefined>;
     body?: unknown;
   } = {},
@@ -129,6 +136,55 @@ export function fetchAudit(filters: AuditFilters, limit = 100): Promise<AuditPay
       eventType: filters.eventType,
       actorTypes: filters.actorTypes,
       success: filters.success,
+    },
+  });
+}
+
+export function fetchLastSeenHistory(query: HistoryQuery): Promise<AdminPagePayload<LastSeenHistoryRecord>> {
+  return requestJson<AdminPagePayload<LastSeenHistoryRecord>>("/admin/api/history/last-seen", {
+    params: {
+      roomCode: query.roomCode,
+      search: query.search,
+      page: String(query.page),
+      pageSize: String(query.pageSize),
+    },
+  });
+}
+
+export function deleteLastSeenHistory(records: Pick<LastSeenHistoryRecord, "roomCode" | "sourceId" | "playerUuid">[]): Promise<DeleteHistoryResponse> {
+  return requestJson<DeleteHistoryResponse>("/admin/api/history/last-seen", {
+    method: "DELETE",
+    body: { records },
+  });
+}
+
+export function fetchTabHistory(query: HistoryQuery): Promise<AdminPagePayload<TabHistoryRecord>> {
+  return requestJson<AdminPagePayload<TabHistoryRecord>>("/admin/api/history/tab", {
+    params: {
+      roomCode: query.roomCode,
+      search: query.search,
+      page: String(query.page),
+      pageSize: String(query.pageSize),
+    },
+  });
+}
+
+export function deleteTabHistory(records: Pick<TabHistoryRecord, "roomCode" | "playerUuid">[]): Promise<DeleteHistoryResponse> {
+  return requestJson<DeleteHistoryResponse>("/admin/api/history/tab", {
+    method: "DELETE",
+    body: { records },
+  });
+}
+
+export function fetchRuntimeState(
+  kind: RuntimeStateKind,
+  query: Pick<HistoryQuery, "roomCode" | "page" | "pageSize">,
+): Promise<RuntimeStatePayload> {
+  return requestJson<RuntimeStatePayload>(`/admin/api/runtime/${kind}`, {
+    params: {
+      roomCode: query.roomCode,
+      page: String(query.page),
+      pageSize: String(query.pageSize),
     },
   });
 }

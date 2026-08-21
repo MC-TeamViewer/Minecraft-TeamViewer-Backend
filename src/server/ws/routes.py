@@ -8,7 +8,10 @@ from ..admin.auth import (
     record_audit_event,
     record_player_identity,
     record_player_activity,
+    trigger_admin_sse_last_seen_history,
     trigger_admin_sse_overview,
+    trigger_admin_sse_runtime_state,
+    trigger_admin_sse_tab_history,
 )
 from ..admin.proxy_ip import get_websocket_remote_addr
 from ..app import runtime
@@ -306,6 +309,7 @@ async def web_map_ws(websocket: WebSocket):
                         mark=updated_mark,
                     ),
                 )
+                trigger_admin_sse_runtime_state()
                 continue
 
             if isinstance(packet, CommandPlayerMarkClearPacket):
@@ -322,6 +326,7 @@ async def web_map_ws(websocket: WebSocket):
                 )
                 if removed:
                     await runtime.broadcaster.broadcast_web_map_updates()
+                    trigger_admin_sse_runtime_state()
                 continue
 
             if isinstance(packet, CommandPlayerMarkClearAllPacket):
@@ -334,6 +339,8 @@ async def web_map_ws(websocket: WebSocket):
                         removedCount=removed_count,
                     ),
                 )
+                if removed_count:
+                    trigger_admin_sse_runtime_state()
                 continue
 
             if isinstance(packet, CommandSameServerFilterSetPacket):
@@ -418,6 +425,7 @@ async def web_map_ws(websocket: WebSocket):
                         waypoint=validated.model_dump(),
                     ),
                 )
+                trigger_admin_sse_runtime_state()
                 continue
 
             if isinstance(packet, WaypointsDeletePacket):
@@ -471,6 +479,8 @@ async def web_map_ws(websocket: WebSocket):
                         error=None if removed_ids else "waypoint_not_found",
                     ),
                 )
+                if removed_ids:
+                    trigger_admin_sse_runtime_state()
                 continue
 
             await send_packet(websocket, WebMapAckPacket(ok=False, error="unsupported_command"))
@@ -754,6 +764,11 @@ async def websocket_endpoint(websocket: WebSocket):
             ):
                 continue
 
+            # The management page receives a debounced signal and reloads only
+            # the currently visible runtime table.  Triggering here covers all
+            # report-bundle variants without coupling the UI to protocol shapes.
+            trigger_admin_sse_runtime_state()
+
             for expanded_packet in expand_player_packets(packet):
                 if isinstance(expanded_packet, ExternalSourceStatusPacket):
                     if not runtime.state.is_external_source(submit_player_id):
@@ -804,6 +819,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             current_time,
                         )
                     await runtime.broadcaster.broadcast_web_map_updates()
+                    trigger_admin_sse_last_seen_history()
                     continue
 
                 if (
@@ -890,6 +906,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 await broadcast_tab_history_digest(
                                     runtime.state.get_player_room(submit_player_id), send_packet
                                 )
+                                trigger_admin_sse_tab_history()
                         await runtime.broadcaster.broadcast_web_map_updates()
                     continue
 
@@ -917,6 +934,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 await broadcast_tab_history_digest(
                                     runtime.state.get_player_room(submit_player_id), send_packet
                                 )
+                                trigger_admin_sse_tab_history()
                         await runtime.broadcaster.broadcast_web_map_updates()
                     continue
 
@@ -1239,6 +1257,8 @@ async def websocket_endpoint(websocket: WebSocket):
             runtime.state.remove_connection(submit_player_id)
             runtime.tab_history_subscriptions.pop(("player", submit_player_id), None)
             await runtime.broadcaster.broadcast_web_map_updates()
+            trigger_admin_sse_runtime_state()
+            trigger_admin_sse_last_seen_history()
             runtime.logger.info("Client %s disconnected", submit_player_id)
 
 

@@ -104,6 +104,71 @@ export interface AdminSessionPayload {
   expiresAt: number;
 }
 
+export interface AdminPagePayload<T> {
+  items: T[];
+  total: number;
+  page: number;
+  pageSize: number;
+  availableRooms: string[];
+  serverTime?: number;
+}
+
+export interface LastSeenHistoryRecord {
+  roomCode: string;
+  sourceId: string;
+  playerUuid: string;
+  playerName: string | null;
+  x: number | null;
+  y: number | null;
+  z: number | null;
+  dimension: string | null;
+  lastSeenAtUtcMs: number | null;
+  positionObservedAtUtcMs: number | null;
+  offlineDetectedAtUtcMs: number | null;
+}
+
+export interface TabHistoryRecord {
+  roomCode: string;
+  playerUuid: string;
+  player: Record<string, unknown>;
+  labelFirstObservedAtUtcMs: number;
+  lastObservedAtUtcMs: number;
+  revision: number;
+}
+
+export interface HistoryQuery {
+  roomCode: string;
+  search: string;
+  page: number;
+  pageSize: number;
+}
+
+export interface DeleteHistoryResponse {
+  requested: number;
+  deleted: number;
+  missing: number;
+}
+
+export type RuntimeStateKind =
+  | "tab-reports"
+  | "players"
+  | "entities"
+  | "waypoints"
+  | "battle-chunks"
+  | "player-marks";
+
+export interface RuntimeStateItem {
+  id: string;
+  sourceId: string | null;
+  reportedAtUtcMs: number | null;
+  data: Record<string, unknown>;
+}
+
+export interface RuntimeStatePayload extends AdminPagePayload<RuntimeStateItem> {
+  kind: RuntimeStateKind;
+  roomCode: string;
+}
+
 export interface LiveTrafficPayload {
   sampleWindowSec: number;
   selectedLayer: TrafficLayer;

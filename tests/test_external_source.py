@@ -398,6 +398,32 @@ def test_last_seen_history_survives_source_disconnect_and_is_room_isolated() -> 
     assert state.resolve_states_for_sources(set(), "room-b")["lastSeenPlayers"] == {}
 
 
+def test_admin_last_seen_records_are_raw_and_delete_by_exact_composite_key() -> None:
+    state = ServerState()
+    player_id = "00000000-0000-0000-0000-000000000999"
+    state.replace_last_seen_players("source-a", "room-a", {player_id: _last_seen_data(player_id)}, 10.0)
+    state.replace_last_seen_players("source-b", "room-a", {player_id: _last_seen_data(player_id)}, 11.0)
+
+    records = state.list_admin_last_seen_records(room_code="room-a", search="target")
+    assert [(item["sourceId"], item["playerUuid"]) for item in records] == [
+        ("source-a", player_id),
+        ("source-b", player_id),
+    ]
+
+    deleted = state.delete_admin_last_seen_records([{
+        "roomCode": "room-a",
+        "sourceId": "source-a",
+        "playerUuid": player_id,
+    }])
+    assert deleted == [{"roomCode": "room-a", "sourceId": "source-a", "playerUuid": player_id}]
+    assert state.list_admin_last_seen_records() == [records[1]]
+    assert state.delete_admin_last_seen_records([{
+        "roomCode": "room-b",
+        "sourceId": "source-b",
+        "playerUuid": player_id,
+    }]) == []
+
+
 def test_online_player_suppresses_matching_last_seen_history() -> None:
     state = ServerState()
     source_id = "external-source"

@@ -52,6 +52,8 @@ const ConnectionStatusTable = defineAsyncComponent(() => import("@/components/Co
 const ExternalSourceStatusTable = defineAsyncComponent(() => import("@/components/ExternalSourceStatusTable.vue"));
 const AuditFilters = defineAsyncComponent(() => import("@/components/AuditFilters.vue"));
 const AuditTable = defineAsyncComponent(() => import("@/components/AuditTable.vue"));
+const HistoryDataManager = defineAsyncComponent(() => import("@/components/HistoryDataManager.vue"));
+const RuntimeStateExplorer = defineAsyncComponent(() => import("@/components/RuntimeStateExplorer.vue"));
 
 const auditFilters = ref<AuditFiltersModel>({ ...DEFAULT_AUDIT_FILTERS });
 const metricsFilters = ref<MetricsFilters>({ ...DEFAULT_METRICS_FILTERS });
@@ -70,6 +72,9 @@ const hourlyMetricsLoading = ref(false);
 const trafficHistoryLoading = ref(false);
 let metricsRefreshVersion = 0;
 let trafficRefreshVersion = 0;
+const lastSeenRefreshKey = ref(0);
+const tabHistoryRefreshKey = ref(0);
+const runtimeStateRefreshKey = ref(0);
 
 const { overview, roomOptions, applyOverview, resetOverview } = useOverviewState();
 const {
@@ -294,6 +299,9 @@ const {
     trafficHistoryLoading.value = false;
   },
   onAudit: applyAudit,
+  onLastSeenHistory: () => { lastSeenRefreshKey.value += 1; },
+  onTabHistory: () => { tabHistoryRefreshKey.value += 1; },
+  onRuntimeState: () => { runtimeStateRefreshKey.value += 1; },
   onError: async () => {
     try {
       await fetchSession();
@@ -440,6 +448,9 @@ async function handleManualRefresh() {
   if (!receivedBootstrap) {
     await fallbackBootstrap();
   }
+  lastSeenRefreshKey.value += 1;
+  tabHistoryRefreshKey.value += 1;
+  runtimeStateRefreshKey.value += 1;
 }
 
 async function handleLogin(payload: { username: string; password: string }) {
@@ -509,10 +520,10 @@ function updateHistoryTrafficMixedView(value: TrafficMixedViewMode) {
   <div v-else class="app-shell">
     <header class="hero-panel">
       <div>
-        <span class="hero-eyebrow">只读后台</span>
+        <span class="hero-eyebrow">管理后台</span>
         <h1>TeamViewRelay Admin</h1>
         <p>
-          统一查看在线概况、实时网速、自定义粒度历史流量、最近 DAU、小时活跃，以及实时审计日志。
+          统一查看在线概况、实时网速、活跃指标与审计日志，并管理下线位置和 Tab 历史数据。
         </p>
       </div>
       <div class="hero-actions">
@@ -593,6 +604,10 @@ function updateHistoryTrafficMixedView(value: TrafficMixedViewMode) {
       <RoomOverviewTable :overview="overview" />
       <ConnectionStatusTable :overview="overview" />
       <ExternalSourceStatusTable :overview="overview" />
+
+      <HistoryDataManager kind="last-seen" :refresh-key="lastSeenRefreshKey" />
+      <HistoryDataManager kind="tab" :refresh-key="tabHistoryRefreshKey" />
+      <RuntimeStateExplorer :refresh-key="runtimeStateRefreshKey" />
 
       <section class="audit-stack">
         <AuditFilters
