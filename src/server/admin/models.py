@@ -100,6 +100,36 @@ class LiveTrafficPayload(TypedDict):
     serverTime: NotRequired[float]
 
 
+class ProtobufMetricPayload(TypedDict):
+    messageCount: int
+    messagesPerSecond: float
+    byteCount: int
+    bytesPerSecond: float
+    maxPacketBytes: int
+    lastSentAt: float | None
+
+
+class ProtobufMessageMetricPayload(ProtobufMetricPayload):
+    messageType: str
+
+
+class ProtobufConnectionTrafficPayload(TypedDict):
+    actorId: str
+    channel: str
+    total: ProtobufMetricPayload
+    snapshotFull: ProtobufMetricPayload
+    messageTypes: list[ProtobufMessageMetricPayload]
+
+
+class ProtobufTrafficPayload(TypedDict):
+    sampleWindowSec: int
+    total: ProtobufMetricPayload
+    snapshotFull: ProtobufMetricPayload
+    messageTypes: list[ProtobufMessageMetricPayload]
+    connections: list[ProtobufConnectionTrafficPayload]
+    serverTime: NotRequired[float]
+
+
 class TrafficBucketItem(TypedDict):
     bucket: str
     label: str
@@ -173,5 +203,6 @@ class BootstrapPayload(TypedDict):
     dailyMetrics: MetricsPayload
     hourlyMetrics: MetricsPayload
     liveTraffic: LiveTrafficPayload
+    protobufTraffic: ProtobufTrafficPayload
     trafficHistory: TrafficHistoryPayload
     audit: AuditPayload

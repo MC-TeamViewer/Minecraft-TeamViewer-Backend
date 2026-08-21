@@ -4,14 +4,24 @@ import { ElTable, ElTableColumn } from "element-plus/es/components/table/index";
 import { computed, ref } from "vue";
 
 import { connectionColumns } from "@/connectionColumns";
-import type { ConnectionDetail, OverviewPayload } from "@/types";
+import type {
+  ConnectionDetail,
+  OverviewPayload,
+  ProtobufConnectionTraffic,
+  ProtobufMetric,
+  ProtobufTrafficPayload,
+} from "@/types";
 
 const props = defineProps<{
   overview: OverviewPayload | null;
+  protobufTraffic: ProtobufTrafficPayload | null;
 }>();
 
 const rows = computed(() => (props.overview?.connectionDetails ?? []).filter((row) => row.channel !== "external_source"));
 const expandedKeys = ref<string[]>([]);
+const trafficByActor = computed(() => new Map(
+  (props.protobufTraffic?.connections ?? []).map((item) => [`${item.channel}:${item.actorId}`, item]),
+));
 
 function formatChannel(value: ConnectionDetail["channel"]): string {
   if (value === "player") {
@@ -26,6 +36,39 @@ function formatChannel(value: ConnectionDetail["channel"]): string {
 function handleExpandChange(row: ConnectionDetail, expandedRows: ConnectionDetail[]) {
   expandedKeys.value = expandedRows.map((item) => item.actorId);
 }
+
+function trafficFor(row: ConnectionDetail): ProtobufConnectionTraffic | undefined {
+  return trafficByActor.value.get(`${row.channel}:${row.actorId}`);
+}
+
+function formatBytes(value: number | null | undefined): string {
+  const amount = Number(value ?? 0);
+  if (!Number.isFinite(amount) || amount <= 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB"];
+  const index = Math.min(Math.floor(Math.log(amount) / Math.log(1024)), units.length - 1);
+  const scaled = amount / (1024 ** index);
+  return `${scaled >= 10 || index === 0 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[index]}`;
+}
+
+function formatMessageRate(value: number | null | undefined): string {
+  const amount = Number(value ?? 0);
+  if (!Number.isFinite(amount) || amount <= 0) return "0 包/s";
+  return `${amount >= 10 ? amount.toFixed(1) : amount.toFixed(2)} 包/s`;
+}
+
+function formatByteRate(value: number | null | undefined): string {
+  return `${formatBytes(value)}/s`;
+}
+
+function formatTimestamp(value: number | null | undefined): string {
+  if (!value) return "-";
+  return new Date(value * 1000).toLocaleString("zh-CN", { hour12: false });
+}
+
+function snapshotSummary(metric: ProtobufMetric | undefined): string {
+  if (!metric || metric.messageCount === 0) return "0";
+  return `${metric.messageCount} 包 / ${formatBytes(metric.byteCount)}`;
+}
 </script>
 
 <template>
@@ -34,7 +77,7 @@ function handleExpandChange(row: ConnectionDetail, expandedRows: ConnectionDetai
       <div class="section-header">
         <div>
           <h2>当前连接状态</h2>
-          <p>只统计已经完成 WebSocket 握手并登记到服务端内存态的连接。</p>
+          <p>只统计已经完成 WebSocket 握手并登记到服务端内存态的连接；Protobuf 指标为最近 {{ protobufTraffic?.sampleWindowSec ?? 10 }} 秒与本次进程累计。</p>
         </div>
       </div>
     </template>
@@ -58,6 +101,26 @@ function handleExpandChange(row: ConnectionDetail, expandedRows: ConnectionDetai
         <span class="status-summary-label">活跃房间</span>
         <strong class="status-summary-value">{{ overview?.activeRooms ?? 0 }}</strong>
       </div>
+      <div class="status-summary-card">
+        <span class="status-summary-label">Protobuf 发包频率</span>
+        <strong class="status-summary-value">{{ formatMessageRate(protobufTraffic?.total.messagesPerSecond) }}</strong>
+      </div>
+      <div class="status-summary-card">
+        <span class="status-summary-label">Protobuf 累计发包</span>
+        <strong class="status-summary-value">{{ protobufTraffic?.total.messageCount ?? 0 }}</strong>
+      </div>
+      <div class="status-summary-card">
+        <span class="status-summary-label">Protobuf 累计字节</span>
+        <strong class="status-summary-value">{{ formatBytes(protobufTraffic?.total.byteCount) }}</strong>
+      </div>
+      <div class="status-summary-card">
+        <span class="status-summary-label">Protobuf 当前字节率</span>
+        <strong class="status-summary-value">{{ formatByteRate(protobufTraffic?.total.bytesPerSecond) }}</strong>
+      </div>
+      <div class="status-summary-card">
+        <span class="status-summary-label">snapshot_full</span>
+        <strong class="status-summary-value">{{ snapshotSummary(protobufTraffic?.snapshotFull) }}</strong>
+      </div>
     </section>
 
     <el-table
@@ -79,7 +142,39 @@ function handleExpandChange(row: ConnectionDetail, expandedRows: ConnectionDetai
             <div><span class="detail-key">程序版本</span><span>{{ row.programVersion || "-" }}</span></div>
             <div><span class="detail-key">远端地址</span><span>{{ row.remoteAddr || "-" }}</span></div>
             <div><span class="detail-key">连接 ID</span><span class="mono-text">{{ row.actorId || "-" }}</span></div>
+            <template v-if="trafficFor(row)">
+              <div><span class="detail-key">Protobuf 累计包</span><span>{{ trafficFor(row)?.total.messageCount }}</span></div>
+              <div><span class="detail-key">Protobuf 当前频率</span><span>{{ formatMessageRate(trafficFor(row)?.total.messagesPerSecond) }}</span></div>
+              <div><span class="detail-key">Protobuf 当前字节率</span><span>{{ formatByteRate(trafficFor(row)?.total.bytesPerSecond) }}</span></div>
+              <div><span class="detail-key">snapshot_full</span><span>{{ snapshotSummary(trafficFor(row)?.snapshotFull) }}</span></div>
+              <div><span class="detail-key">最大 Protobuf 包</span><span>{{ formatBytes(trafficFor(row)?.total.maxPacketBytes) }}</span></div>
+              <div><span class="detail-key">最近 Protobuf 发送</span><span>{{ formatTimestamp(trafficFor(row)?.total.lastSentAt) }}</span></div>
+            </template>
           </div>
+          <el-table
+            v-if="trafficFor(row)?.messageTypes.length"
+            :data="trafficFor(row)?.messageTypes"
+            size="small"
+            border
+            class="admin-table expanded-message-table"
+          >
+            <el-table-column prop="messageType" label="Protobuf 类型" min-width="190">
+              <template #default="{ row: metric }"><span class="mono-text">{{ metric.messageType }}</span></template>
+            </el-table-column>
+            <el-table-column prop="messageCount" label="累计包" width="100" />
+            <el-table-column label="当前频率" width="120">
+              <template #default="{ row: metric }">{{ formatMessageRate(metric.messagesPerSecond) }}</template>
+            </el-table-column>
+            <el-table-column label="累计字节" width="120">
+              <template #default="{ row: metric }">{{ formatBytes(metric.byteCount) }}</template>
+            </el-table-column>
+            <el-table-column label="最大单包" width="120">
+              <template #default="{ row: metric }">{{ formatBytes(metric.maxPacketBytes) }}</template>
+            </el-table-column>
+            <el-table-column label="最近发送" min-width="180">
+              <template #default="{ row: metric }">{{ formatTimestamp(metric.lastSentAt) }}</template>
+            </el-table-column>
+          </el-table>
         </template>
       </el-table-column>
       <el-table-column
@@ -98,6 +193,12 @@ function handleExpandChange(row: ConnectionDetail, expandedRows: ConnectionDetai
         <template v-else #default="{ row }">
           <span :class="{ 'mono-text': column.prop === 'actorId' }">{{ row[column.prop] || "-" }}</span>
         </template>
+      </el-table-column>
+      <el-table-column label="Protobuf 频率" width="130">
+        <template #default="{ row }">{{ formatMessageRate(trafficFor(row)?.total.messagesPerSecond) }}</template>
+      </el-table-column>
+      <el-table-column label="snapshot_full" min-width="150">
+        <template #default="{ row }">{{ snapshotSummary(trafficFor(row)?.snapshotFull) }}</template>
       </el-table-column>
     </el-table>
   </el-card>

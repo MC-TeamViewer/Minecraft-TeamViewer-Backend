@@ -177,6 +177,36 @@ export interface LiveTrafficPayload {
   serverTime?: number;
 }
 
+export interface ProtobufMetric {
+  messageCount: number;
+  messagesPerSecond: number;
+  byteCount: number;
+  bytesPerSecond: number;
+  maxPacketBytes: number;
+  lastSentAt: number | null;
+}
+
+export interface ProtobufMessageMetric extends ProtobufMetric {
+  messageType: string;
+}
+
+export interface ProtobufConnectionTraffic {
+  actorId: string;
+  channel: string;
+  total: ProtobufMetric;
+  snapshotFull: ProtobufMetric;
+  messageTypes: ProtobufMessageMetric[];
+}
+
+export interface ProtobufTrafficPayload {
+  sampleWindowSec: number;
+  total: ProtobufMetric;
+  snapshotFull: ProtobufMetric;
+  messageTypes: ProtobufMessageMetric[];
+  connections: ProtobufConnectionTraffic[];
+  serverTime?: number;
+}
+
 export interface TrafficBucketItem {
   bucket: string;
   label: string;
@@ -255,6 +285,7 @@ export interface BootstrapPayload {
   dailyMetrics: MetricsPayload;
   hourlyMetrics: MetricsPayload;
   liveTraffic: LiveTrafficPayload;
+  protobufTraffic: ProtobufTrafficPayload;
   trafficHistory: TrafficHistoryPayload;
   audit: AuditPayload;
 }

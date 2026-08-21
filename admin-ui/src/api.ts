@@ -10,6 +10,7 @@ import type {
   MetricsFilters,
   MetricsPayload,
   OverviewPayload,
+  ProtobufTrafficPayload,
   TrafficFilters,
   TrafficHistoryPayload,
   RuntimeStateKind,
@@ -117,6 +118,10 @@ export function fetchHourlyMetrics(filters: MetricsFilters): Promise<MetricsPayl
 
 export function fetchLiveTraffic(): Promise<LiveTrafficPayload> {
   return requestJson<LiveTrafficPayload>("/admin/api/traffic/live");
+}
+
+export function fetchLiveProtobufTraffic(): Promise<ProtobufTrafficPayload> {
+  return requestJson<ProtobufTrafficPayload>("/admin/api/protobuf/live");
 }
 
 export function fetchTrafficHistory(filters: TrafficFilters): Promise<TrafficHistoryPayload> {

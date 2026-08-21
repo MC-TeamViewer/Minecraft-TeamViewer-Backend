@@ -68,6 +68,7 @@ uv run src/main.py
 - `/admin/api/events`：后台管理页 SSE 实时事件流
 - `/admin/api/metrics/daily`：日活趋势
 - `/admin/api/metrics/hourly`：小时活跃趋势
+- `/admin/api/protobuf/live`：当前进程的 Protobuf 出站包数、频率和按连接/消息类型统计
 - `/admin/api/audit`：审计日志查询，支持 `actorTypes` 多值筛选
 - `/admin/api/history/last-seen`：下线位置历史的分页查询与批量删除
 - `/admin/api/history/tab`：Tab 历史镜像的分页查询与批量删除
@@ -127,9 +128,10 @@ uv run src/main.py
 后台页面刷新策略：
 
 - 首屏优先等待 `/admin/api/events` 的 `bootstrap` 事件，1.2 秒内未收到时才回退到普通 HTTP 拉取
-- 后续通过 `/admin/api/events` 的 SSE 流实时更新当前连接状态、房间概览、DAU、小时活跃、审计日志，以及数据管理区中当前打开的实时状态/历史表
+- 后续通过 `/admin/api/events` 的 SSE 流实时更新当前连接状态、房间概览、实时 Protobuf 发包、DAU、小时活跃、审计日志，以及数据管理区中当前打开的实时状态/历史表
 - SSE 连接会携带当前审计筛选和指标筛选参数，避免首屏和切换筛选时重复拉取整页数据
-- 当前连接状态会细分到每个已登记连接，显示类型、名字、房间、协议版本、程序版本和地址
+- 当前连接状态会细分到每个已登记连接，显示类型、名字、房间、协议版本、程序版本、地址和 Protobuf 出站统计；`snapshot_full` 会单独汇总其次数、字节和最大单包
+- Protobuf 指标统计成功发送的应用层 Protobuf 包：显示最近 10 秒频率和本次进程累计，重启后清零；不包含 MessagePack 与 WebSocket 线缆字节
 - 数据管理区可按房间和关键字检查下线位置与 Tab 历史，支持多选删除；删除的 Tab 条目会通过同步 tombstone 通知客户端
 - 页面顶部会展示轻量可观测信息，包括 SSE 订阅数、最近一次 retention 清理结果、admin API/SSE 错误计数，以及当前是否启用可信代理头
 - 管理页前端使用 `Vue 3 + Vite + Element Plus + ECharts` 构建，构建产物由后端直接托管到 `/admin`

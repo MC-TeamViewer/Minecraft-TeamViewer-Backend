@@ -88,6 +88,7 @@ describe("useAdminSse", () => {
     const onDailyMetrics = vi.fn();
     const onHourlyMetrics = vi.fn();
     const onLiveTraffic = vi.fn();
+    const onProtobufTraffic = vi.fn();
     const onTrafficHistory = vi.fn();
     const onAudit = vi.fn();
     const onLastSeenHistory = vi.fn();
@@ -107,6 +108,7 @@ describe("useAdminSse", () => {
         onDailyMetrics,
         onHourlyMetrics,
         onLiveTraffic,
+        onProtobufTraffic,
         onTrafficHistory,
         onAudit,
         onLastSeenHistory,
@@ -160,6 +162,13 @@ describe("useAdminSse", () => {
           totalEgressBps: 0,
         },
       },
+      protobufTraffic: {
+        sampleWindowSec: 10,
+        total: { messageCount: 0, messagesPerSecond: 0, byteCount: 0, bytesPerSecond: 0, maxPacketBytes: 0, lastSentAt: null },
+        snapshotFull: { messageCount: 0, messagesPerSecond: 0, byteCount: 0, bytesPerSecond: 0, maxPacketBytes: 0, lastSentAt: null },
+        messageTypes: [],
+        connections: [],
+      },
       trafficHistory: {
         timezone: "UTC",
         range: "48h",
@@ -183,6 +192,15 @@ describe("useAdminSse", () => {
     });
     await expect(bootstrapPromise).resolves.toBe(true);
     expect(onBootstrap).toHaveBeenCalledTimes(1);
+
+    MockEventSource.instances[0].emit("protobuf_traffic", {
+      sampleWindowSec: 10,
+      total: { messageCount: 1, messagesPerSecond: 0.1, byteCount: 32, bytesPerSecond: 3.2, maxPacketBytes: 32, lastSentAt: 1 },
+      snapshotFull: { messageCount: 0, messagesPerSecond: 0, byteCount: 0, bytesPerSecond: 0, maxPacketBytes: 0, lastSentAt: null },
+      messageTypes: [],
+      connections: [],
+    });
+    expect(onProtobufTraffic).toHaveBeenCalledTimes(1);
 
     MockEventSource.instances[0].emit("last_seen_history", { serverTime: 1 });
     MockEventSource.instances[0].emit("tab_history", { serverTime: 1 });

@@ -9,12 +9,14 @@ from . import runtime
 from ..admin.auth import (
     build_admin_store_config,
     build_connection_details,
+    build_protobuf_connection_targets,
     build_room_overview,
     expire_admin_sessions,
     get_admin_observability_payload,
     record_audit_event,
 )
 from ..admin.payloads import AdminPayloadService
+from ..admin.protobuf_stats import ProtobufStatsService
 from ..admin.store import AdminStore
 from ..admin.traffic import TrafficStatsService
 from ..tab_history import TabHistoryStore, TabHistoryStoreConfig
@@ -119,11 +121,15 @@ async def lifespan(_app: FastAPI):
     )
     await runtime.tab_history_store.initialize()
     runtime.admin_traffic_service = TrafficStatsService(admin_store=runtime.admin_store)
+    runtime.admin_protobuf_stats_service = ProtobufStatsService(
+        resolve_active_connections=build_protobuf_connection_targets,
+    )
     runtime.admin_payload_service = AdminPayloadService(
         admin_store=runtime.admin_store,
         build_room_overview=build_room_overview,
         build_connection_details=build_connection_details,
         build_live_traffic=runtime.admin_traffic_service.build_live_payload,
+        build_live_protobuf_traffic=runtime.admin_protobuf_stats_service.build_live_payload,
         get_broadcast_hz=lambda: runtime.state.broadcast_hz,
         get_sse_subscriber_count=runtime.admin_sse_hub.subscriber_count,
         get_observability_payload=get_admin_observability_payload,
@@ -182,3 +188,4 @@ async def lifespan(_app: FastAPI):
         runtime.tab_history_subscriptions.clear()
         runtime.admin_payload_service = None
         runtime.admin_traffic_service = None
+        runtime.admin_protobuf_stats_service = None

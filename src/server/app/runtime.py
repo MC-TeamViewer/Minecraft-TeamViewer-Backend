@@ -3,6 +3,7 @@ import logging
 import os
 
 from ..admin.sse import AdminSseHub
+from ..admin.protobuf_stats import ProtobufStatsService
 from ..admin.traffic import TrafficStatsService
 from ..core.broadcaster import Broadcaster
 from ..core.codec import ProtobufMessageCodec
@@ -46,6 +47,7 @@ tab_history_store = None
 tab_history_subscriptions: dict[tuple[str, str], dict] = {}
 admin_payload_service = None
 admin_traffic_service: TrafficStatsService | None = None
+admin_protobuf_stats_service: ProtobufStatsService | None = None
 admin_retention_task: asyncio.Task | None = None
 admin_traffic_flush_task: asyncio.Task | None = None
 admin_sse_hub = AdminSseHub()

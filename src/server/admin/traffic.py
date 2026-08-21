@@ -5,6 +5,8 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
+from .protobuf_stats import record_protobuf_packet_nowait
+
 if TYPE_CHECKING:
     from .store import AdminStore
 
@@ -288,11 +290,22 @@ async def record_websocket_payload_traffic(
     )
 
 
-async def send_tracked_websocket_bytes(websocket, payload: bytes, *, channel: str | None = None) -> None:
+async def send_tracked_websocket_bytes(
+    websocket,
+    payload: bytes,
+    *,
+    channel: str | None = None,
+    protobuf_type: str | None = None,
+) -> None:
     await websocket.send_bytes(payload)
     await record_websocket_payload_traffic(
         websocket=websocket,
         direction="egress",
         payload=payload,
         channel=channel,
+    )
+    record_protobuf_packet_nowait(
+        websocket=websocket,
+        message_type=protobuf_type,
+        byte_count=len(payload),
     )

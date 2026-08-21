@@ -4,10 +4,11 @@ import ElTag from "element-plus/es/components/tag/index";
 import { ElTable, ElTableColumn } from "element-plus/es/components/table/index";
 import { computed } from "vue";
 
-import type { ConnectionDetail, OverviewPayload } from "@/types";
+import type { ConnectionDetail, OverviewPayload, ProtobufConnectionTraffic, ProtobufTrafficPayload } from "@/types";
 
 const props = defineProps<{
   overview: OverviewPayload | null;
+  protobufTraffic: ProtobufTrafficPayload | null;
 }>();
 
 const rows = computed(() =>
@@ -35,6 +36,30 @@ function healthType(row: ConnectionDetail): "success" | "warning" | "danger" | "
 function formatTimestamp(value: number | null | undefined): string {
   if (!value) return "-";
   return new Date(value * 1000).toLocaleString();
+}
+
+const trafficByActor = computed(() => new Map(
+  (props.protobufTraffic?.connections ?? []).map((item) => [`${item.channel}:${item.actorId}`, item]),
+));
+
+function trafficFor(row: ConnectionDetail): ProtobufConnectionTraffic | undefined {
+  return trafficByActor.value.get(`${row.channel}:${row.actorId}`);
+}
+
+function formatBytes(value: number | null | undefined): string {
+  const amount = Number(value ?? 0);
+  if (!Number.isFinite(amount) || amount <= 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB"];
+  const index = Math.min(Math.floor(Math.log(amount) / Math.log(1024)), units.length - 1);
+  const scaled = amount / (1024 ** index);
+  return `${scaled >= 10 || index === 0 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[index]}`;
+}
+
+function protobufSummary(row: ConnectionDetail): string {
+  const metric = trafficFor(row)?.total;
+  if (!metric) return "-";
+  const rate = metric.messagesPerSecond > 0 ? `${metric.messagesPerSecond.toFixed(2)} 包/s` : "0 包/s";
+  return `${rate} · ${metric.messageCount} 包`;
 }
 </script>
 
@@ -68,6 +93,12 @@ function formatTimestamp(value: number | null | undefined): string {
         <template #default="{ row }">{{ row.failureCode || "-" }}</template>
       </el-table-column>
       <el-table-column prop="protocolVersion" label="协议" width="90" />
+      <el-table-column label="Protobuf 发包" min-width="150">
+        <template #default="{ row }">{{ protobufSummary(row) }}</template>
+      </el-table-column>
+      <el-table-column label="累计字节" width="120">
+        <template #default="{ row }">{{ formatBytes(trafficFor(row)?.total.byteCount) }}</template>
+      </el-table-column>
       <el-table-column prop="programVersion" label="程序版本" min-width="180" show-overflow-tooltip />
       <el-table-column prop="actorId" label="Source ID" min-width="240" show-overflow-tooltip>
         <template #default="{ row }"><span class="mono-text">{{ row.actorId }}</span></template>

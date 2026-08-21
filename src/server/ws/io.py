@@ -32,16 +32,35 @@ from ..core.uuid_codec import normalize_inbound_uuid_fields
 from ..state import ServerState
 
 
+def protobuf_packet_type(packet) -> str | None:
+    if isinstance(packet, dict):
+        value = packet.get("type")
+    else:
+        value = getattr(packet, "type", None)
+    return value if isinstance(value, str) and value else None
+
+
 async def _raw_send_packet(websocket: WebSocket, packet, *, channel: str | None = None) -> None:
+    packet_type = protobuf_packet_type(packet)
     if channel:
         if isinstance(packet, dict):
             body = dict(packet)
         else:
             body = packet.model_dump(exclude_none=True)
         body["channel"] = channel
-        await send_tracked_websocket_bytes(websocket, runtime.message_codec.encode(body), channel=channel)
+        await send_tracked_websocket_bytes(
+            websocket,
+            runtime.message_codec.encode(body),
+            channel=channel,
+            protobuf_type=packet_type,
+        )
         return
-    await send_tracked_websocket_bytes(websocket, runtime.message_codec.encode(packet), channel=channel)
+    await send_tracked_websocket_bytes(
+        websocket,
+        runtime.message_codec.encode(packet),
+        channel=channel,
+        protobuf_type=packet_type,
+    )
 
 
 def _resolve_send_packet():

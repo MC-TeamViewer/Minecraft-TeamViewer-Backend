@@ -455,6 +455,28 @@ def build_connection_details() -> list[dict]:
     return details
 
 
+def build_protobuf_connection_targets() -> list[dict[str, Any]]:
+    """Return active socket identities used to attach live protobuf stats to actors."""
+    targets: list[dict[str, Any]] = []
+    for player_id, websocket in runtime.state.connections.items():
+        targets.append(
+            {
+                "actorId": player_id,
+                "channel": "external_source" if runtime.state.is_external_source(player_id) else "player",
+                "websocket": websocket,
+            }
+        )
+    for web_map_id, websocket in runtime.state.web_map_connections.items():
+        targets.append(
+            {
+                "actorId": web_map_id,
+                "channel": "web_map",
+                "websocket": websocket,
+            }
+        )
+    return targets
+
+
 def ensure_admin_payload_service() -> AdminPayloadService:
     if runtime.admin_payload_service is None:
         raise RuntimeError("admin_store_unavailable")
@@ -491,6 +513,10 @@ async def build_admin_hourly_metrics_payload(
 
 async def build_admin_live_traffic_payload() -> dict:
     return await ensure_admin_payload_service().build_live_traffic_payload()
+
+
+async def build_admin_protobuf_traffic_payload() -> dict:
+    return await ensure_admin_payload_service().build_live_protobuf_traffic_payload()
 
 
 async def build_admin_hourly_traffic_payload(hours: int = 48, start_at: str | None = None) -> dict:

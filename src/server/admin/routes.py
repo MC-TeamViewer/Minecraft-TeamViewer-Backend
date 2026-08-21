@@ -21,6 +21,7 @@ from .auth import (
     build_admin_hourly_metrics_payload,
     build_admin_hourly_traffic_payload,
     build_admin_live_traffic_payload,
+    build_admin_protobuf_traffic_payload,
     build_admin_overview_payload,
     build_admin_traffic_history_payload,
     build_admin_session_payload,
@@ -315,6 +316,8 @@ async def admin_events(
                         }
                     elif event_name == "traffic_live":
                         payload = {"serverTime": time.time(), **(await build_admin_live_traffic_payload())}
+                    elif event_name == "protobuf_traffic":
+                        payload = {"serverTime": time.time(), **(await build_admin_protobuf_traffic_payload())}
                     elif event_name == "traffic_history":
                         payload = {
                             "serverTime": time.time(),
@@ -424,6 +427,18 @@ async def admin_live_traffic(request: Request):
     await record_admin_access(request, auth_result, "admin_api_access")
     try:
         return JSONResponse(await build_admin_live_traffic_payload())
+    except Exception:
+        runtime.admin_runtime_stats["apiErrors"] += 1
+        raise
+
+
+async def admin_live_protobuf_traffic(request: Request):
+    auth_result = await authenticate_admin_request(request)
+    if isinstance(auth_result, JSONResponse):
+        return auth_result
+    await record_admin_access(request, auth_result, "admin_api_access")
+    try:
+        return JSONResponse(await build_admin_protobuf_traffic_payload())
     except Exception:
         runtime.admin_runtime_stats["apiErrors"] += 1
         raise
@@ -702,6 +717,7 @@ def register_admin_routes(app) -> None:
     app.get("/admin/api/metrics/daily")(admin_daily_metrics)
     app.get("/admin/api/metrics/hourly")(admin_hourly_metrics)
     app.get("/admin/api/traffic/live")(admin_live_traffic)
+    app.get("/admin/api/protobuf/live")(admin_live_protobuf_traffic)
     app.get("/admin/api/traffic/history")(admin_traffic_history)
     app.get("/admin/api/traffic/hourly")(admin_hourly_traffic)
     app.get("/admin/api/traffic/daily")(admin_daily_traffic)

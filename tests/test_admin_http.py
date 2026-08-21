@@ -20,6 +20,7 @@ if str(BACKEND_SRC) not in sys.path:
 
 import main as main_module
 from server.admin import auth as admin_auth
+from server.admin.protobuf_stats import record_protobuf_packet_nowait
 from server.admin import routes as admin_routes
 from server.admin.proxy_ip import get_websocket_remote_addr
 from server.admin.traffic import record_websocket_traffic
@@ -144,6 +145,7 @@ async def test_admin_page_is_public_but_api_requires_session(monkeypatch: pytest
             page = await client.get("/admin")
             overview = await client.get("/admin/api/overview")
             events = await client.get("/admin/api/events")
+            protobuf_traffic = await client.get("/admin/api/protobuf/live")
             assert page.status_code == 200, page.text
             assert "TeamViewRelay Admin" in page.text
             asset_match = re.search(r"/admin/assets/[^\"']+", page.text)
@@ -153,6 +155,7 @@ async def test_admin_page_is_public_but_api_requires_session(monkeypatch: pytest
     assert asset_response.status_code == 200
     assert overview.status_code == 401
     assert events.status_code == 401
+    assert protobuf_traffic.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -236,7 +239,8 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
             },
         )
 
-        app_runtime.state.connections["player-1"] = _connected_websocket_stub()  # type: ignore[assignment]
+        player_socket = _connected_websocket_stub()
+        app_runtime.state.connections["player-1"] = player_socket  # type: ignore[assignment]
         app_runtime.state.set_player_room("player-1", "room-admin-test")
         app_runtime.state.connection_caps["player-1"] = {
             "protocol": "0.6.1",
@@ -244,7 +248,8 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
             "remoteAddr": "127.0.0.1",
         }
         app_runtime.state.players["player-1"] = {"data": {"playerName": "Alice"}}
-        app_runtime.state.web_map_connections["web-map-1"] = _connected_websocket_stub()  # type: ignore[assignment]
+        web_map_socket = _connected_websocket_stub()
+        app_runtime.state.web_map_connections["web-map-1"] = web_map_socket  # type: ignore[assignment]
         app_runtime.state.set_web_map_room("web-map-1", "room-admin-test")
         app_runtime.web_map_connection_meta["web-map-1"] = {
             "protocolVersion": "0.6.1",
@@ -252,6 +257,16 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
             "displayName": "Web Map",
             "remoteAddr": "127.0.0.2",
         }
+        app_runtime.admin_protobuf_stats_service.record_nowait(
+            websocket=player_socket,
+            message_type="snapshot_full",
+            byte_count=8192,
+        )
+        app_runtime.admin_protobuf_stats_service.record_nowait(
+            websocket=web_map_socket,
+            message_type="patch",
+            byte_count=512,
+        )
 
         transport = httpx.ASGITransport(app=main.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -261,6 +276,7 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
             daily = await client.get("/admin/api/metrics/daily?days=2")
             hourly = await client.get("/admin/api/metrics/hourly?hours=3")
             live_traffic = await client.get("/admin/api/traffic/live")
+            protobuf_traffic = await client.get("/admin/api/protobuf/live")
             history_traffic = await client.get("/admin/api/traffic/history?range=6h&granularity=5m")
             hourly_traffic = await client.get(f"/admin/api/traffic/hourly?hours=2&startAt={current_hour}")
             daily_traffic = await client.get("/admin/api/traffic/daily?days=2")
@@ -275,6 +291,7 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
     daily_payload = daily.json()
     hourly_payload = hourly.json()
     live_traffic_payload = live_traffic.json()
+    protobuf_traffic_payload = protobuf_traffic.json()
     history_traffic_payload = history_traffic.json()
     hourly_traffic_payload = hourly_traffic.json()
     daily_traffic_payload = daily_traffic.json()
@@ -300,6 +317,11 @@ async def test_admin_http_exposes_dashboard_metrics_audit_and_traffic(monkeypatc
     assert live_traffic_payload["application"]["totalIngressBps"] > 0
     assert live_traffic_payload["application"]["totalEgressBps"] > 0
     assert live_traffic_payload["wire"]["totalIngressBps"] == 0
+    assert protobuf_traffic.status_code == 200
+    assert protobuf_traffic_payload["sampleWindowSec"] == 10
+    assert protobuf_traffic_payload["total"]["messageCount"] >= 2
+    assert protobuf_traffic_payload["snapshotFull"]["byteCount"] >= 8192
+    assert {item["actorId"] for item in protobuf_traffic_payload["connections"]} == {"player-1", "web-map-1"}
     assert history_traffic_payload["range"] == "6h"
     assert history_traffic_payload["granularity"] == "5m"
     assert history_traffic_payload["selectedLayer"] == "application"
@@ -599,6 +621,7 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         assert bootstrap_payload["overview"]["playerConnections"] == 0
         assert bootstrap_payload["liveTraffic"]["application"]["totalIngressBps"] > 0
         assert bootstrap_payload["liveTraffic"]["wire"]["totalIngressBps"] == 0
+        assert bootstrap_payload["protobufTraffic"]["total"]["messageCount"] == 0
         assert bootstrap_payload["trafficHistory"]["application"]["items"]
         assert bootstrap_payload["trafficHistory"]["wire"]["items"]
         assert bootstrap_payload["trafficHistory"]["range"] == "6h"
@@ -609,13 +632,24 @@ async def test_admin_sse_stream_emits_bootstrap_and_followup_events(
         assert "availableEventTypes" in bootstrap_payload["audit"]
         assert any(item["playerId"] == "player-2" and item["username"] == "Bob" for item in bootstrap_payload["audit"]["playerIdentityMappings"])
 
-        app_runtime.state.connections["player-2"] = _connected_websocket_stub()  # type: ignore[assignment]
+        player_socket = _connected_websocket_stub()
+        app_runtime.state.connections["player-2"] = player_socket  # type: ignore[assignment]
         app_runtime.state.set_player_room("player-2", "room-admin-test")
         admin_auth.trigger_admin_sse_overview()
 
         overview_name, overview_payload = await _read_sse_event(lines, expected_names={"overview"})
         assert overview_name == "overview"
         assert overview_payload["playerConnections"] == 1
+
+        record_protobuf_packet_nowait(
+            websocket=player_socket,
+            message_type="snapshot_full",
+            byte_count=4096,
+        )
+        protobuf_name, protobuf_payload = await _read_sse_event(lines, expected_names={"protobuf_traffic"})
+        assert protobuf_name == "protobuf_traffic"
+        assert protobuf_payload["snapshotFull"]["messageCount"] >= 1
+        assert protobuf_payload["connections"][0]["actorId"] == "player-2"
 
         await admin_auth.record_player_activity("player-2", "room-admin-test")
         metric_payloads = {}

@@ -8,6 +8,7 @@ import type {
   LiveTrafficPayload,
   MetricsPayload,
   OverviewPayload,
+  ProtobufTrafficPayload,
   TrafficHistoryPayload,
 } from "@/types";
 
@@ -24,6 +25,7 @@ export interface UseAdminSseOptions {
   onDailyMetrics: (payload: MetricsPayload) => void;
   onHourlyMetrics: (payload: MetricsPayload) => void;
   onLiveTraffic: (payload: LiveTrafficPayload) => void;
+  onProtobufTraffic: (payload: ProtobufTrafficPayload) => void;
   onTrafficHistory: (payload: TrafficHistoryPayload) => void;
   onAudit: (payload: AuditPayload) => void;
   onLastSeenHistory?: () => void;
@@ -159,6 +161,12 @@ export function useAdminSse(options: UseAdminSseOptions) {
       const payload = parsePayload<LiveTrafficPayload>(event);
       if (payload) {
         options.onLiveTraffic(payload);
+      }
+    });
+    source.addEventListener("protobuf_traffic", (event) => {
+      const payload = parsePayload<ProtobufTrafficPayload>(event);
+      if (payload) {
+        options.onProtobufTraffic(payload);
       }
     });
     source.addEventListener("traffic_history", (event) => {

@@ -13,6 +13,7 @@ from .models import (
     LiveTrafficPayload,
     MetricsPayload,
     OverviewPayload,
+    ProtobufTrafficPayload,
     TrafficHistoryPayload,
     RoomOverviewItem,
 )
@@ -33,6 +34,7 @@ class AdminPayloadService:
         build_room_overview: Callable[[], list[RoomOverviewItem]],
         build_connection_details: Callable[[], list[ConnectionDetailItem]],
         build_live_traffic: Callable[[], Awaitable[LiveTrafficPayload]],
+        build_live_protobuf_traffic: Callable[[], Awaitable[ProtobufTrafficPayload]],
         get_broadcast_hz: Callable[[], float],
         get_sse_subscriber_count: Callable[[], int],
         get_observability_payload: Callable[[], AdminObservabilityPayload],
@@ -41,6 +43,7 @@ class AdminPayloadService:
         self._build_room_overview = build_room_overview
         self._build_connection_details = build_connection_details
         self._build_live_traffic = build_live_traffic
+        self._build_live_protobuf_traffic = build_live_protobuf_traffic
         self._get_broadcast_hz = get_broadcast_hz
         self._get_sse_subscriber_count = get_sse_subscriber_count
         self._get_observability_payload = get_observability_payload
@@ -127,6 +130,13 @@ class AdminPayloadService:
             ("live_traffic", ()),
             ttl_sec=1.0,
             builder=self._build_live_traffic,
+        )
+
+    async def build_live_protobuf_traffic_payload(self) -> ProtobufTrafficPayload:
+        return await self._get_cached_payload(
+            ("protobuf_traffic", ()),
+            ttl_sec=1.0,
+            builder=self._build_live_protobuf_traffic,
         )
 
     async def build_hourly_traffic_payload(self, *, hours: int = 48, start_at: str | None = None) -> dict[str, Any]:
@@ -247,11 +257,12 @@ class AdminPayloadService:
         traffic_granularity: str = "1h",
         traffic_start_at: str | None = None,
     ) -> BootstrapPayload:
-        overview, daily_metrics, hourly_metrics, live_traffic, traffic_history, audit = await asyncio.gather(
+        overview, daily_metrics, hourly_metrics, live_traffic, protobuf_traffic, traffic_history, audit = await asyncio.gather(
             self.build_overview_payload(),
             self.build_daily_metrics_payload(days=daily_days, room_code=daily_room_code, start_date=daily_start_date),
             self.build_hourly_metrics_payload(hours=hourly_hours, room_code=hourly_room_code, start_at=hourly_start_at),
             self.build_live_traffic_payload(),
+            self.build_live_protobuf_traffic_payload(),
             self.build_traffic_history_payload(
                 range_preset=traffic_range,
                 granularity=traffic_granularity,
@@ -270,6 +281,7 @@ class AdminPayloadService:
             "dailyMetrics": daily_metrics,
             "hourlyMetrics": hourly_metrics,
             "liveTraffic": live_traffic,
+            "protobufTraffic": protobuf_traffic,
             "trafficHistory": traffic_history,
             "audit": audit,
         }

@@ -212,7 +212,7 @@ async def test_scoped_view_change_is_sent_when_global_winner_does_not_change() -
     broadcaster._player_last_states[viewer] = broadcaster._build_player_sync_view_state(first_visible)
     sent: list[bytes] = []
 
-    async def capture_send(self, ws, payload: bytes, *, channel: str) -> None:
+    async def capture_send(self, ws, payload: bytes, *, channel: str, protobuf_type: str) -> None:
         sent.append(payload)
 
     async def skip_web_maps(self, force_full: bool = False) -> None:
@@ -288,7 +288,7 @@ async def test_field_clear_delivery_never_falls_back_to_snapshot_full(
     }
     sent: list[bytes] = []
 
-    async def capture_send(self, ws, payload: bytes, *, channel: str) -> None:
+    async def capture_send(self, ws, payload: bytes, *, channel: str, protobuf_type: str) -> None:
         sent.append(payload)
 
     broadcaster._send_encoded = MethodType(capture_send, broadcaster)

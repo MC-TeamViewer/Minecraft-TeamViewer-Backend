@@ -39,6 +39,7 @@ import type {
   TrafficHistoryDisplayMode,
   TrafficLayer,
   TrafficMixedViewMode,
+  ProtobufTrafficPayload,
 } from "@/types";
 import {
   DEFAULT_AUDIT_FILTERS,
@@ -75,6 +76,7 @@ let trafficRefreshVersion = 0;
 const lastSeenRefreshKey = ref(0);
 const tabHistoryRefreshKey = ref(0);
 const runtimeStateRefreshKey = ref(0);
+const protobufTraffic = ref<ProtobufTrafficPayload | null>(null);
 
 const { overview, roomOptions, applyOverview, resetOverview } = useOverviewState();
 const {
@@ -105,6 +107,7 @@ function resetDashboard() {
   resetOverview();
   resetMetrics();
   resetAudit();
+  protobufTraffic.value = null;
   isLoading.value = true;
   loadError.value = null;
   dailyMetricsLoading.value = false;
@@ -141,6 +144,7 @@ function applyBootstrap(payload: BootstrapPayload) {
   applyDailyMetrics(payload.dailyMetrics);
   applyHourlyMetrics(payload.hourlyMetrics);
   applyLiveTraffic(payload.liveTraffic);
+  protobufTraffic.value = payload.protobufTraffic;
   applyTrafficHistory(payload.trafficHistory);
   if (!hadLiveTraffic) {
     liveTrafficLayer.value = payload.liveTraffic.selectedLayer ?? "application";
@@ -291,6 +295,7 @@ const {
     hourlyMetricsLoading.value = false;
   },
   onLiveTraffic: applyLiveTraffic,
+  onProtobufTraffic: (payload) => { protobufTraffic.value = payload; },
   onTrafficHistory: (payload) => {
     if (!matchesTrafficFilters(payload)) {
       return;
@@ -523,7 +528,7 @@ function updateHistoryTrafficMixedView(value: TrafficMixedViewMode) {
         <span class="hero-eyebrow">管理后台</span>
         <h1>TeamViewRelay Admin</h1>
         <p>
-          统一查看在线概况、实时网速、活跃指标与审计日志，并管理下线位置和 Tab 历史数据。
+          统一查看在线概况、实时网速、Protobuf 发包、活跃指标与审计日志，并管理下线位置和 Tab 历史数据。
         </p>
       </div>
       <div class="hero-actions">
@@ -602,8 +607,8 @@ function updateHistoryTrafficMixedView(value: TrafficMixedViewMode) {
       </section>
 
       <RoomOverviewTable :overview="overview" />
-      <ConnectionStatusTable :overview="overview" />
-      <ExternalSourceStatusTable :overview="overview" />
+      <ConnectionStatusTable :overview="overview" :protobuf-traffic="protobufTraffic" />
+      <ExternalSourceStatusTable :overview="overview" :protobuf-traffic="protobufTraffic" />
 
       <HistoryDataManager kind="last-seen" :refresh-key="lastSeenRefreshKey" />
       <HistoryDataManager kind="tab" :refresh-key="tabHistoryRefreshKey" />
