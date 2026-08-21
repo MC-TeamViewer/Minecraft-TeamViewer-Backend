@@ -2,9 +2,8 @@
 import ElButton from "element-plus/es/components/button/index";
 import ElCard from "element-plus/es/components/card/index";
 import ElInput from "element-plus/es/components/input/index";
-import ElOption from "element-plus/es/components/option/index";
 import ElPagination from "element-plus/es/components/pagination/index";
-import ElSelect from "element-plus/es/components/select/index";
+import { ElOption, ElSelect } from "element-plus/es/components/select/index";
 import { ElTable, ElTableColumn } from "element-plus/es/components/table/index";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { computed, ref, watch } from "vue";
