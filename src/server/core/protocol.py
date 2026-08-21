@@ -42,6 +42,30 @@ class ResyncRequestPacket(PacketModel):
     type: Literal["resync_req"]
 
 
+class TabHistorySubscribePacket(PacketModel):
+    type: Literal["tab_history_subscribe"]
+    enabled: bool = True
+    knownRevision: int | None = None
+    knownDigestSha256: bytes | None = None
+
+
+class TabHistorySyncRequestPacket(PacketModel):
+    type: Literal["tab_history_sync_request"]
+    requestId: str
+    preferredMode: str | int = "TAB_HISTORY_SYNC_MODE_FULL"
+    baseRevision: int | None = None
+    baseDigestSha256: bytes | None = None
+    maxChunkEntries: int | None = None
+    allowFullFallback: bool = False
+
+
+class TabHistoryLookupRequestPacket(PacketModel):
+    type: Literal["tab_history_lookup_request"]
+    requestId: str
+    selectors: list[dict[str, Any]] = Field(default_factory=list)
+    maxChunkEntries: int | None = None
+
+
 class CommandPlayerMarkSetPacket(PacketModel):
     type: Literal["command_player_mark_set"]
     playerId: str | None = None
@@ -236,7 +260,10 @@ WebMapInboundPacket = Annotated[
     | CommandPlayerMarkClearAllPacket
     | CommandSameServerFilterSetPacket
     | CommandTacticalWaypointSetPacket
-    | WaypointsDeletePacket,
+    | WaypointsDeletePacket
+    | TabHistorySubscribePacket
+    | TabHistorySyncRequestPacket
+    | TabHistoryLookupRequestPacket,
     Field(discriminator="type"),
 ]
 
@@ -264,7 +291,10 @@ PlayerInboundPacket = Annotated[
     | WaypointsDeletePacket
     | WaypointsEntityDeathCancelPacket
     | BattleMapObservationPacket
-    | ResyncRequestPacket,
+    | ResyncRequestPacket
+    | TabHistorySubscribePacket
+    | TabHistorySyncRequestPacket
+    | TabHistoryLookupRequestPacket,
     Field(discriminator="type"),
 ]
 
@@ -359,6 +389,7 @@ class HandshakeAckPacket(OutboundPacket):
     entityTimeoutSec: int | None = None
     battleChunkTimeoutSec: int | None = None
     acceptedClientRole: str | int | None = None
+    tabHistory: dict[str, Any] | None = None
 
 
 class WebMapAckPacket(OutboundPacket):

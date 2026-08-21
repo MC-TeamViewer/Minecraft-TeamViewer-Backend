@@ -47,3 +47,18 @@ congestionLevels = [
 [features]
 # 是否启用同服过滤（基于 Tab 列表归并来源）
 sameServerFilterEnabled = false
+
+[tabHistory]
+# 仅协议 0.7.0+ 且具有合法 UUID 的 Tab 条目会进入历史记录。
+enabled = true
+# 玩家最新标签保留天数；0 表示永久保留。
+retentionDays = 400
+# 增量变更日志保留天数；0 表示永久保留。
+deltaRetentionDays = 30
+# 下列条目数均是单消息 chunk 限制，不是房间记录总数限制。
+defaultChunkEntries = 256
+maxChunkEntries = 512
+maxChunkBytes = 262144
+maxLookupSelectors = 128
+# 标签不变时，最多每隔多久刷新一次 lastObserved，避免高频 Tab 报告制造无意义增量。
+observationUpdateIntervalSec = 300

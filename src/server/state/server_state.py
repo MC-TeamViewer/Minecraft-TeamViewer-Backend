@@ -91,6 +91,14 @@ class ServerState:
         (8, 10.0),
     )
     TAB_REPORT_TIMEOUT_SEC = 45
+    TAB_HISTORY_ENABLED = True
+    TAB_HISTORY_RETENTION_DAYS = 400
+    TAB_HISTORY_DELTA_RETENTION_DAYS = 30
+    TAB_HISTORY_DEFAULT_CHUNK_ENTRIES = 256
+    TAB_HISTORY_MAX_CHUNK_ENTRIES = 512
+    TAB_HISTORY_MAX_CHUNK_BYTES = 256 * 1024
+    TAB_HISTORY_MAX_LOOKUP_SELECTORS = 128
+    TAB_HISTORY_OBSERVATION_UPDATE_INTERVAL_SEC = 300
     DEFAULT_ROOM_CODE = "default"
     WEB_MAP_TACTICAL_SOURCE_PREFIX = "__web_map_tactical__:"
     BATTLE_CHUNK_CACHE_SOURCE_PREFIX = "__battle_chunk_cache__:"
@@ -233,6 +241,36 @@ class ServerState:
         self.same_server_filter_enabled = self._coerce_bool(
             feature_cfg.get("sameServerFilterEnabled"),
             False,
+        )
+
+        tab_history_cfg = config.get("tabHistory", {}) if isinstance(config.get("tabHistory"), dict) else {}
+        self.TAB_HISTORY_ENABLED = self._coerce_bool(tab_history_cfg.get("enabled"), self.TAB_HISTORY_ENABLED)
+        self.TAB_HISTORY_RETENTION_DAYS = self._coerce_int(
+            tab_history_cfg.get("retentionDays"), self.TAB_HISTORY_RETENTION_DAYS, 0, 36500
+        )
+        self.TAB_HISTORY_DELTA_RETENTION_DAYS = self._coerce_int(
+            tab_history_cfg.get("deltaRetentionDays"), self.TAB_HISTORY_DELTA_RETENTION_DAYS, 0, 36500
+        )
+        self.TAB_HISTORY_DEFAULT_CHUNK_ENTRIES = self._coerce_int(
+            tab_history_cfg.get("defaultChunkEntries"), self.TAB_HISTORY_DEFAULT_CHUNK_ENTRIES, 1, 512
+        )
+        self.TAB_HISTORY_MAX_CHUNK_ENTRIES = self._coerce_int(
+            tab_history_cfg.get("maxChunkEntries"), self.TAB_HISTORY_MAX_CHUNK_ENTRIES, 1, 512
+        )
+        self.TAB_HISTORY_DEFAULT_CHUNK_ENTRIES = min(
+            self.TAB_HISTORY_DEFAULT_CHUNK_ENTRIES, self.TAB_HISTORY_MAX_CHUNK_ENTRIES
+        )
+        self.TAB_HISTORY_MAX_CHUNK_BYTES = self._coerce_int(
+            tab_history_cfg.get("maxChunkBytes"), self.TAB_HISTORY_MAX_CHUNK_BYTES, 16 * 1024, 1024 * 1024
+        )
+        self.TAB_HISTORY_MAX_LOOKUP_SELECTORS = self._coerce_int(
+            tab_history_cfg.get("maxLookupSelectors"), self.TAB_HISTORY_MAX_LOOKUP_SELECTORS, 1, 512
+        )
+        self.TAB_HISTORY_OBSERVATION_UPDATE_INTERVAL_SEC = self._coerce_int(
+            tab_history_cfg.get("observationUpdateIntervalSec"),
+            self.TAB_HISTORY_OBSERVATION_UPDATE_INTERVAL_SEC,
+            0,
+            86400,
         )
 
         logger.info(
@@ -508,6 +546,9 @@ class ServerState:
         entry_name = self._normalize_tab_name(item.get("name") or item.get("playerName"))
         entry_display_name = self._normalize_tab_name(item.get("displayName"))
         entry_prefixed_name = self._normalize_tab_name(item.get("prefixedName") or item.get("teamDisplayName"))
+        scoreboard_team_id = self._normalize_tab_name(item.get("scoreboardTeamId") or item.get("teamId"))
+        scoreboard_prefix = self._normalize_tab_name(item.get("scoreboardPrefix"))
+        scoreboard_suffix = self._normalize_tab_name(item.get("scoreboardSuffix"))
 
         if entry_uuid is None and entry_name is None and entry_display_name is None and entry_prefixed_name is None:
             return None
@@ -517,6 +558,13 @@ class ServerState:
             "name": entry_name,
             "displayName": entry_display_name,
             "prefixedName": entry_prefixed_name,
+            "scoreboardTeamId": scoreboard_team_id,
+            "scoreboardPrefix": scoreboard_prefix if scoreboard_prefix is not None else entry_prefixed_name,
+            "scoreboardSuffix": scoreboard_suffix,
+            "scoreboardColorRgb": item.get("scoreboardColorRgb"),
+            "formattedDisplayName": item.get("formattedDisplayName"),
+            "formattedScoreboardPrefix": item.get("formattedScoreboardPrefix"),
+            "formattedScoreboardSuffix": item.get("formattedScoreboardSuffix"),
         }
 
     def _build_tab_player_report_key(self, entry: dict[str, Any]) -> str | None:
@@ -604,6 +652,8 @@ class ServerState:
                 entry = self._build_tab_player_entry(item)
                 if entry is None:
                     continue
+                if entry.get("uuid") is None:
+                    entry["uuid"] = self._normalize_tab_uuid(raw_key)
                 entry_key = self._normalize_tab_report_key(raw_key) or self._build_tab_player_report_key(entry)
                 if entry_key is None:
                     continue

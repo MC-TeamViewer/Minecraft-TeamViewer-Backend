@@ -17,6 +17,7 @@ from ..admin.auth import (
 from ..admin.payloads import AdminPayloadService
 from ..admin.store import AdminStore
 from ..admin.traffic import TrafficStatsService
+from ..tab_history import TabHistoryStore, TabHistoryStoreConfig
 
 
 async def run_broadcast_scheduler() -> None:
@@ -57,6 +58,8 @@ async def run_admin_retention_scheduler() -> None:
         try:
             if runtime.admin_store is not None:
                 cleanup = await runtime.admin_store.cleanup_retention()
+                if runtime.tab_history_store is not None:
+                    cleanup["tabHistory"] = await runtime.tab_history_store.cleanup_retention()
                 expired_sessions = await expire_admin_sessions()
                 cleanup["expiredSessionsEnded"] = expired_sessions
                 runtime.admin_runtime_stats["lastRetentionCleanup"] = json.dumps(cleanup, ensure_ascii=False)
@@ -106,6 +109,15 @@ async def run_admin_traffic_flush_scheduler() -> None:
 async def lifespan(_app: FastAPI):
     runtime.admin_store = AdminStore(build_admin_store_config())
     await runtime.admin_store.initialize()
+    runtime.tab_history_store = TabHistoryStore(
+        TabHistoryStoreConfig(
+            db_path=runtime.admin_store.config.db_path,
+            retention_days=runtime.state.TAB_HISTORY_RETENTION_DAYS,
+            delta_retention_days=runtime.state.TAB_HISTORY_DELTA_RETENTION_DAYS,
+            observation_update_interval_sec=runtime.state.TAB_HISTORY_OBSERVATION_UPDATE_INTERVAL_SEC,
+        )
+    )
+    await runtime.tab_history_store.initialize()
     runtime.admin_traffic_service = TrafficStatsService(admin_store=runtime.admin_store)
     runtime.admin_payload_service = AdminPayloadService(
         admin_store=runtime.admin_store,
@@ -117,6 +129,7 @@ async def lifespan(_app: FastAPI):
         get_observability_payload=get_admin_observability_payload,
     )
     cleanup = await runtime.admin_store.cleanup_retention()
+    cleanup["tabHistory"] = await runtime.tab_history_store.cleanup_retention()
     cleanup["expiredSessionsEnded"] = await expire_admin_sessions()
     runtime.admin_runtime_stats["lastRetentionCleanup"] = json.dumps(cleanup, ensure_ascii=False)
     runtime.admin_runtime_stats["apiErrors"] = 0
@@ -163,5 +176,9 @@ async def lifespan(_app: FastAPI):
                 await runtime.admin_traffic_service.flush_pending()
             await runtime.admin_store.close()
             runtime.admin_store = None
+        if runtime.tab_history_store is not None:
+            await runtime.tab_history_store.close()
+            runtime.tab_history_store = None
+        runtime.tab_history_subscriptions.clear()
         runtime.admin_payload_service = None
         runtime.admin_traffic_service = None

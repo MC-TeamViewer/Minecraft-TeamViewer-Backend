@@ -31,6 +31,12 @@ _WIRE_PAYLOADS: dict[str, tuple[str, type[Message]]] = {
     "report_rate_hint": ("report_rate_hint", teamviewer_pb2.ReportRateHint),
     "battle_chunk_meta_request": ("battle_chunk_meta_req", teamviewer_pb2.BattleChunkMetaRequest),
     "battle_chunk_meta_snapshot": ("battle_chunk_meta_snapshot", teamviewer_pb2.BattleChunkMetaSnapshot),
+    "tab_history_subscribe_request": ("tab_history_subscribe", teamviewer_pb2.TabHistorySubscribeRequest),
+    "tab_history_sync_request": ("tab_history_sync_request", teamviewer_pb2.TabHistorySyncRequest),
+    "tab_history_lookup_request": ("tab_history_lookup_request", teamviewer_pb2.TabHistoryLookupRequest),
+    "tab_history_digest": ("tab_history_digest", teamviewer_pb2.TabHistoryDigest),
+    "tab_history_sync_chunk": ("tab_history_sync_chunk", teamviewer_pb2.TabHistorySyncChunk),
+    "tab_history_lookup_chunk": ("tab_history_lookup_chunk", teamviewer_pb2.TabHistoryLookupChunk),
 }
 
 _PAYLOAD_TO_TYPE: dict[str, str] = {
@@ -416,6 +422,23 @@ def _patch_upserts_to_map(items: list[dict[str, Any]]) -> dict[str, Any]:
     return mapped
 
 
+def _tab_patch_upserts_to_map(items: list[dict[str, Any]]) -> dict[str, Any]:
+    mapped: dict[str, Any] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_key = item.get("key")
+        if not isinstance(item_key, str) or not item_key:
+            continue
+        data = dict(item.get("data")) if isinstance(item.get("data"), dict) else {}
+        # Protocol 0.6.x Mod builds accidentally wrote the UUID only to the
+        # TabPlayerUpsert key. Backfill it defensively at the decode boundary.
+        if not data.get("uuid"):
+            data["uuid"] = item_key
+        mapped[item_key] = data
+    return mapped
+
+
 def _last_seen_players_to_map(value: Any) -> dict[str, Any]:
     """Normalize last-seen map values without weakening their model contract.
 
@@ -681,7 +704,7 @@ def _decode_payload(payload_name: str, payload: Message) -> dict[str, Any]:
         tab_players_patch = data.get("tabPlayersPatch")
         if isinstance(tab_players_patch, dict):
             bundle["tabPlayersPatch"] = {
-                "upsert": _patch_upserts_to_map(tab_players_patch.get("upsert", [])),
+                "upsert": _tab_patch_upserts_to_map(tab_players_patch.get("upsert", [])),
                 "delete": list(tab_players_patch.get("delete", [])),
             }
 

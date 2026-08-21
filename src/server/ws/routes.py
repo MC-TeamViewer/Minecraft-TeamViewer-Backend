@@ -37,6 +37,12 @@ from ..core.protocol import (
     WaypointsDeletePacket,
     WebMapAckPacket,
 )
+from ..tab_history.service import (
+    broadcast_digest as broadcast_tab_history_digest,
+    capabilities as tab_history_capabilities,
+    handle_packet as handle_tab_history_packet,
+    supported_for_protocol as tab_history_supported_for_protocol,
+)
 from .io import (
     describe_websocket,
     expand_player_packets,
@@ -190,6 +196,11 @@ async def web_map_ws(websocket: WebSocket):
                         playerTimeoutSec=runtime.state.PLAYER_TIMEOUT,
                         entityTimeoutSec=runtime.state.ENTITY_TIMEOUT,
                         battleChunkTimeoutSec=runtime.state.BATTLE_CHUNK_TIMEOUT,
+                        tabHistory=(
+                            tab_history_capabilities()
+                            if tab_history_supported_for_protocol(client_protocol)
+                            else None
+                        ),
                     ),
                     channel="web_map",
                 )
@@ -238,6 +249,16 @@ async def web_map_ws(websocket: WebSocket):
 
             if not handshake_completed:
                 await send_packet(websocket, WebMapAckPacket(ok=False, error="handshake_required"))
+                continue
+
+            if await handle_tab_history_packet(
+                packet,
+                websocket,
+                send_packet,
+                connection_key=("web_map", web_map_id),
+                room_code=web_map_room,
+                channel="web_map",
+            ):
                 continue
 
             if isinstance(packet, PingPacket):
@@ -502,6 +523,7 @@ async def web_map_ws(websocket: WebSocket):
             del runtime.state.web_map_connection_rooms[web_map_id]
         runtime.state.web_map_connection_protocols.pop(web_map_id, None)
         runtime.web_map_connection_meta.pop(web_map_id, None)
+        runtime.tab_history_subscriptions.pop(("web_map", web_map_id), None)
 
 
 async def reserved_admin_ws(websocket: WebSocket):
@@ -670,6 +692,11 @@ async def websocket_endpoint(websocket: WebSocket):
                         "entityTimeoutSec": runtime.state.ENTITY_TIMEOUT,
                         "battleChunkTimeoutSec": runtime.state.BATTLE_CHUNK_TIMEOUT,
                         "acceptedClientRole": client_role,
+                        "tabHistory": (
+                            tab_history_capabilities()
+                            if tab_history_supported_for_protocol(client_protocol)
+                            else None
+                        ),
                     }
                     await send_packet(websocket, HandshakeAckPacket(**ack))
                     runtime.state.connections[submit_player_id] = websocket
@@ -715,6 +742,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     submit_player_id,
                     runtime.state.get_player_room(submit_player_id),
                 )
+
+            player_protocol = str(runtime.state.connection_caps.get(submit_player_id, {}).get("protocol") or "")
+            if await handle_tab_history_packet(
+                packet,
+                websocket,
+                send_packet,
+                connection_key=("player", submit_player_id),
+                room_code=runtime.state.get_player_room(submit_player_id),
+                channel="player",
+            ):
+                continue
 
             for expanded_packet in expand_player_packets(packet):
                 if isinstance(expanded_packet, ExternalSourceStatusPacket):
@@ -843,6 +881,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     if isinstance(submit_player_id, str) and submit_player_id:
                         current_time = time.monotonic()
                         runtime.state.upsert_tab_player_report(submit_player_id, expanded_packet.tabPlayers, current_time)
+                        if runtime.tab_history_store is not None and tab_history_supported_for_protocol(player_protocol):
+                            changed = await runtime.tab_history_store.upsert_players(
+                                runtime.state.get_player_room(submit_player_id),
+                                [(None, item) for item in expanded_packet.tabPlayers],
+                            )
+                            if changed:
+                                await broadcast_tab_history_digest(
+                                    runtime.state.get_player_room(submit_player_id), send_packet
+                                )
                         await runtime.broadcaster.broadcast_web_map_updates()
                     continue
 
@@ -855,6 +902,15 @@ async def websocket_endpoint(websocket: WebSocket):
                             expanded_packet.delete,
                             current_time,
                         )
+                        if runtime.tab_history_store is not None and tab_history_supported_for_protocol(player_protocol):
+                            changed = await runtime.tab_history_store.upsert_players(
+                                runtime.state.get_player_room(submit_player_id),
+                                list(expanded_packet.upsert.items()),
+                            )
+                            if changed:
+                                await broadcast_tab_history_digest(
+                                    runtime.state.get_player_room(submit_player_id), send_packet
+                                )
                         await runtime.broadcaster.broadcast_web_map_updates()
                     continue
 
@@ -1175,6 +1231,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 detail={"reason": disconnect_reason, "code": disconnect_code},
             )
             runtime.state.remove_connection(submit_player_id)
+            runtime.tab_history_subscriptions.pop(("player", submit_player_id), None)
             await runtime.broadcaster.broadcast_web_map_updates()
             runtime.logger.info("Client %s disconnected", submit_player_id)
 

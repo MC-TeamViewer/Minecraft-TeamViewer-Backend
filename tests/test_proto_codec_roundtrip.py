@@ -54,8 +54,34 @@ def test_wire_envelope_payload_field_numbers_are_contiguous() -> None:
     payload = teamviewer_pb2.WireEnvelope.DESCRIPTOR.oneofs_by_name["payload"]
     field_numbers = [field.number for field in payload.fields]
 
-    assert field_numbers == list(range(10, 27))
+    assert field_numbers == list(range(10, 33))
     assert teamviewer_pb2.WireEnvelope.DESCRIPTOR.fields_by_name["channel"].number == 1
+
+
+def test_tab_history_codec_and_legacy_tab_patch_uuid_fallback() -> None:
+    request = CODEC.decode(
+        CODEC.encode(
+            {
+                "type": "tab_history_lookup_request",
+                "channel": "web_map",
+                "requestId": "lookup-1",
+                "selectors": [
+                    {"uuid": "12345678-1234-5678-9234-567812345678"},
+                    {"name": "Player"},
+                ],
+            }
+        )
+    )
+    assert request["requestId"] == "lookup-1"
+    assert request["selectors"][1]["name"] == "Player"
+
+    envelope = teamviewer_pb2.WireEnvelope(channel=teamviewer_pb2.WIRE_CHANNEL_PLAYER)
+    patch = envelope.player_report_bundle.tab_players_patch.upsert.add()
+    patch.key = "12345678-1234-5678-9234-567812345678"
+    patch.data.name = "Player"
+    decoded = CODEC.decode(envelope.SerializeToString())
+    data = decoded["tabPlayersPatch"]["upsert"][patch.key]
+    assert data["uuid"] == patch.key
 
 
 def test_optional_client_role_presence_and_external_status_roundtrip() -> None:

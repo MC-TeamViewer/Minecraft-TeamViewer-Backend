@@ -9,9 +9,9 @@ from ..core.codec import ProtobufMessageCodec
 from ..state import ServerState
 
 
-NETWORK_PROTOCOL_VERSION = "0.6.5"
+NETWORK_PROTOCOL_VERSION = "0.7.0"
 SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = "0.6.1"
-SERVER_PROGRAM_VERSION = "team-view-relay-server-v0.5.12-proto0.6.5"
+SERVER_PROGRAM_VERSION = "team-view-relay-server-v0.5.13-proto0.7.0"
 LEGACY_PROTOCOL_REJECTION_REASON = (
     "unsupported_protocol_version: "
     "当前服务器仅支持 Protobuf 协议（0.6.1 及以上）。"
@@ -42,6 +42,8 @@ state = ServerState()
 broadcaster = Broadcaster(state)
 broadcast_task: asyncio.Task | None = None
 admin_store = None
+tab_history_store = None
+tab_history_subscriptions: dict[tuple[str, str], dict] = {}
 admin_payload_service = None
 admin_traffic_service: TrafficStatsService | None = None
 admin_retention_task: asyncio.Task | None = None

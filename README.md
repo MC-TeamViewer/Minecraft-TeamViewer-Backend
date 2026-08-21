@@ -89,6 +89,7 @@ uv run src/main.py
 - digest 间隔和广播频率
 - 广播拥塞降级阈值
 - 同服过滤（Tab 列表归并）相关行为
+- Tab 历史最新标签的保留期、delta 保留期与单消息 chunk 上限
 
 如果你要调整“多久清理离线对象”“广播频率多高”“同服过滤是否默认启用”，优先看这个文件。
 
@@ -164,10 +165,10 @@ docker compose up -d --build
 docker compose up -d --build
 ```
 
-当前发布版本为 `v0.5.12-proto0.6.5`。构建带版本号的本地镜像：
+当前发布版本为 `v0.5.13-proto0.7.0`。构建带版本号的本地镜像：
 
 ```bash
-docker build -t professornuo/team-view-relay:v0.5.12-proto0.6.5 .
+docker build -t professornuo/team-view-relay:v0.5.13-proto0.7.0 .
 ```
 
 默认暴露：
@@ -253,7 +254,7 @@ Vite 开发服务器会把 `/admin/api/*`、`/admin/api/events` 和 `/admin` 代
 
 当前协议常量位于 `src/server/app/runtime.py`：
 
-- `NETWORK_PROTOCOL_VERSION = 0.6.5`
+- `NETWORK_PROTOCOL_VERSION = 0.7.0`
 - `SERVER_MIN_COMPATIBLE_PROTOCOL_VERSION = 0.6.1`
 
 共享 ProtoBuf 协议源位于：
@@ -274,7 +275,7 @@ Python 协议产物通过下面脚本生成：
 
 ```bash
 git -C third_party/TeamViewRelay-Protocol fetch --tags
-git -C third_party/TeamViewRelay-Protocol checkout proto/v0.6.5
+git -C third_party/TeamViewRelay-Protocol checkout proto/v0.7.0
 git add third_party/TeamViewRelay-Protocol
 ./scripts/generate_proto_python.sh
 uv run pytest -q
