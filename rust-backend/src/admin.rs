@@ -2,8 +2,8 @@ use std::{collections::HashMap, convert::Infallible, env, net::IpAddr};
 
 use axum::{
     Json,
-    extract::{ConnectInfo, Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    extract::{ConnectInfo, Path, Query, RawQuery, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response, Sse, sse::Event},
 };
 use chrono::{Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, Timelike};
@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite};
+use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{transport::TransportConnectInfo, web::AppState};
@@ -148,19 +149,82 @@ pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Resp
     }
 }
 
-pub async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
+#[derive(Clone, Default)]
+struct EventFilters {
+    daily: DailyMetricsQuery,
+    hourly: HourlyMetricsQuery,
+    traffic: TrafficHistoryQuery,
+    audit: AuditQuery,
+}
+
+impl EventFilters {
+    fn from_raw_query(raw_query: Option<&str>) -> Result<Self, &'static str> {
+        let mut filters = Self::default();
+        for (key, value) in query_pairs(raw_query) {
+            match key.as_str() {
+                "auditLimit" => {
+                    filters.audit.limit = Some(parse_u32(&value, "invalid_audit_limit")?)
+                }
+                "auditEventType" => filters.audit.event_type = nonempty(value),
+                "auditActorType" => filters.audit.actor_type = nonempty(value),
+                "auditActorTypes" => filters.audit.actor_types.push(value),
+                "auditSuccess" => {
+                    filters.audit.success = Some(parse_bool(&value, "invalid_audit_success")?)
+                }
+                "dailyDays" => filters.daily.days = Some(parse_u32(&value, "invalid_daily_days")?),
+                "dailyStartDate" => filters.daily.start_date = nonempty(value),
+                "dailyRoomCode" => filters.daily.room_code = nonempty(value),
+                "hourlyHours" => {
+                    filters.hourly.hours = Some(parse_u32(&value, "invalid_hourly_hours")?)
+                }
+                "hourlyStartAt" => filters.hourly.start_at = nonempty(value),
+                "hourlyRoomCode" => filters.hourly.room_code = nonempty(value),
+                "trafficRange" => filters.traffic.range = nonempty(value),
+                "trafficGranularity" => filters.traffic.granularity = nonempty(value),
+                "trafficStartAt" => filters.traffic.start_at = nonempty(value),
+                _ => {}
+            }
+        }
+        Ok(filters)
+    }
+}
+
+pub async fn events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
     if authenticate(&state, &headers).await.is_none() {
         return unauthorized();
     }
+    let filters = match EventFilters::from_raw_query(raw_query.as_deref()) {
+        Ok(filters) => filters,
+        Err(detail) => return invalid_parameter(detail),
+    };
     let snapshot = state
         .relay
         .snapshot(None)
         .await
         .unwrap_or_else(|_| json!({}));
     let overview = overview_value(&snapshot);
-    let daily_metrics = default_daily_metrics(&state.db).await;
-    let hourly_metrics = default_hourly_metrics(&state.db).await;
-    let traffic_history = default_traffic_history(&state.db).await;
+    let (daily_metrics, hourly_metrics, traffic_history, audit) = tokio::join!(
+        daily_metrics_value(&state.db, &filters.daily),
+        hourly_metrics_value(&state.db, &filters.hourly),
+        traffic_history_value(&state.db, &filters.traffic),
+        audit_value(&state.db, &filters.audit),
+    );
+    let daily_metrics = match daily_metrics {
+        Ok(value) => value,
+        Err(detail) => return invalid_parameter(detail),
+    };
+    let hourly_metrics = match hourly_metrics {
+        Ok(value) => value,
+        Err(detail) => return invalid_parameter(detail),
+    };
+    let traffic_history = match traffic_history {
+        Ok(value) => value,
+        Err(detail) => return invalid_parameter(detail),
+    };
     let bootstrap = json!({
         "serverTime": unix_seconds(),
         "overview": overview,
@@ -169,61 +233,72 @@ pub async fn events(State(state): State<AppState>, headers: HeaderMap) -> Respon
         "liveTraffic": state.metrics.live_traffic_json(),
         "protobufTraffic": state.metrics.protobuf_json(),
         "trafficHistory": traffic_history,
-        "audit": {"items": [], "playerIdentityMappings": [], "nextBeforeId": null, "limit": 100, "availableEventTypes": []},
+        "audit": audit,
     });
     let bootstrap_event = Event::default()
         .event("bootstrap")
         .json_data(bootstrap)
         .expect("JSON event");
-    let updates = stream::unfold((state, 0_usize), |(state, index)| async move {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let event_names = [
-            "overview",
-            "daily_metrics",
-            "hourly_metrics",
-            "traffic_live",
-            "protobuf_traffic",
-            "traffic_history",
-            "audit",
-            "last_seen_history",
-            "tab_history",
-            "runtime_state",
-            "heartbeat",
-        ];
-        let event_name = event_names[index % event_names.len()];
-        let payload = match event_name {
-            "overview" => {
-                let snapshot = state
-                    .relay
-                    .snapshot(None)
+    let updates = stream::unfold(
+        (state, filters, 0_usize),
+        |(state, filters, index)| async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let event_names = [
+                "overview",
+                "daily_metrics",
+                "hourly_metrics",
+                "traffic_live",
+                "protobuf_traffic",
+                "traffic_history",
+                "audit",
+                "last_seen_history",
+                "tab_history",
+                "runtime_state",
+                "heartbeat",
+            ];
+            let event_name = event_names[index % event_names.len()];
+            let payload = match event_name {
+                "overview" => {
+                    let snapshot = state
+                        .relay
+                        .snapshot(None)
+                        .await
+                        .unwrap_or_else(|_| json!({}));
+                    let mut payload = overview_value(&snapshot);
+                    payload["serverTime"] = json!(unix_seconds());
+                    payload
+                }
+                "daily_metrics" => daily_metrics_value(&state.db, &filters.daily)
                     .await
-                    .unwrap_or_else(|_| json!({}));
-                let mut payload = overview_value(&snapshot);
-                payload["serverTime"] = json!(unix_seconds());
-                payload
-            }
-            "daily_metrics" => default_daily_metrics(&state.db).await,
-            "hourly_metrics" => default_hourly_metrics(&state.db).await,
-            "traffic_live" => state.metrics.live_traffic_json(),
-            "protobuf_traffic" => state.metrics.protobuf_json(),
-            "traffic_history" => default_traffic_history(&state.db).await,
-            "audit" => json!({
-                "serverTime":unix_seconds(),"items":[],"playerIdentityMappings":[],
-                "nextBeforeId":null,"limit":100,"availableEventTypes":[],
-            }),
-            _ => json!({"serverTime":unix_seconds()}),
-        };
-        let event = Event::default()
-            .event(event_name)
-            .json_data(payload)
-            .expect("JSON event");
-        Some((Ok::<_, Infallible>(event), (state, index + 1)))
-    });
-    Sse::new(stream::once(async move { Ok::<_, Infallible>(bootstrap_event) }).chain(updates))
-        .into_response()
+                    .unwrap_or_else(|detail| json!({"detail":detail,"serverTime":unix_seconds()})),
+                "hourly_metrics" => hourly_metrics_value(&state.db, &filters.hourly)
+                    .await
+                    .unwrap_or_else(|detail| json!({"detail":detail,"serverTime":unix_seconds()})),
+                "traffic_live" => state.metrics.live_traffic_json(),
+                "protobuf_traffic" => state.metrics.protobuf_json(),
+                "traffic_history" => traffic_history_value(&state.db, &filters.traffic)
+                    .await
+                    .unwrap_or_else(|detail| json!({"detail":detail,"serverTime":unix_seconds()})),
+                "audit" => audit_value(&state.db, &filters.audit).await,
+                _ => json!({"serverTime":unix_seconds()}),
+            };
+            let event = Event::default()
+                .event(event_name)
+                .json_data(payload)
+                .expect("JSON event");
+            Some((Ok::<_, Infallible>(event), (state, filters, index + 1)))
+        },
+    );
+    let mut response =
+        Sse::new(stream::once(async move { Ok::<_, Infallible>(bootstrap_event) }).chain(updates))
+            .into_response();
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct DailyMetricsQuery {
     days: Option<u32>,
     #[serde(rename = "roomCode")]
@@ -240,11 +315,21 @@ pub async fn metrics_daily(
     if authenticate(&state, &headers).await.is_none() {
         return unauthorized();
     }
+    match daily_metrics_value(&state.db, &query).await {
+        Ok(value) => Json(value).into_response(),
+        Err(detail) => invalid_parameter(detail),
+    }
+}
+
+async fn daily_metrics_value(
+    db: &sqlx::SqlitePool,
+    query: &DailyMetricsQuery,
+) -> Result<Value, &'static str> {
     let days = query.days.unwrap_or(30).clamp(1, 400);
-    let start = match query.start_date {
-        Some(value) => match NaiveDate::parse_from_str(&value, "%Y-%m-%d") {
+    let start = match query.start_date.as_deref() {
+        Some(value) => match NaiveDate::parse_from_str(value, "%Y-%m-%d") {
             Ok(value) => value,
-            Err(_) => return invalid_parameter("invalid_start_date"),
+            Err(_) => return Err("invalid_start_date"),
         },
         None => Local::now().date_naive() - ChronoDuration::days(i64::from(days - 1)),
     };
@@ -252,7 +337,7 @@ pub async fn metrics_daily(
         .bind(start.format("%Y-%m-%d").to_string())
         .bind((start + ChronoDuration::days(i64::from(days))).format("%Y-%m-%d").to_string())
         .bind(query.room_code.as_deref()).bind(query.room_code.as_deref())
-        .fetch_all(&state.db).await.unwrap_or_default();
+        .fetch_all(db).await.unwrap_or_default();
     let counts = rows
         .into_iter()
         .map(|row| {
@@ -270,10 +355,12 @@ pub async fn metrics_daily(
             json!({"bucket":bucket,"activePlayers":counts.get(&bucket).copied().unwrap_or(0)})
         })
         .collect::<Vec<_>>();
-    Json(json!({"timezone":timezone_name(),"roomCode":query.room_code,"days":days,"startDate":start.format("%Y-%m-%d").to_string(),"items":items,"serverTime":unix_seconds()})).into_response()
+    Ok(
+        json!({"timezone":timezone_name(),"roomCode":query.room_code,"days":days,"startDate":start.format("%Y-%m-%d").to_string(),"items":items,"serverTime":unix_seconds()}),
+    )
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct HourlyMetricsQuery {
     hours: Option<u32>,
     #[serde(rename = "roomCode")]
@@ -290,11 +377,21 @@ pub async fn metrics_hourly(
     if authenticate(&state, &headers).await.is_none() {
         return unauthorized();
     }
+    match hourly_metrics_value(&state.db, &query).await {
+        Ok(value) => Json(value).into_response(),
+        Err(detail) => invalid_parameter(detail),
+    }
+}
+
+async fn hourly_metrics_value(
+    db: &sqlx::SqlitePool,
+    query: &HourlyMetricsQuery,
+) -> Result<Value, &'static str> {
     let hours = query.hours.unwrap_or(48).clamp(1, 24 * 90);
-    let start = match query.start_at {
-        Some(value) => match parse_local_datetime(&value) {
+    let start = match query.start_at.as_deref() {
+        Some(value) => match parse_local_datetime(value) {
             Some(value) => value,
-            None => return invalid_parameter("invalid_start_at"),
+            None => return Err("invalid_start_at"),
         },
         None => {
             let now = Local::now().naive_local();
@@ -308,7 +405,7 @@ pub async fn metrics_hourly(
     let rows = sqlx::query("SELECT local_hour AS bucket, COUNT(DISTINCT player_id) AS active_players FROM hourly_player_activity WHERE local_hour >= ? AND local_hour < ? AND (? IS NULL OR room_code = ?) GROUP BY local_hour")
         .bind(format_local_hour(start)).bind(format_local_hour(end))
         .bind(query.room_code.as_deref()).bind(query.room_code.as_deref())
-        .fetch_all(&state.db).await.unwrap_or_default();
+        .fetch_all(db).await.unwrap_or_default();
     let counts = rows
         .into_iter()
         .map(|row| {
@@ -324,7 +421,9 @@ pub async fn metrics_hourly(
             json!({"bucket":bucket,"activePlayers":counts.get(&bucket).copied().unwrap_or(0)})
         })
         .collect::<Vec<_>>();
-    Json(json!({"timezone":timezone_name(),"roomCode":query.room_code,"hours":hours,"startAt":format_local_hour(start),"items":items,"serverTime":unix_seconds()})).into_response()
+    Ok(
+        json!({"timezone":timezone_name(),"roomCode":query.room_code,"hours":hours,"startAt":format_local_hour(start),"items":items,"serverTime":unix_seconds()}),
+    )
 }
 
 pub async fn traffic_live(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -337,7 +436,7 @@ pub async fn protobuf_live(State(state): State<AppState>, headers: HeaderMap) ->
     authenticated_json(&state, &headers, value).await
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct TrafficHistoryQuery {
     range: Option<String>,
     granularity: Option<String>,
@@ -355,6 +454,16 @@ pub async fn traffic_history(
     if authenticate(&state, &headers).await.is_none() {
         return unauthorized();
     }
+    match traffic_history_value(&state.db, &query).await {
+        Ok(value) => Json(value).into_response(),
+        Err(detail) => invalid_parameter(detail),
+    }
+}
+
+async fn traffic_history_value(
+    db: &sqlx::SqlitePool,
+    query: &TrafficHistoryQuery,
+) -> Result<Value, &'static str> {
     let range = query.range.as_deref().unwrap_or("48h");
     let range_seconds = match range {
         "1h" => 3_600,
@@ -363,7 +472,7 @@ pub async fn traffic_history(
         "48h" => 172_800,
         "7d" => 604_800,
         "30d" => 2_592_000,
-        _ => return invalid_parameter("invalid_traffic_range"),
+        _ => return Err("invalid_traffic_range"),
     };
     let default_granularity = match range {
         "1h" => "1m",
@@ -383,7 +492,7 @@ pub async fn traffic_history(
         _ => false,
     };
     if !valid {
-        return invalid_parameter("invalid_traffic_granularity");
+        return Err("invalid_traffic_granularity");
     }
     let bucket_seconds = match granularity {
         "1m" => 60,
@@ -394,10 +503,10 @@ pub async fn traffic_history(
         _ => unreachable!(),
     };
     let count = range_seconds / bucket_seconds;
-    let start = match query.start_at {
-        Some(value) => match parse_local_datetime(&value) {
+    let start = match query.start_at.as_deref() {
+        Some(value) => match parse_local_datetime(value) {
             Some(value) => align_datetime(value, bucket_seconds),
-            None => return invalid_parameter("invalid_start_at"),
+            None => return Err("invalid_start_at"),
         },
         None => {
             align_datetime(Local::now().naive_local(), bucket_seconds)
@@ -424,7 +533,7 @@ pub async fn traffic_history(
         )
     };
     let application = traffic_series(
-        &state.db,
+        db,
         application_table,
         bucket_column,
         start,
@@ -432,26 +541,18 @@ pub async fn traffic_history(
         bucket_seconds,
     )
     .await;
-    let wire = traffic_series(
-        &state.db,
-        wire_table,
-        bucket_column,
-        start,
-        count,
-        bucket_seconds,
-    )
-    .await;
+    let wire = traffic_series(db, wire_table, bucket_column, start, count, bucket_seconds).await;
     let selected_layer = query
         .selected_layer
+        .clone()
         .filter(|value| matches!(value.as_str(), "application" | "wire"))
         .unwrap_or_else(|| "application".to_owned());
-    Json(json!({
+    Ok(json!({
         "timezone":timezone_name(),"range":range,"granularity":granularity,
         "bucketSeconds":bucket_seconds,"startAt":format_local_second(start),
         "selectedLayer":selected_layer,"application":application,"wire":wire,
         "serverTime":unix_seconds(),
     }))
-    .into_response()
 }
 
 #[derive(Default, Deserialize)]
@@ -532,7 +633,7 @@ pub async fn traffic_daily(
     .into_response()
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct AuditQuery {
     limit: Option<u32>,
     #[serde(rename = "beforeId")]
@@ -546,26 +647,52 @@ pub struct AuditQuery {
     success: Option<bool>,
 }
 
+impl AuditQuery {
+    fn from_raw_query(raw_query: Option<&str>) -> Result<Self, &'static str> {
+        let mut query = Self::default();
+        for (key, value) in query_pairs(raw_query) {
+            match key.as_str() {
+                "limit" => query.limit = Some(parse_u32(&value, "invalid_audit_limit")?),
+                "beforeId" => query.before_id = Some(parse_i64(&value, "invalid_audit_before_id")?),
+                "eventType" => query.event_type = nonempty(value),
+                "actorType" => query.actor_type = nonempty(value),
+                "actorTypes" => query.actor_types.push(value),
+                "success" => query.success = Some(parse_bool(&value, "invalid_audit_success")?),
+                _ => {}
+            }
+        }
+        Ok(query)
+    }
+}
+
 pub async fn audit(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuditQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Response {
     if authenticate(&state, &headers).await.is_none() {
         return unauthorized();
     }
+    let query = match AuditQuery::from_raw_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(detail) => return invalid_parameter(detail),
+    };
+    Json(audit_value(&state.db, &query).await).into_response()
+}
+
+async fn audit_value(db: &sqlx::SqlitePool, query: &AuditQuery) -> Value {
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let mut actor_types = query
         .actor_types
-        .into_iter()
+        .iter()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     if actor_types.is_empty()
-        && let Some(actor_type) = query.actor_type.map(|value| value.trim().to_owned())
+        && let Some(actor_type) = query.actor_type.as_deref().map(str::trim)
         && !actor_type.is_empty()
     {
-        actor_types.push(actor_type);
+        actor_types.push(actor_type.to_owned());
     }
     actor_types.sort();
     actor_types.dedup();
@@ -585,12 +712,12 @@ pub async fn audit(
         if let Some(before_id) = query.before_id {
             clauses.push("id < ").push_bind_unseparated(before_id);
         }
-        if let Some(event_type) = query.event_type.map(|value| value.trim().to_owned())
+        if let Some(event_type) = query.event_type.as_deref().map(str::trim)
             && !event_type.is_empty()
         {
             clauses
                 .push("event_type = ")
-                .push_bind_unseparated(event_type);
+                .push_bind_unseparated(event_type.to_owned());
         }
         if !actor_types.is_empty() {
             clauses.push("actor_type IN (");
@@ -609,11 +736,7 @@ pub async fn audit(
         }
     }
     builder.push(" ORDER BY id DESC LIMIT ").push_bind(limit);
-    let rows = builder
-        .build()
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    let rows = builder.build().fetch_all(db).await.unwrap_or_default();
     let items: Vec<Value> = rows.into_iter().map(|row| json!({
         "id": row.get::<i64,_>("id"), "occurredAt": row.get::<i64,_>("occurred_at"),
         "eventType": row.get::<String,_>("event_type"), "actorType": row.get::<String,_>("actor_type"),
@@ -626,18 +749,18 @@ pub async fn audit(
         .then(|| items.last().and_then(|item| item["id"].as_i64()))
         .flatten();
     let identities = sqlx::query("SELECT player_id, username, updated_at FROM player_identity_mappings ORDER BY updated_at DESC, player_id ASC")
-        .fetch_all(&state.db).await.unwrap_or_default().into_iter().map(|row| json!({
+        .fetch_all(db).await.unwrap_or_default().into_iter().map(|row| json!({
             "playerId":row.get::<String,_>("player_id"),"username":row.get::<String,_>("username"),"updatedAt":row.get::<i64,_>("updated_at")
         })).collect::<Vec<_>>();
     let available_event_types =
         sqlx::query("SELECT DISTINCT event_type FROM audit_events ORDER BY event_type")
-            .fetch_all(&state.db)
+            .fetch_all(db)
             .await
             .unwrap_or_default()
             .into_iter()
             .map(|row| row.get::<String, _>("event_type"))
             .collect::<Vec<_>>();
-    Json(json!({"items": items, "playerIdentityMappings": identities, "nextBeforeId": next_before_id, "limit": limit, "availableEventTypes": available_event_types})).into_response()
+    json!({"items": items, "playerIdentityMappings": identities, "nextBeforeId": next_before_id, "limit": limit, "availableEventTypes": available_event_types})
 }
 
 pub async fn empty_history(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1129,6 +1252,27 @@ fn invalid_parameter(detail: &str) -> Response {
     )
         .into_response()
 }
+fn query_pairs(raw_query: Option<&str>) -> Vec<(String, String)> {
+    form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes())
+        .into_owned()
+        .collect()
+}
+fn nonempty(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.trim().to_owned())
+}
+fn parse_u32(value: &str, detail: &'static str) -> Result<u32, &'static str> {
+    value.parse().map_err(|_| detail)
+}
+fn parse_i64(value: &str, detail: &'static str) -> Result<i64, &'static str> {
+    value.parse().map_err(|_| detail)
+}
+fn parse_bool(value: &str, detail: &'static str) -> Result<bool, &'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(detail),
+    }
+}
 fn normalize_search(value: &str) -> String {
     value.trim().to_lowercase()
 }
@@ -1297,84 +1441,6 @@ fn overview_value(snapshot: &Value) -> Value {
         "observability":{"sseSubscribers":0,"lastRetentionCleanup":null,"apiErrors":0,"sseErrors":0,"trustProxyHeaders":env_bool("TEAMVIEWER_TRUST_PROXY_HEADERS")}
     })
 }
-async fn default_daily_metrics(db: &sqlx::SqlitePool) -> Value {
-    let days = 30_u32;
-    let start = Local::now().date_naive() - ChronoDuration::days(i64::from(days - 1));
-    let rows = sqlx::query("SELECT local_date AS bucket, COUNT(DISTINCT player_id) AS active_players FROM daily_player_activity WHERE local_date >= ? GROUP BY local_date")
-        .bind(start.format("%Y-%m-%d").to_string())
-        .fetch_all(db).await.unwrap_or_default();
-    let counts = rows
-        .into_iter()
-        .map(|row| {
-            (
-                row.get::<String, _>("bucket"),
-                row.get::<i64, _>("active_players"),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let items = (0..days)
-        .map(|offset| {
-            let bucket = (start + ChronoDuration::days(i64::from(offset)))
-                .format("%Y-%m-%d")
-                .to_string();
-            json!({"bucket":bucket,"activePlayers":counts.get(&bucket).copied().unwrap_or(0)})
-        })
-        .collect::<Vec<_>>();
-    json!({"timezone":timezone_name(),"roomCode":null,"days":days,"startDate":start.format("%Y-%m-%d").to_string(),"items":items,"serverTime":unix_seconds()})
-}
-
-async fn default_hourly_metrics(db: &sqlx::SqlitePool) -> Value {
-    let hours = 48_u32;
-    let now = Local::now().naive_local();
-    let start = now
-        .date()
-        .and_hms_opt(now.hour(), 0, 0)
-        .expect("valid hour")
-        - ChronoDuration::hours(i64::from(hours - 1));
-    let rows = sqlx::query("SELECT local_hour AS bucket, COUNT(DISTINCT player_id) AS active_players FROM hourly_player_activity WHERE local_hour >= ? GROUP BY local_hour")
-        .bind(format_local_hour(start)).fetch_all(db).await.unwrap_or_default();
-    let counts = rows
-        .into_iter()
-        .map(|row| {
-            (
-                row.get::<String, _>("bucket"),
-                row.get::<i64, _>("active_players"),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let items = (0..hours)
-        .map(|offset| {
-            let bucket = format_local_hour(start + ChronoDuration::hours(i64::from(offset)));
-            json!({"bucket":bucket,"activePlayers":counts.get(&bucket).copied().unwrap_or(0)})
-        })
-        .collect::<Vec<_>>();
-    json!({"timezone":timezone_name(),"roomCode":null,"hours":hours,"startAt":format_local_hour(start),"items":items,"serverTime":unix_seconds()})
-}
-
-async fn default_traffic_history(db: &sqlx::SqlitePool) -> Value {
-    let count = 48_u32;
-    let start = align_datetime(Local::now().naive_local(), 3_600)
-        - ChronoDuration::hours(i64::from(count - 1));
-    let application = traffic_series(
-        db,
-        "hourly_traffic_bytes",
-        "local_hour",
-        start,
-        count,
-        3_600,
-    )
-    .await;
-    let wire = traffic_series(
-        db,
-        "hourly_wire_traffic_bytes",
-        "local_hour",
-        start,
-        count,
-        3_600,
-    )
-    .await;
-    json!({"timezone":timezone_name(),"range":"48h","granularity":"1h","bucketSeconds":3600,"startAt":format_local_second(start),"selectedLayer":"application","application":application,"wire":wire,"serverTime":unix_seconds()})
-}
 fn unix_millis() -> i64 {
     (unix_seconds() * 1000.0) as i64
 }
@@ -1383,4 +1449,44 @@ fn unix_seconds() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuditQuery, EventFilters};
+
+    #[test]
+    fn audit_query_collects_repeated_actor_types() {
+        let query = AuditQuery::from_raw_query(Some(
+            "limit=50&actorTypes=player&actorTypes=external_source&actorTypes=web%5Fmap&success=false",
+        ))
+        .expect("valid query");
+
+        assert_eq!(query.limit, Some(50));
+        assert_eq!(query.actor_types, ["player", "external_source", "web_map"]);
+        assert_eq!(query.success, Some(false));
+    }
+
+    #[test]
+    fn event_filters_preserve_each_dashboard_filter() {
+        let filters = EventFilters::from_raw_query(Some(
+            "auditLimit=25&auditActorTypes=player&auditActorTypes=system&dailyDays=14&dailyRoomCode=room%20a&hourlyHours=24&hourlyRoomCode=room%20b&trafficRange=24h&trafficGranularity=15m",
+        ))
+        .expect("valid filters");
+
+        assert_eq!(filters.audit.limit, Some(25));
+        assert_eq!(filters.audit.actor_types, ["player", "system"]);
+        assert_eq!(filters.daily.days, Some(14));
+        assert_eq!(filters.daily.room_code.as_deref(), Some("room a"));
+        assert_eq!(filters.hourly.hours, Some(24));
+        assert_eq!(filters.hourly.room_code.as_deref(), Some("room b"));
+        assert_eq!(filters.traffic.range.as_deref(), Some("24h"));
+        assert_eq!(filters.traffic.granularity.as_deref(), Some("15m"));
+    }
+
+    #[test]
+    fn repeated_query_rejects_invalid_boolean_values() {
+        assert!(AuditQuery::from_raw_query(Some("success=sometimes")).is_err());
+        assert!(EventFilters::from_raw_query(Some("auditSuccess=sometimes")).is_err());
+    }
 }

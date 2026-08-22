@@ -34,7 +34,7 @@ uv run python scripts/load_test_live.py \
   --stages 10,20,40 \
   --history-players 1000 \
   --min-snapshot-kib 200 \
-  --expected-build team-view-relay-rust-v1.0.0-proto0.7.0
+  --expected-build team-view-relay-rust-v1.0.1-proto0.7.0
 ```
 
 Mirror test traffic or route a small explicitly selected cohort to Rust. Use a

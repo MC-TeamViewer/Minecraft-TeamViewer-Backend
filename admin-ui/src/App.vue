@@ -324,7 +324,7 @@ async function activateDashboard() {
   }
   resetDashboard();
   connect();
-  const receivedBootstrap = await waitForBootstrap(1200);
+  const receivedBootstrap = await waitForBootstrap(3000);
   if (!receivedBootstrap) {
     await fallbackBootstrap();
   }

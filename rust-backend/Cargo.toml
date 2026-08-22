@@ -1,6 +1,6 @@
 [package]
 name = "teamviewrelay-rust"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 publish = false
 
@@ -29,6 +29,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.18", features = ["v4"] }
 unicode-normalization = "0.1"
+url = "2.5"
 yawc = { version = "0.3.4", default-features = false, features = ["axum"] }
 
 [build-dependencies]

@@ -174,11 +174,11 @@ docker compose up -d --build
 docker compose up -d --build
 ```
 
-当前 Rust 发布版本为 `v1.0.0-proto0.7.0`。构建带版本号的本地镜像：
+当前 Rust 发布版本为 `v1.0.1-proto0.7.0`。构建带版本号的本地镜像：
 
 ```bash
 docker build -f Dockerfile.rust \
-  -t ghcr.io/mc-teamviewer/minecraft-teamviewer-backend-rust:v1.0.0-proto0.7.0 .
+  -t ghcr.io/mc-teamviewer/minecraft-teamviewer-backend-rust:v1.0.1-proto0.7.0 .
 ```
 
 默认暴露：
@@ -239,7 +239,7 @@ uv run python scripts/load_test_live.py \
   --stages 10,20,40 \
   --history-players 1000 \
   --min-snapshot-kib 200 \
-  --expected-build team-view-relay-rust-v1.0.0-proto0.7.0
+  --expected-build team-view-relay-rust-v1.0.1-proto0.7.0
 ```
 
 远程目标必须提供 `--expected-build`。只有明确无法提供构建标识时，才用

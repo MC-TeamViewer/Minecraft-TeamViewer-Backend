@@ -4,8 +4,8 @@
 
 - Python hotfix 归档分支：`python-hotfix-v0.5.14`
 - Python 镜像：`professornuo/team-view-relay:v0.5.14-proto0.7.0.hotfix`
-- Rust 版本：`v1.0.0-proto0.7.0`
-- Rust 镜像：`ghcr.io/mc-teamviewer/minecraft-teamviewer-backend-rust:v1.0.0-proto0.7.0`
+- Rust 版本：`v1.0.1-proto0.7.0`
+- Rust 镜像：`ghcr.io/mc-teamviewer/minecraft-teamviewer-backend-rust:v1.0.1-proto0.7.0`
 
 Rust 使用 `Dockerfile.rust` 构建，并由 main 分支的 GitHub Actions 发布到独立
 镜像仓库，不会覆盖 Python 镜像。
@@ -46,7 +46,7 @@ docker compose logs --tail=100 backend
 ```
 
 健康检查中的 `buildVersion` 应为
-`team-view-relay-rust-v1.0.0-proto0.7.0`。
+`team-view-relay-rust-v1.0.1-proto0.7.0`。
 
 如果 GHCR 镜像为私有包，先执行：
 

@@ -1,6 +1,6 @@
 services:
   backend-rust:
-    image: ${TEAMVIEWER_RUST_IMAGE:-ghcr.io/mc-teamviewer/minecraft-teamviewer-backend-rust:v1.0.0-proto0.7.0}
+    image: ${TEAMVIEWER_RUST_IMAGE:-ghcr.io/mc-teamviewer/minecraft-teamviewer-backend-rust:v1.0.1-proto0.7.0}
     build:
       context: .
       dockerfile: Dockerfile.rust
