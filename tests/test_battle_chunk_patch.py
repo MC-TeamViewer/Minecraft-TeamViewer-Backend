@@ -201,3 +201,27 @@ def test_build_battle_chunk_sync_data_defaults_legacy_mode_to_nodemc() -> None:
     )
 
     assert normalized["mode"] == "nodemc"
+
+
+def test_select_battle_chunk_meta_accepts_client_visible_id() -> None:
+    state = ServerState()
+    state.connections["player-1"] = object()
+    state.connection_rooms["player-1"] = "room-a"
+    internal_id = "room-a|minecraft:overworld|12|34"
+    data = build_battle_chunk_data(
+        observedAt=123456,
+        reporterId="player-1",
+        roomCode="room-a",
+    )
+    state.battle_chunk_meta[internal_id] = {
+        "timestamp": 1.0,
+        "submitPlayerId": "player-1",
+        "data": data,
+    }
+
+    selected = state.select_battle_chunk_meta_snapshot(
+        "room-a",
+        ["minecraft:overworld|12|34"],
+    )
+
+    assert selected == {"minecraft:overworld|12|34": data}

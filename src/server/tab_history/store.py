@@ -251,72 +251,85 @@ class TabHistoryStore:
             return False
 
         async with self._lock:
-            db = self._require_db()
-            current_head = self._head_row(room_code)
-            next_revision = int(current_head["revision"] if current_head is not None else 0) + 1
-            changed: list[dict[str, Any]] = []
-            for player_uuid, player in normalized.items():
-                row = db.execute(
-                    "SELECT * FROM tab_history_entries WHERE room_code = ? AND player_uuid = ?",
-                    (room_code, player_uuid),
-                ).fetchone()
-                if row is not None:
-                    persisted_player = json.loads(row["player_json"])
-                    if self._display_label_quality(player) < self._display_label_quality(persisted_player):
-                        continue
-                signature = self._label_signature(player)
-                label_changed = row is None or str(row["label_signature"]) != signature
-                if row is not None and not label_changed:
-                    minimum_interval_ms = max(0, self.config.observation_update_interval_sec) * 1000
-                    if stamp - int(row["last_observed_at"]) < minimum_interval_ms:
-                        continue
-                first_at = stamp if label_changed else int(row["label_first_observed_at"])
-                etag = self._entry_etag(player, first_at, stamp)
-                entry = {
-                    "player": player,
-                    "labelFirstObservedAtUtcMs": first_at,
-                    "lastObservedAtUtcMs": stamp,
-                    "revision": next_revision,
-                    "etagSha256": etag,
-                }
-                changed.append(entry)
-                db.execute(
-                    """
-                    INSERT INTO tab_history_entries (
-                        room_code, player_uuid, normalized_name, player_json, label_signature,
-                        label_first_observed_at, last_observed_at, revision, etag_sha256
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(room_code, player_uuid) DO UPDATE SET
-                        normalized_name = excluded.normalized_name,
-                        player_json = excluded.player_json,
-                        label_signature = excluded.label_signature,
-                        label_first_observed_at = excluded.label_first_observed_at,
-                        last_observed_at = excluded.last_observed_at,
-                        revision = excluded.revision,
-                        etag_sha256 = excluded.etag_sha256
-                    """,
-                    (
-                        room_code,
-                        player_uuid,
-                        self.normalize_name(player.get("name")) or None,
-                        self._canonical_json(player),
-                        signature,
-                        first_at,
-                        stamp,
-                        next_revision,
-                        etag,
-                    ),
-                )
-                db.execute(
-                    "INSERT OR REPLACE INTO tab_history_deltas VALUES (?, ?, ?, 'upsert', ?, ?)",
-                    (room_code, next_revision, player_uuid, self._entry_json(entry), stamp),
-                )
+            return await asyncio.to_thread(
+                self._upsert_players_sync,
+                room_code,
+                normalized,
+                stamp,
+            )
 
-            if not changed:
-                return False
-            self._write_head(room_code, next_revision, stamp)
-            db.commit()
-            return True
+    def _upsert_players_sync(
+        self,
+        room_code: str,
+        normalized: dict[str, dict[str, Any]],
+        stamp: int,
+    ) -> bool:
+        db = self._require_db()
+        current_head = self._head_row(room_code)
+        next_revision = int(current_head["revision"] if current_head is not None else 0) + 1
+        changed: list[dict[str, Any]] = []
+        for player_uuid, player in normalized.items():
+            row = db.execute(
+                "SELECT * FROM tab_history_entries WHERE room_code = ? AND player_uuid = ?",
+                (room_code, player_uuid),
+            ).fetchone()
+            if row is not None:
+                persisted_player = json.loads(row["player_json"])
+                if self._display_label_quality(player) < self._display_label_quality(persisted_player):
+                    continue
+            signature = self._label_signature(player)
+            label_changed = row is None or str(row["label_signature"]) != signature
+            if row is not None and not label_changed:
+                minimum_interval_ms = max(0, self.config.observation_update_interval_sec) * 1000
+                if stamp - int(row["last_observed_at"]) < minimum_interval_ms:
+                    continue
+            first_at = stamp if label_changed else int(row["label_first_observed_at"])
+            etag = self._entry_etag(player, first_at, stamp)
+            entry = {
+                "player": player,
+                "labelFirstObservedAtUtcMs": first_at,
+                "lastObservedAtUtcMs": stamp,
+                "revision": next_revision,
+                "etagSha256": etag,
+            }
+            changed.append(entry)
+            db.execute(
+                """
+                INSERT INTO tab_history_entries (
+                    room_code, player_uuid, normalized_name, player_json, label_signature,
+                    label_first_observed_at, last_observed_at, revision, etag_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(room_code, player_uuid) DO UPDATE SET
+                    normalized_name = excluded.normalized_name,
+                    player_json = excluded.player_json,
+                    label_signature = excluded.label_signature,
+                    label_first_observed_at = excluded.label_first_observed_at,
+                    last_observed_at = excluded.last_observed_at,
+                    revision = excluded.revision,
+                    etag_sha256 = excluded.etag_sha256
+                """,
+                (
+                    room_code,
+                    player_uuid,
+                    self.normalize_name(player.get("name")) or None,
+                    self._canonical_json(player),
+                    signature,
+                    first_at,
+                    stamp,
+                    next_revision,
+                    etag,
+                ),
+            )
+            db.execute(
+                "INSERT OR REPLACE INTO tab_history_deltas VALUES (?, ?, ?, 'upsert', ?, ?)",
+                (room_code, next_revision, player_uuid, self._entry_json(entry), stamp),
+            )
+
+        if not changed:
+            return False
+        self._write_head(room_code, next_revision, stamp)
+        db.commit()
+        return True
 
     async def cleanup_retention(self, *, now_ms: int | None = None) -> dict[str, int]:
         stamp = int(now_ms if now_ms is not None else time.time() * 1000)
@@ -470,8 +483,10 @@ class TabHistoryStore:
 
     async def head(self, room_code: str) -> dict[str, Any]:
         async with self._lock:
-            row = self._head_row(room_code)
-            return self._serialize_head(room_code, row)
+            return await asyncio.to_thread(self._head_sync, room_code)
+
+    def _head_sync(self, room_code: str) -> dict[str, Any]:
+        return self._serialize_head(room_code, self._head_row(room_code))
 
     async def sync(
         self,
@@ -483,50 +498,77 @@ class TabHistoryStore:
         allow_full_fallback: bool,
     ) -> dict[str, Any]:
         async with self._lock:
-            db = self._require_db()
-            head_row = self._head_row(room_code)
-            head = self._serialize_head(room_code, head_row)
-            mode = "TAB_HISTORY_SYNC_MODE_DELTA" if preferred_mode.endswith("DELTA") else "TAB_HISTORY_SYNC_MODE_FULL"
-            reset_reason: str | None = None
+            return await asyncio.to_thread(
+                self._sync_sync,
+                room_code,
+                preferred_mode,
+                base_revision,
+                base_digest,
+                allow_full_fallback,
+            )
 
-            if mode == "TAB_HISTORY_SYNC_MODE_DELTA":
-                revision_row = None
-                if base_revision is not None:
-                    revision_row = db.execute(
-                        "SELECT digest_sha256 FROM tab_history_revisions WHERE room_code = ? AND revision = ?",
-                        (room_code, int(base_revision)),
-                    ).fetchone()
-                    if int(base_revision) == 0 and revision_row is None:
-                        revision_row = {"digest_sha256": hashlib.sha256(b"").digest()}
-                if base_revision is None or revision_row is None:
-                    reset_reason = "TAB_HISTORY_RESET_REASON_BASE_UNKNOWN"
-                elif base_digest is not None and bytes(revision_row["digest_sha256"]) != bytes(base_digest):
-                    reset_reason = "TAB_HISTORY_RESET_REASON_DIGEST_MISMATCH"
-                elif int(base_revision) < int(head["oldestAvailableDeltaRevision"]):
-                    reset_reason = "TAB_HISTORY_RESET_REASON_DELTA_EXPIRED"
+    def _sync_sync(
+        self,
+        room_code: str,
+        preferred_mode: str,
+        base_revision: int | None,
+        base_digest: bytes | None,
+        allow_full_fallback: bool,
+    ) -> dict[str, Any]:
+        db = self._require_db()
+        head_row = self._head_row(room_code)
+        head = self._serialize_head(room_code, head_row)
+        mode = "TAB_HISTORY_SYNC_MODE_DELTA" if preferred_mode.endswith("DELTA") else "TAB_HISTORY_SYNC_MODE_FULL"
+        reset_reason: str | None = None
 
-                if reset_reason is not None and allow_full_fallback:
-                    mode = "TAB_HISTORY_SYNC_MODE_FULL"
-                    reset_reason = None
+        if mode == "TAB_HISTORY_SYNC_MODE_DELTA":
+            revision_row = None
+            if base_revision is not None:
+                revision_row = db.execute(
+                    "SELECT digest_sha256 FROM tab_history_revisions WHERE room_code = ? AND revision = ?",
+                    (room_code, int(base_revision)),
+                ).fetchone()
+                if int(base_revision) == 0 and revision_row is None:
+                    revision_row = {"digest_sha256": hashlib.sha256(b"").digest()}
+            if base_revision is None or revision_row is None:
+                reset_reason = "TAB_HISTORY_RESET_REASON_BASE_UNKNOWN"
+            elif base_digest is not None and bytes(revision_row["digest_sha256"]) != bytes(base_digest):
+                reset_reason = "TAB_HISTORY_RESET_REASON_DIGEST_MISMATCH"
+            elif int(base_revision) < int(head["oldestAvailableDeltaRevision"]):
+                reset_reason = "TAB_HISTORY_RESET_REASON_DELTA_EXPIRED"
 
-            if mode == "TAB_HISTORY_SYNC_MODE_FULL":
-                rows = db.execute(
-                    "SELECT * FROM tab_history_entries WHERE room_code = ? ORDER BY player_uuid", (room_code,)
-                ).fetchall()
-                upsert = [self._entry_from_row(row) for row in rows]
-                deletes: list[str] = []
-            elif reset_reason is None:
-                rows = db.execute(
-                    "SELECT * FROM tab_history_deltas WHERE room_code = ? AND revision > ? ORDER BY revision, player_uuid",
-                    (room_code, int(base_revision or 0)),
-                ).fetchall()
-                latest: dict[str, sqlite3.Row] = {str(row["player_uuid"]): row for row in rows}
-                upsert = [self._entry_from_json(row["entry_json"]) for row in latest.values() if row["operation"] == "upsert"]
-                deletes = [player_uuid for player_uuid, row in latest.items() if row["operation"] == "delete"]
-            else:
-                upsert = []
-                deletes = []
-            return {"mode": mode, "head": head, "upsert": upsert, "deleteUuids": deletes, "resetReason": reset_reason}
+            if reset_reason is not None and allow_full_fallback:
+                mode = "TAB_HISTORY_SYNC_MODE_FULL"
+                reset_reason = None
+
+        if mode == "TAB_HISTORY_SYNC_MODE_FULL":
+            rows = db.execute(
+                "SELECT * FROM tab_history_entries WHERE room_code = ? ORDER BY player_uuid", (room_code,)
+            ).fetchall()
+            upsert = [self._entry_from_row(row) for row in rows]
+            deletes: list[str] = []
+        elif reset_reason is None:
+            rows = db.execute(
+                "SELECT * FROM tab_history_deltas WHERE room_code = ? AND revision > ? ORDER BY revision, player_uuid",
+                (room_code, int(base_revision or 0)),
+            ).fetchall()
+            latest: dict[str, sqlite3.Row] = {str(row["player_uuid"]): row for row in rows}
+            upsert = [
+                self._entry_from_json(row["entry_json"])
+                for row in latest.values()
+                if row["operation"] == "upsert"
+            ]
+            deletes = [player_uuid for player_uuid, row in latest.items() if row["operation"] == "delete"]
+        else:
+            upsert = []
+            deletes = []
+        return {
+            "mode": mode,
+            "head": head,
+            "upsert": upsert,
+            "deleteUuids": deletes,
+            "resetReason": reset_reason,
+        }
 
     async def lookup(self, room_code: str, selectors: list[dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         async with self._lock:

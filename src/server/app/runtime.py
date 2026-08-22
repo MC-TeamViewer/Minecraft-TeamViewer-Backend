@@ -50,10 +50,15 @@ admin_traffic_service: TrafficStatsService | None = None
 admin_protobuf_stats_service: ProtobufStatsService | None = None
 admin_retention_task: asyncio.Task | None = None
 admin_traffic_flush_task: asyncio.Task | None = None
+event_loop_monitor_task: asyncio.Task | None = None
 admin_sse_hub = AdminSseHub()
 web_map_connection_meta: dict[str, dict] = {}
 admin_runtime_stats = {
     "lastRetentionCleanup": None,
     "apiErrors": 0,
     "sseErrors": 0,
+    "broadcastLastMs": 0.0,
+    "broadcastP95Ms": 0.0,
+    "eventLoopLagP95Ms": 0.0,
+    "broadcastOverruns": 0,
 }

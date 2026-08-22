@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -20,10 +21,25 @@ from ..admin.protobuf_stats import ProtobufStatsService
 from ..admin.store import AdminStore
 from ..admin.traffic import TrafficStatsService
 from ..tab_history import TabHistoryStore, TabHistoryStoreConfig
+from ..ws.sender import websocket_send_hub
+
+
+_broadcast_duration_samples: deque[float] = deque(maxlen=240)
+_event_loop_lag_samples: deque[float] = deque(maxlen=600)
+
+
+def _p95_ms(samples: deque[float]) -> float:
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    index = min(len(ordered) - 1, max(0, int(len(ordered) * 0.95) - 1))
+    return ordered[index] * 1000.0
 
 
 async def run_broadcast_scheduler() -> None:
     previous_hz: float | None = None
+    overrun_streak = 0
+    healthy_streak = 0
     while True:
         tick_start = time.monotonic()
         try:
@@ -52,17 +68,59 @@ async def run_broadcast_scheduler() -> None:
 
         interval_sec = 1.0 / max(runtime.state.MIN_BROADCAST_HZ, runtime.state.broadcast_hz)
         elapsed = time.monotonic() - tick_start
+        _broadcast_duration_samples.append(elapsed)
+        runtime.admin_runtime_stats["broadcastLastMs"] = elapsed * 1000.0
+        runtime.admin_runtime_stats["broadcastP95Ms"] = _p95_ms(_broadcast_duration_samples)
+
+        if elapsed > interval_sec:
+            runtime.admin_runtime_stats["broadcastOverruns"] += 1
+            overrun_streak += 1
+            healthy_streak = 0
+            if overrun_streak >= 3:
+                current_cap = runtime.state.performance_broadcast_hz_cap or runtime.state.broadcast_hz
+                runtime.state.performance_broadcast_hz_cap = max(
+                    runtime.state.MIN_BROADCAST_HZ,
+                    min(current_cap, runtime.state.broadcast_hz) * 0.75,
+                )
+                overrun_streak = 0
+        else:
+            overrun_streak = 0
+            if elapsed <= interval_sec * 0.6:
+                healthy_streak += 1
+            else:
+                healthy_streak = 0
+            if healthy_streak >= 40 and runtime.state.performance_broadcast_hz_cap is not None:
+                next_cap = min(
+                    runtime.state.DEFAULT_BROADCAST_HZ,
+                    runtime.state.performance_broadcast_hz_cap * 1.25,
+                )
+                runtime.state.performance_broadcast_hz_cap = next_cap
+                healthy_streak = 0
         await asyncio.sleep(max(0.0, interval_sec - elapsed))
+
+
+async def run_event_loop_lag_monitor() -> None:
+    interval_sec = 0.1
+    expected = time.monotonic() + interval_sec
+    while True:
+        await asyncio.sleep(interval_sec)
+        now = time.monotonic()
+        _event_loop_lag_samples.append(max(0.0, now - expected))
+        runtime.admin_runtime_stats["eventLoopLagP95Ms"] = _p95_ms(_event_loop_lag_samples)
+        expected = now + interval_sec
 
 
 async def run_admin_retention_scheduler() -> None:
     while True:
+        # Startup already performs one cleanup.  Waiting first avoids a duplicate
+        # pass racing with requests that begin immediately after readiness.
+        await asyncio.sleep(6 * 60 * 60)
         try:
             if runtime.admin_store is not None:
+                expired_sessions = await expire_admin_sessions()
                 cleanup = await runtime.admin_store.cleanup_retention()
                 if runtime.tab_history_store is not None:
                     cleanup["tabHistory"] = await runtime.tab_history_store.cleanup_retention()
-                expired_sessions = await expire_admin_sessions()
                 cleanup["expiredSessionsEnded"] = expired_sessions
                 runtime.admin_runtime_stats["lastRetentionCleanup"] = json.dumps(cleanup, ensure_ascii=False)
                 runtime.logger.info("Admin retention cleanup completed: %s", cleanup)
@@ -81,7 +139,6 @@ async def run_admin_retention_scheduler() -> None:
                     "message": str(exc),
                 },
             )
-        await asyncio.sleep(6 * 60 * 60)
 
 
 async def run_admin_traffic_flush_scheduler() -> None:
@@ -89,6 +146,8 @@ async def run_admin_traffic_flush_scheduler() -> None:
         try:
             if runtime.admin_traffic_service is not None:
                 await runtime.admin_traffic_service.flush_pending()
+            if runtime.admin_store is not None:
+                await runtime.admin_store.flush_player_activity()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -134,12 +193,17 @@ async def lifespan(_app: FastAPI):
         get_sse_subscriber_count=runtime.admin_sse_hub.subscriber_count,
         get_observability_payload=get_admin_observability_payload,
     )
+    expired_sessions = await expire_admin_sessions()
     cleanup = await runtime.admin_store.cleanup_retention()
     cleanup["tabHistory"] = await runtime.tab_history_store.cleanup_retention()
-    cleanup["expiredSessionsEnded"] = await expire_admin_sessions()
+    cleanup["expiredSessionsEnded"] = expired_sessions
     runtime.admin_runtime_stats["lastRetentionCleanup"] = json.dumps(cleanup, ensure_ascii=False)
     runtime.admin_runtime_stats["apiErrors"] = 0
     runtime.admin_runtime_stats["sseErrors"] = 0
+    runtime.admin_runtime_stats["broadcastLastMs"] = 0.0
+    runtime.admin_runtime_stats["broadcastP95Ms"] = 0.0
+    runtime.admin_runtime_stats["eventLoopLagP95Ms"] = 0.0
+    runtime.admin_runtime_stats["broadcastOverruns"] = 0
     runtime.logger.info(
         "Admin store initialized db=%s timezone=%s cleanup=%s",
         runtime.admin_store.masked_db_path,
@@ -152,10 +216,20 @@ async def lifespan(_app: FastAPI):
         runtime.admin_retention_task = asyncio.create_task(run_admin_retention_scheduler())
     if runtime.admin_traffic_flush_task is None or runtime.admin_traffic_flush_task.done():
         runtime.admin_traffic_flush_task = asyncio.create_task(run_admin_traffic_flush_scheduler())
+    if runtime.event_loop_monitor_task is None or runtime.event_loop_monitor_task.done():
+        runtime.event_loop_monitor_task = asyncio.create_task(run_event_loop_lag_monitor())
     try:
         yield
     finally:
         await runtime.admin_sse_hub.close()
+        await websocket_send_hub.close()
+        if runtime.event_loop_monitor_task is not None:
+            runtime.event_loop_monitor_task.cancel()
+            try:
+                await runtime.event_loop_monitor_task
+            except asyncio.CancelledError:
+                pass
+            runtime.event_loop_monitor_task = None
         if runtime.admin_traffic_flush_task is not None:
             runtime.admin_traffic_flush_task.cancel()
             try:
@@ -180,6 +254,7 @@ async def lifespan(_app: FastAPI):
         if runtime.admin_store is not None:
             if runtime.admin_traffic_service is not None:
                 await runtime.admin_traffic_service.flush_pending()
+            await runtime.admin_store.flush_player_activity()
             await runtime.admin_store.close()
             runtime.admin_store = None
         if runtime.tab_history_store is not None:

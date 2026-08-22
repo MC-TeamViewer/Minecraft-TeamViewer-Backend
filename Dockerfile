@@ -1,5 +1,6 @@
 ARG NODE_IMAGE=node:24-bookworm-slim
 ARG UV_IMAGE=astral/uv:python3.13-bookworm-slim
+ARG BUILD_VERSION=0.5.14-proto0.7.0.hotfix
 
 FROM ${NODE_IMAGE} AS admin-ui-build
 
@@ -14,6 +15,9 @@ RUN pnpm install --frozen-lockfile
 RUN pnpm build
 
 FROM ${UV_IMAGE}
+
+ARG BUILD_VERSION
+ENV TEAMVIEWER_BUILD_VERSION=${BUILD_VERSION}
 
 WORKDIR /app
 

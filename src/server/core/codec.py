@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any, Protocol
 
 from google.protobuf.descriptor import FieldDescriptor
@@ -81,6 +82,29 @@ def _snake_to_camel(name: str) -> str:
     if not parts:
         return name
     return parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
+
+
+@lru_cache(maxsize=None)
+def _descriptor_field_maps(descriptor) -> tuple[
+    dict[str, FieldDescriptor],
+    dict[str, FieldDescriptor],
+    dict[str, FieldDescriptor],
+]:
+    """Build immutable-by-convention lookup tables once per protobuf descriptor.
+
+    A descriptor graph is process-global.  Rebuilding these maps for every object in
+    every packet used to dominate broadcast CPU time under modest fan-out.
+    """
+    fields_by_exact: dict[str, FieldDescriptor] = {}
+    fields_by_normalized: dict[str, FieldDescriptor] = {}
+    fields_by_json: dict[str, FieldDescriptor] = {}
+    for field in descriptor.fields:
+        fields_by_exact[field.name] = field
+        fields_by_exact[field.json_name] = field
+        fields_by_normalized[_normalize_field_key(field.name)] = field
+        fields_by_normalized[_normalize_field_key(field.json_name)] = field
+        fields_by_json[field.json_name] = field
+    return fields_by_exact, fields_by_normalized, fields_by_json
 
 
 def _message_to_value(value: Any) -> Any:
@@ -363,12 +387,7 @@ def _message_to_plain_dict(message: Message) -> dict[str, Any]:
 
     output: dict[str, Any] = {}
     for field, value in message.ListFields():
-        key = field.json_name
-        if field.type == FieldDescriptor.TYPE_ENUM:
-            enum_value = field.enum_type.values_by_number.get(int(value))
-            output[key] = enum_value.name if enum_value is not None else int(value)
-            continue
-
+        key = "playerUUID" if field.json_name == "playerUuid" else field.json_name
         if field.is_repeated:
             if field.message_type is not None and field.message_type.GetOptions().map_entry:
                 mapped: dict[str, Any] = {}
@@ -378,8 +397,22 @@ def _message_to_plain_dict(message: Message) -> dict[str, Any]:
                 output[key] = mapped
             elif field.type == FieldDescriptor.TYPE_MESSAGE:
                 output[key] = [_message_to_plain_dict(item) for item in value]
+            elif field.type == FieldDescriptor.TYPE_ENUM:
+                output[key] = [
+                    (
+                        enum_value.name
+                        if (enum_value := field.enum_type.values_by_number.get(int(item))) is not None
+                        else int(item)
+                    )
+                    for item in value
+                ]
             else:
                 output[key] = list(value)
+            continue
+
+        if field.type == FieldDescriptor.TYPE_ENUM:
+            enum_value = field.enum_type.values_by_number.get(int(value))
+            output[key] = enum_value.name if enum_value is not None else int(value)
             continue
 
         if field.type == FieldDescriptor.TYPE_MESSAGE:
@@ -392,7 +425,7 @@ def _message_to_plain_dict(message: Message) -> dict[str, Any]:
     # hold their wire default. They are still real values (for example z=0),
     # so retain them before validating the decoded packet.
     for field in message.DESCRIPTOR.fields:
-        key = field.json_name
+        key = "playerUUID" if field.json_name == "playerUuid" else field.json_name
         if key in output or field.is_repeated or field.type == FieldDescriptor.TYPE_MESSAGE:
             continue
         if field.has_presence:
@@ -508,14 +541,7 @@ def _remap_message_value(value: Any, field: FieldDescriptor) -> Any:
 
 def _remap_message_dict(data: dict[str, Any], descriptor) -> dict[str, Any]:
     remapped: dict[str, Any] = {}
-    fields_by_exact: dict[str, FieldDescriptor] = {}
-    fields_by_normalized: dict[str, FieldDescriptor] = {}
-
-    for field in descriptor.fields:
-        fields_by_exact[field.name] = field
-        fields_by_exact[field.json_name] = field
-        fields_by_normalized[_normalize_field_key(field.name)] = field
-        fields_by_normalized[_normalize_field_key(field.json_name)] = field
+    fields_by_exact, fields_by_normalized, _ = _descriptor_field_maps(descriptor)
 
     for key, value in data.items():
         key_text = str(key)
@@ -627,7 +653,7 @@ def _populate_message_field(message: Message, field: FieldDescriptor, value: Any
 def _populate_message(message: Message, data: dict[str, Any], descriptor=None) -> Message:
     message_descriptor = descriptor or message.DESCRIPTOR
     remapped = _remap_message_dict(data, message_descriptor)
-    fields_by_json = {field.json_name: field for field in message_descriptor.fields}
+    _, _, fields_by_json = _descriptor_field_maps(message_descriptor)
 
     for key, value in remapped.items():
         field = fields_by_json.get(str(key))

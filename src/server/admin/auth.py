@@ -20,6 +20,7 @@ from .store import (
     AdminStore,
     AdminStoreConfig,
 )
+from ..ws.sender import websocket_send_hub
 
 ADMIN_SESSION_COOKIE_NAME = "teamviewer_admin_session"
 
@@ -49,13 +50,19 @@ def get_admin_session_ttl_sec() -> int:
 
 
 def get_admin_observability_payload() -> AdminObservabilityPayload:
-    return {
+    payload = {
         "sseSubscribers": runtime.admin_sse_hub.subscriber_count(),
         "lastRetentionCleanup": runtime.admin_runtime_stats["lastRetentionCleanup"],
         "apiErrors": int(runtime.admin_runtime_stats["apiErrors"]),
         "sseErrors": int(runtime.admin_runtime_stats["sseErrors"]),
         "trustProxyHeaders": parse_bool_env("TEAMVIEWER_TRUST_PROXY_HEADERS", False),
+        "broadcastLastMs": float(runtime.admin_runtime_stats["broadcastLastMs"]),
+        "broadcastP95Ms": float(runtime.admin_runtime_stats["broadcastP95Ms"]),
+        "eventLoopLagP95Ms": float(runtime.admin_runtime_stats["eventLoopLagP95Ms"]),
+        "broadcastOverruns": int(runtime.admin_runtime_stats["broadcastOverruns"]),
     }
+    payload.update(websocket_send_hub.snapshot())
+    return payload
 
 
 def admin_ui_unavailable_response() -> PlainTextResponse:

@@ -15,6 +15,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  RUST_IMAGE_NAME: ${{ github.repository }}-rust
 
 jobs:
   test:
@@ -75,6 +76,18 @@ jobs:
       - name: Run tests
         run: UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Verify Rust backend
+        working-directory: rust-backend
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets
+
   build-and-push:
     needs: test
     runs-on: ubuntu-latest
@@ -128,25 +141,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
+      - name: Extract Rust image metadata
+        id: meta_rust
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.RUST_IMAGE_NAME }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
+            type=semver,pattern=v{{version}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push Docker image
+      - name: Build and push Rust backend image
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: Dockerfile.rust
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ steps.meta_rust.outputs.tags }}
+          labels: ${{ steps.meta_rust.outputs.labels }}
+          cache-from: type=gha,scope=rust
+          cache-to: type=gha,mode=max,scope=rust

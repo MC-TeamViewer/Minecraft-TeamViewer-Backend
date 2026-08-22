@@ -1,6 +1,10 @@
 # TeamViewRelay Backend
 
-TeamViewRelay 的后端聚合服务，基于 FastAPI + WebSocket。它负责接收 Minecraft 客户端上报的数据，按房间号（`roomCode`）聚合并广播给游戏内客户端和网页地图端。
+TeamViewRelay 的 Rust 后端聚合服务。它负责接收 Minecraft 客户端上报的数据，按房间号（`roomCode`）聚合并广播给游戏内客户端和网页地图端。
+
+main 分支从 `v1.0.0-proto0.7.0` 起使用 Rust。上一代 Python hotfix
+保存在 `python-hotfix-v0.5.14` 分支，迁移和回滚方法见
+[`docs/python-to-rust-compose-migration.md`](docs/python-to-rust-compose-migration.md)。
 
 相关组件：
 
@@ -26,26 +30,25 @@ TeamViewRelay 的后端聚合服务，基于 FastAPI + WebSocket。它负责接�
 
 ## 快速开始
 
-1. 安装 Python `3.12+`。
-2. 在仓库根目录执行 `uv sync` 安装依赖。
-3. 在 `admin-ui/` 目录执行 `pnpm install && pnpm build` 构建后台管理页静态资源。
-4. 运行 `uv run src/main.py` 启动服务。
-5. 让 Mod 连接 `ws://127.0.0.1:8765/mc-client`。
-6. 让网页地图脚本连接 `ws://127.0.0.1:8765/web-map/ws`。
+1. 设置 `TEAMVIEWER_ADMIN_USERNAME` 和 `TEAMVIEWER_ADMIN_PASSWORD`。
+2. 执行 `docker compose up -d`。
+3. 检查 `http://127.0.0.1:8765/health` 的版本号。
+4. 让 Mod 连接 `ws://127.0.0.1:8765/mc-client`。
+5. 让网页地图脚本连接 `ws://127.0.0.1:8765/web-map/ws`。
 
 ## 安装 / 运行
 
 环境要求：
 
-- Python `>=3.12`
-- 推荐使用 `uv`
+- Rust `1.94+`（仅源码构建时需要）
+- Node.js `24+` 与 pnpm（仅重新构建管理页时需要）
+- 或直接使用 Docker / Docker Compose
 
 启动命令：
 
 ```bash
-uv sync
-cd admin-ui && pnpm install && pnpm build && cd ..
-uv run src/main.py
+cd admin-ui && corepack enable && pnpm install --frozen-lockfile && pnpm build && cd ..
+cargo run --release --manifest-path rust-backend/Cargo.toml
 ```
 
 默认监听地址：
@@ -85,7 +88,7 @@ uv run src/main.py
 
 运行时配置文件：
 
-- `src/server/server_state_config.toml`
+- `src/server/state/server_state_config.toml`
 
 这个文件主要控制：
 
@@ -171,10 +174,11 @@ docker compose up -d --build
 docker compose up -d --build
 ```
 
-当前发布版本为 `v0.5.14-proto0.7.0`。构建带版本号的本地镜像：
+当前 Rust 发布版本为 `v1.0.0-proto0.7.0`。构建带版本号的本地镜像：
 
 ```bash
-docker build -t professornuo/team-view-relay:v0.5.14-proto0.7.0 .
+docker build -f Dockerfile.rust \
+  -t ghcr.io/mc-teamviewer/minecraft-teamviewer-backend-rust:v1.0.0-proto0.7.0 .
 ```
 
 默认暴露：
@@ -193,9 +197,75 @@ docker compose up -d --build
 
 Compose 默认会：
 
-- 把 SQLite 数据库直接映射到宿主机 `./data/teamviewer-admin.db`
+- 把全新的 Rust SQLite 数据库映射到宿主机 `./data-rust/teamviewer-admin.db`
 - 通过 `TZ` 控制报表时区，默认 `Asia/Shanghai`
 - 把容器内数据库路径固定为 `/app/data/teamviewer-admin.db`
+
+### 协议级压力测试
+
+`scripts/load_test_live.py` 只依赖共享 WS 协议，不绑定 Python 或 Rust
+实现。每档用户数都会创建等量的 Mod 上报端和 Web 消费端，并在整个
+测试中只保留一个外部数据源。例如 `--stages 10,20,40` 对应 21、41、
+81 条 WS 连接。
+
+压测开始前会先在专用的 `load-benchmark-v3` 房间写入 1000 条离线位置、
+1000 条在线 Tab 状态和对应的持久化 Tab History。每个 Web 客户端都会执行
+Tab History FULL 同步。脚本会实测原始 protobuf `snapshot_full` 大小，默认
+要求 Web 快照至少达到 200KiB；夹具条数、大小门槛和房间可分别通过
+`--history-players`、`--min-snapshot-kib`、`--room` 调整。脚本拒绝使用
+`default` 房间，固定的压测房间和 UUID 也避免重复运行时无限新增历史行。
+
+压 Python hotfix：
+
+```bash
+uv run python scripts/load_test_live.py \
+  --url https://teamviewer.example.com \
+  --room load-benchmark-v3 \
+  --stages 10,20,40 \
+  --stage-duration 30 \
+  --report-hz 10 \
+  --history-players 1000 \
+  --min-snapshot-kib 200 \
+  --allow-remote \
+  --expected-build 0.5.14-proto0.7.0.hotfix
+```
+
+压 Rust canary 时只需更换目标和期望版本：
+
+```bash
+uv run python scripts/load_test_live.py \
+  --url http://127.0.0.1:8766 \
+  --room load-rust-canary \
+  --stages 10,20,40 \
+  --history-players 1000 \
+  --min-snapshot-kib 200 \
+  --expected-build team-view-relay-rust-v1.0.0-proto0.7.0
+```
+
+远程目标必须提供 `--expected-build`。只有明确无法提供构建标识时，才用
+`--allow-unverified-build` 跳过检查。
+
+每档结果中的 `passed` 是最直接的结论，整个进程也会用退出码 `0/1`
+表示通过或失败。排查连接与心跳问题时重点看：
+
+- `targetConnections`、`activeConnections`、`connectionFailures`：目标连接数、
+  存活连接数以及连接或握手失败数。
+- `disconnectsDuringStage`、`disconnectDetails`：本档内已经建立后又断开的连接；
+  服务端正常 Close 和异常断开都会记录。
+- `heartbeat.sent/received/timedOut`：所有 Mod、Web 和外部源的 WebSocket
+  传输层 Ping/Pong 统计。`timedOut > 0` 表示在 `heartbeat.timeoutSec` 内没
+  收到 Pong，等价于真实客户端可能因心跳超时断开。
+- `pingRttP95Ms`、`pingRttMaxMs`：心跳往返延迟。脚本默认把 p95 超过
+  2000ms 判为失败。
+- `reportHz`、`achievedReportHz`：期望与实际产生的上报频率；两者差距明显
+  时说明压测端或目标端已经产生反压。默认低于目标的 95% 就判为失败，
+  可通过 `--min-rate-ratio` 调整。
+- `fixture.webSnapshotFullKiB`、`historyFixture`：预热夹具实际生成的快照大小，
+  以及每个消费者是否收到 1000 条离线位置、Tab 状态与 Tab History。
+- `consistency.converged`：停止上报后，所有消费者是否在限制时间内收到一致
+  的最终状态。
+
+可通过 `--heartbeat-timeout` 对齐真实 Mod 的心跳超时配置，默认是 5 秒。
 
 ### 与其他组件如何协作
 

@@ -23,4 +23,8 @@ data/
 
 # Docker
 Dockerfile.*
+!Dockerfile.rust
 *.dockerfile
+
+# Rust build output
+rust-backend/target/

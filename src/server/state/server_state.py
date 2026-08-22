@@ -136,6 +136,7 @@ class ServerState:
         self.last_seen_player_reports: Dict[str, Dict[str, dict]] = {}
         self.last_seen_source_rooms: Dict[str, str] = {}
         self.last_seen_revision = 0
+        self.delivery_revision = 0
 
         # 连接与能力信息。
         self.connections: Dict[str, WebSocket] = {}
@@ -151,9 +152,11 @@ class ServerState:
 
         # 管理端指挥态：用于玩家敌我/颜色标记。
         self.player_marks: Dict[str, dict] = {}
+        self.player_marks_revision = 0
 
         # Tab 玩家列表来源报告：submit_player_id -> report。
         self.tab_player_reports: Dict[str, dict] = {}
+        self.tab_reports_revision = 0
 
         # 来源粘性：用于减少多来源切换抖动。
         self.player_selected_sources: Dict[str, str] = {}
@@ -164,6 +167,7 @@ class ServerState:
         self.battle_map_reporter_state: Dict[str, dict] = {}
 
         self.broadcast_hz = float(self.DEFAULT_BROADCAST_HZ)
+        self.performance_broadcast_hz_cap: float | None = None
         self._last_timeout_log_ts = 0.0
         self._last_refresh_request_ts: Dict[str, float] = {}
 
@@ -637,6 +641,7 @@ class ServerState:
 
         report = self._build_tab_player_report(submit_player_id, players_by_key, current_time)
         self.tab_player_reports[submit_player_id] = report
+        self.tab_reports_revision += 1
         return report
 
     def patch_tab_player_report(
@@ -676,27 +681,35 @@ class ServerState:
 
         report = self._build_tab_player_report(submit_player_id, players_by_key, current_time)
         self.tab_player_reports[submit_player_id] = report
+        self.tab_reports_revision += 1
         return report
 
     def cleanup_tab_reports(self, current_time: Optional[float] = None) -> None:
         now = time.monotonic() if current_time is None else float(current_time)
+        changed = False
         for source_id in list(self.tab_player_reports.keys()):
             report = self.tab_player_reports.get(source_id)
             if not isinstance(report, dict):
                 del self.tab_player_reports[source_id]
+                changed = True
                 continue
 
             if source_id not in self.connections:
                 del self.tab_player_reports[source_id]
+                changed = True
                 continue
 
             ts = report.get("_livenessTimestamp")
             if not isinstance(ts, (int, float)):
                 del self.tab_player_reports[source_id]
+                changed = True
                 continue
 
             if now - float(ts) > self.TAB_REPORT_TIMEOUT_SEC:
                 del self.tab_player_reports[source_id]
+                changed = True
+        if changed:
+            self.tab_reports_revision += 1
 
     def touch_tab_player_report(self, submit_player_id: Optional[str], current_time: float) -> bool:
         if not isinstance(submit_player_id, str) or not submit_player_id:
@@ -1678,10 +1691,22 @@ class ServerState:
             room_code,
         )
         selected: Dict[str, dict] = {}
+        visible_by_client_id = {
+            client_id: node
+            for internal_id, node in visible_meta.items()
+            if isinstance(node, dict)
+            and isinstance(node.get("data"), dict)
+            and (
+                client_id := self.build_client_visible_battle_chunk_id(
+                    internal_id,
+                    node["data"],
+                )
+            )
+        }
         for chunk_id in chunk_ids:
             if not isinstance(chunk_id, str) or not chunk_id:
                 continue
-            node = visible_meta.get(chunk_id)
+            node = visible_by_client_id.get(chunk_id)
             if not isinstance(node, dict):
                 continue
             data = node.get("data")
@@ -1809,6 +1834,7 @@ class ServerState:
             "updatedAt": int(time.time() * 1000),
         }
         self.player_marks[normalized_player_id] = mark
+        self.player_marks_revision += 1
         return dict(mark)
 
     def clear_player_mark(self, player_id: str) -> bool:
@@ -1818,11 +1844,14 @@ class ServerState:
         if normalized_player_id not in self.player_marks:
             return False
         del self.player_marks[normalized_player_id]
+        self.player_marks_revision += 1
         return True
 
     def clear_all_player_marks(self) -> int:
         count = len(self.player_marks)
         self.player_marks.clear()
+        if count:
+            self.player_marks_revision += 1
         return count
 
     @staticmethod
@@ -2115,12 +2144,15 @@ class ServerState:
         )
         self.battle_chunks, self.battle_chunk_meta = self.build_effective_battle_chunk_states(active_battle_chunks, current_time)
 
-        return {
+        patch = {
             "players": self.compute_scope_patch(old_players, self.players),
             "entities": self.compute_scope_patch(old_entities, self.entities),
             "waypoints": self.compute_scope_patch(old_waypoints, self.waypoints),
             "battleChunks": self.compute_scope_patch(old_battle_chunks, self.battle_chunks),
         }
+        if self.has_patch_changes(patch):
+            self.delivery_revision += 1
+        return patch
 
     @staticmethod
     def _normalize_protocol_version(version) -> str:
@@ -2171,6 +2203,8 @@ class ServerState:
             if load >= threshold:
                 hz = float(lowered_hz)
                 break
+        if self.performance_broadcast_hz_cap is not None:
+            hz = min(hz, float(self.performance_broadcast_hz_cap))
         self.broadcast_hz = max(self.MIN_BROADCAST_HZ, hz)
         return self.broadcast_hz
 
@@ -2391,6 +2425,7 @@ class ServerState:
 
         if "tab_players" in requested_scopes and player_id in self.tab_player_reports:
             del self.tab_player_reports[player_id]
+            self.tab_reports_revision += 1
         if "players" in requested_scopes:
             remove_source_reports(self.player_reports)
         if "entities" in requested_scopes:

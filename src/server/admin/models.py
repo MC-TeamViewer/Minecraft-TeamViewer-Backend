@@ -81,6 +81,15 @@ class AdminObservabilityPayload(TypedDict):
     apiErrors: int
     sseErrors: int
     trustProxyHeaders: bool
+    broadcastLastMs: float
+    broadcastP95Ms: float
+    eventLoopLagP95Ms: float
+    broadcastOverruns: int
+    activeWriters: int
+    coalescedStateUpdates: int
+    slowClientDisconnects: int
+    sendTimeoutSec: float
+    controlQueueCapacity: int
 
 
 class TrafficLayerLivePayload(TypedDict):

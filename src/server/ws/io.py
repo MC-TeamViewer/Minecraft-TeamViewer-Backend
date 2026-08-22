@@ -1,3 +1,4 @@
+import asyncio
 import sys
 
 import msgpack
@@ -50,14 +51,14 @@ async def _raw_send_packet(websocket: WebSocket, packet, *, channel: str | None 
         body["channel"] = channel
         await send_tracked_websocket_bytes(
             websocket,
-            runtime.message_codec.encode(body),
+            await asyncio.to_thread(runtime.message_codec.encode, body),
             channel=channel,
             protobuf_type=packet_type,
         )
         return
     await send_tracked_websocket_bytes(
         websocket,
-        runtime.message_codec.encode(packet),
+        await asyncio.to_thread(runtime.message_codec.encode, packet),
         channel=channel,
         protobuf_type=packet_type,
     )
@@ -153,7 +154,7 @@ async def receive_payload(websocket: WebSocket, *, allow_legacy_handshake: bool 
         )
 
     try:
-        return runtime.message_codec.decode(payload)
+        return await asyncio.to_thread(runtime.message_codec.decode, payload)
     except PacketDecodeError as proto_error:
         if not allow_legacy_handshake:
             raise proto_error

@@ -1,9 +1,11 @@
+import asyncio
 import logging
 import time
 
 from fastapi import WebSocketDisconnect
 
 from ..admin.traffic import send_tracked_websocket_bytes
+from ..ws.sender import websocket_send_hub
 from .codec import ProtobufMessageCodec
 from .protocol import DigestPacket, PatchPacket, RefreshRequestOutboundPacket, ReportRateHintPacket, SnapshotFullPacket
 from ..state import ServerState
@@ -29,6 +31,8 @@ class Broadcaster:
         self._player_last_states: dict[str, dict] = {}
         self._resolved_source_views: dict[tuple[str, tuple[str, ...]], dict] = {}
         self._last_player_report_hints: dict[str, int] = {}
+        self._last_housekeeping_at = time.monotonic()
+        self._last_delivery_signature: tuple | None = None
         self._player_sync_scopes = (
             "players",
             "entities",
@@ -49,6 +53,11 @@ class Broadcaster:
     def _encode_message(self, packet) -> bytes:
         return self._codec.encode(packet)
 
+    async def _encode_message_async(self, packet) -> bytes:
+        # Large protobuf population still contains Python work.  Keep HTTP and WS
+        # handshakes responsive while the shared payload for a projection is built.
+        return await asyncio.to_thread(self._encode_message, packet)
+
     def _encode_message_once(self, packet, cache: dict[str, bytes], cache_key: str) -> bytes:
         encoded = cache.get(cache_key)
         if encoded is None:
@@ -56,8 +65,22 @@ class Broadcaster:
             cache[cache_key] = encoded
         return encoded
 
-    async def _send_encoded(self, ws, payload: bytes, *, channel: str, protobuf_type: str) -> None:
-        await send_tracked_websocket_bytes(ws, payload, channel=channel, protobuf_type=protobuf_type)
+    async def _send_encoded(
+        self,
+        ws,
+        payload: bytes,
+        *,
+        channel: str,
+        protobuf_type: str,
+    ) -> bool:
+        return await send_tracked_websocket_bytes(
+            ws,
+            payload,
+            channel=channel,
+            protobuf_type=protobuf_type,
+            coalesce_state=protobuf_type in {"snapshot_full", "patch"},
+            wait=False,
+        )
 
     def _build_full_message(
         self,
@@ -232,7 +255,12 @@ class Broadcaster:
         )
         for phase in phases:
             message = self._build_patch_message(phase, channel=channel if channel == "web_map" else None, extra=extra)
-            await self._send_encoded(ws, self._encode_message(message), channel=channel, protobuf_type="patch")
+            await self._send_encoded(
+                ws,
+                await self._encode_message_async(message),
+                channel=channel,
+                protobuf_type="patch",
+            )
 
     def _compute_web_map_patch(self, old_state: dict, new_state: dict) -> dict:
         scope_patch = self._compute_scope_patch_for_scopes(old_state, new_state, self._web_map_sync_scopes)
@@ -404,7 +432,12 @@ class Broadcaster:
             extra={"server_time": time.time()},
         )
 
-        await self._send_encoded(ws, self._encode_message(message), channel="web_map", protobuf_type="snapshot_full")
+        await self._send_encoded(
+            ws,
+            await self._encode_message_async(message),
+            channel="web_map",
+            protobuf_type="snapshot_full",
+        )
         self._web_map_last_states[web_map_id] = view_state
 
     def _build_visible_state_for_player(self, player_id: str) -> dict:
@@ -431,7 +464,12 @@ class Broadcaster:
             "playerMarks": self.state.prune_none_fields(dict(self.state.player_marks)),
         }
         message = self._build_full_message(delivery_state)
-        await self._send_encoded(ws, self._encode_message(message), channel="player", protobuf_type="snapshot_full")
+        await self._send_encoded(
+            ws,
+            await self._encode_message_async(message),
+            channel="player",
+            protobuf_type="snapshot_full",
+        )
         self._player_last_states[player_id] = delivery_state
 
     async def maybe_send_digest(
@@ -473,7 +511,12 @@ class Broadcaster:
         message = DigestPacket(
             hashes=hashes,
         )
-        await self._send_encoded(ws, self._encode_message(message), channel="player", protobuf_type="digest")
+        await self._send_encoded(
+            ws,
+            await self._encode_message_async(message),
+            channel="player",
+            protobuf_type="digest",
+        )
 
     async def broadcast_web_map_updates(self, force_full: bool = False) -> None:
         """向网页地图观察端广播增量（必要时全量）。"""
@@ -484,7 +527,10 @@ class Broadcaster:
 
         disconnected = []
         room_states: dict[str, dict] = {}
+        client_states: dict[tuple[str, bool], dict] = {}
         encoded_full_by_room: dict[tuple[str, bool], bytes] = {}
+        encoded_patch_cache: dict[tuple[str, bool, int, bool], tuple[dict, bytes | None]] = {}
+        server_time = time.time()
         for web_map_id, ws in list(self.state.web_map_connections.items()):
             web_map_room = self.state.get_web_map_room(web_map_id)
             if not self.state.websocket_is_connected(ws):
@@ -503,36 +549,67 @@ class Broadcaster:
                 if room_state is None:
                     room_state = self._build_web_map_view_state(web_map_room)
                     room_states[room_key] = room_state
-                current_state = self._web_map_state_for_client(web_map_id, room_state)
+                supports_last_seen = self._web_map_supports_last_seen(web_map_id)
+                state_key = (room_key, supports_last_seen)
+                current_state = client_states.get(state_key)
+                if current_state is None:
+                    current_state = self._web_map_state_for_client(web_map_id, room_state)
+                    client_states[state_key] = current_state
                 previous_state = self._web_map_last_states.get(web_map_id)
                 message_kind = "idle"
+                protocol_version = self.state.web_map_connection_protocols.get(web_map_id)
+                supports_clear = self._protocol_supports_clear_fields(protocol_version)
+                must_send_full = force_full or previous_state is None or websocket_send_hub.state_pending(ws)
 
-                if force_full or previous_state is None:
+                patch_state: dict | None = None
+                encoded_patch: bytes | None = None
+                if not must_send_full:
+                    patch_cache_key = (room_key, supports_last_seen, id(previous_state), supports_clear)
+                    cached_patch = encoded_patch_cache.get(patch_cache_key)
+                    if cached_patch is None:
+                        patch_state = self._compute_web_map_patch(previous_state, current_state)
+                        if self._has_web_map_patch_changes(patch_state):
+                            if not supports_clear and self._patch_requires_full_snapshot(
+                                patch_state, self._web_map_sync_scopes
+                            ):
+                                must_send_full = True
+                            else:
+                                message = self._build_patch_message(
+                                    patch_state,
+                                    channel="web_map",
+                                    extra={"server_time": server_time},
+                                )
+                                encoded_patch = await self._encode_message_async(message)
+                        encoded_patch_cache[patch_cache_key] = (patch_state, encoded_patch)
+                    else:
+                        patch_state, encoded_patch = cached_patch
+
+                if must_send_full:
                     message_kind = "snapshot_full"
-                    full_cache_key = (room_key, self._web_map_supports_last_seen(web_map_id))
+                    full_cache_key = state_key
                     encoded = encoded_full_by_room.get(full_cache_key)
                     if encoded is None:
                         message = self._build_full_message(
                             current_state,
                             channel="web_map",
-                            extra={"server_time": time.time()},
+                            extra={"server_time": server_time},
                         )
-                        encoded = self._encode_message(message)
+                        encoded = await self._encode_message_async(message)
                         encoded_full_by_room[full_cache_key] = encoded
-                    await self._send_encoded(ws, encoded, channel="web_map", protobuf_type="snapshot_full")
-                else:
-                    patch_state = self._compute_web_map_patch(previous_state, current_state)
-                    if self._has_web_map_patch_changes(patch_state):
-                        message_kind = "patch"
-                        await self._send_compatible_patch(
-                            ws,
-                            patch_state,
-                            current_state,
-                            self._web_map_sync_scopes,
-                            self.state.web_map_connection_protocols.get(web_map_id),
-                            channel="web_map",
-                            extra={"server_time": time.time()},
-                        )
+                    await self._send_encoded(
+                        ws,
+                        encoded,
+                        channel="web_map",
+                        protobuf_type="snapshot_full",
+                    )
+                elif encoded_patch is not None:
+                    message_kind = "patch"
+                    await self._send_encoded(
+                        ws,
+                        encoded_patch,
+                        channel="web_map",
+                        protobuf_type="patch",
+                    )
 
                 self._web_map_last_states[web_map_id] = current_state
             except WebSocketDisconnect as e:
@@ -575,12 +652,63 @@ class Broadcaster:
 
     async def broadcast_updates(self, force_full_to_delta: bool = False) -> None:
         """统一广播入口：清理超时、计算 patch、按能力下发。"""
-        await self.request_preexpiry_refreshes()
-        self.state.cleanup_timeouts()
+        now = time.monotonic()
+        if now - self._last_housekeeping_at >= 0.5:
+            await self.request_preexpiry_refreshes()
+            self.state.cleanup_timeouts()
+            self._last_housekeeping_at = now
         self.state.refresh_resolved_states()
         self._resolved_source_views.clear()
 
+        player_topology = tuple(
+            sorted(
+                (
+                    player_id,
+                    self.state.get_player_room(player_id),
+                    str(self.state.connection_caps.get(player_id, {}).get("protocol") or ""),
+                    self.state.is_external_source(player_id),
+                )
+                for player_id in self.state.connections
+            )
+        )
+        web_map_topology = tuple(
+            sorted(
+                (
+                    web_map_id,
+                    self.state.get_web_map_room(web_map_id),
+                    str(self.state.web_map_connection_protocols.get(web_map_id) or ""),
+                )
+                for web_map_id in self.state.web_map_connections
+            )
+        )
+        delivery_signature = (
+            self.state.delivery_revision,
+            self.state.last_seen_revision,
+            self.state.player_marks_revision,
+            self.state.tab_reports_revision,
+            player_topology,
+            web_map_topology,
+        )
+        digest_due = any(
+            not self.state.is_external_source(player_id)
+            and player_id in self.state.connection_caps
+            and now - float(self.state.connection_caps.get(player_id, {}).get("lastDigestSent", 0.0))
+            >= self.state.DIGEST_INTERVAL_SEC
+            for player_id in self.state.connections
+        )
+        if (
+            not force_full_to_delta
+            and self._last_delivery_signature == delivery_signature
+            and not digest_due
+        ):
+            return
+        self._last_delivery_signature = delivery_signature
+
         disconnected = []
+        projection_states: dict[tuple[str, tuple[str, ...], bool], tuple[dict, dict]] = {}
+        encoded_full_cache: dict[tuple[str, tuple[str, ...], bool], bytes] = {}
+        encoded_patch_cache: dict[tuple[tuple[str, tuple[str, ...], bool], int, bool], tuple[dict, bytes | None]] = {}
+        digest_encoded_cache: dict[tuple[tuple[str, tuple[str, ...], bool], bool], bytes] = {}
         for player_id, ws in list(self.state.connections.items()):
             if self.state.is_external_source(player_id):
                 continue
@@ -594,42 +722,98 @@ class Broadcaster:
 
             try:
                 supports_last_seen = self._player_supports_last_seen(player_id)
-                visible = self._build_visible_state_for_player(player_id)
-                sync_view_state = self._build_player_sync_view_state(
-                    visible,
-                    include_last_seen=supports_last_seen,
+                room_code = self.state.get_player_room(player_id)
+                allowed_sources = tuple(sorted(self.state.get_allowed_sources_for_player(player_id)))
+                projection_key = (
+                    self.state.normalize_room_code(room_code),
+                    allowed_sources,
+                    supports_last_seen,
                 )
-                delivery_state = {
-                    **sync_view_state,
-                    "playerMarks": self.state.prune_none_fields(dict(self.state.player_marks)),
-                }
+                projected = projection_states.get(projection_key)
+                if projected is None:
+                    visible = self._resolve_source_view(set(allowed_sources), room_code)
+                    sync_view_state = self._build_player_sync_view_state(
+                        visible,
+                        include_last_seen=supports_last_seen,
+                    )
+                    delivery_state = {
+                        **sync_view_state,
+                        "playerMarks": self.state.prune_none_fields(dict(self.state.player_marks)),
+                    }
+                    projected = (sync_view_state, delivery_state)
+                    projection_states[projection_key] = projected
+                else:
+                    sync_view_state, delivery_state = projected
                 previous_state = self._player_last_states.get(player_id)
-                if force_full_to_delta or previous_state is None:
+                caps = self.state.connection_caps.get(player_id, {})
+                supports_clear = self._protocol_supports_clear_fields(caps.get("protocol"))
+                must_send_full = (
+                    force_full_to_delta
+                    or previous_state is None
+                    or websocket_send_hub.state_pending(ws)
+                )
+                encoded_patch: bytes | None = None
+                if not must_send_full and previous_state != delivery_state:
+                    patch_cache_key = (projection_key, id(previous_state), supports_clear)
+                    cached_patch = encoded_patch_cache.get(patch_cache_key)
+                    if cached_patch is None:
+                        patch_state = self._compute_scope_patch_for_scopes(
+                            previous_state,
+                            delivery_state,
+                            self._player_delivery_scopes,
+                        )
+                        if self._has_scope_patch_changes(patch_state, self._player_delivery_scopes):
+                            if not supports_clear and self._patch_requires_full_snapshot(
+                                patch_state, self._player_delivery_scopes
+                            ):
+                                must_send_full = True
+                            else:
+                                encoded_patch = await self._encode_message_async(
+                                    self._build_patch_message(patch_state)
+                                )
+                        encoded_patch_cache[patch_cache_key] = (patch_state, encoded_patch)
+                    else:
+                        _, encoded_patch = cached_patch
+
+                if must_send_full:
                     full_msg = self._build_full_message(delivery_state)
+                    encoded_full = encoded_full_cache.get(projection_key)
+                    if encoded_full is None:
+                        encoded_full = await self._encode_message_async(full_msg)
+                        encoded_full_cache[projection_key] = encoded_full
                     await self._send_encoded(
                         ws,
-                        self._encode_message(full_msg),
+                        encoded_full,
                         channel="player",
                         protobuf_type="snapshot_full",
                     )
-                elif previous_state != delivery_state:
-                    patch_state = self._compute_scope_patch_for_scopes(
-                        previous_state,
-                        delivery_state,
-                        self._player_delivery_scopes,
+                elif encoded_patch is not None:
+                    await self._send_encoded(
+                        ws,
+                        encoded_patch,
+                        channel="player",
+                        protobuf_type="patch",
                     )
-                    if self._has_scope_patch_changes(patch_state, self._player_delivery_scopes):
-                        caps = self.state.connection_caps.get(player_id, {})
-                        await self._send_compatible_patch(
-                            ws,
-                            patch_state,
-                            delivery_state,
-                            self._player_delivery_scopes,
-                            caps.get("protocol"),
-                            channel="player",
-                        )
                 self._player_last_states[player_id] = delivery_state
-                await self.maybe_send_digest(player_id, sync_view_state=sync_view_state)
+
+                if caps and now - float(caps.get("lastDigestSent", 0.0)) >= self.state.DIGEST_INTERVAL_SEC:
+                    caps["lastDigestSent"] = now
+                    include_source_metadata = self.state._protocol_at_least(caps.get("protocol"), "0.6.5")
+                    digest_key = (projection_key, include_source_metadata)
+                    encoded_digest = digest_encoded_cache.get(digest_key)
+                    if encoded_digest is None:
+                        hashes = self._build_player_sync_digests(
+                            sync_view_state,
+                            include_player_source_metadata=include_source_metadata,
+                        )
+                        encoded_digest = await self._encode_message_async(DigestPacket(hashes=hashes))
+                        digest_encoded_cache[digest_key] = encoded_digest
+                    await self._send_encoded(
+                        ws,
+                        encoded_digest,
+                        channel="player",
+                        protobuf_type="digest",
+                    )
             except RuntimeError as e:
                 logger.warning(
                     f"RuntimeError sending delta update to player={player_id} "
@@ -709,7 +893,12 @@ class Broadcaster:
             battleChunks=battle_chunks,
         )
         try:
-            await self._send_encoded(ws, self._encode_message(message), channel="player", protobuf_type="refresh_request")
+            await self._send_encoded(
+                ws,
+                await self._encode_message_async(message),
+                channel="player",
+                protobuf_type="refresh_request",
+            )
             self.state.mark_refresh_request_sent(source_id, now)
             logger.debug(
                 "Sent refresh_req "
@@ -756,9 +945,14 @@ class Broadcaster:
                 cache_key = (suggested_ticks, broadcast_hz, reason)
                 encoded = encoded_cache.get(cache_key)
                 if encoded is None:
-                    encoded = self._encode_message(packet)
+                    encoded = await self._encode_message_async(packet)
                     encoded_cache[cache_key] = encoded
-                await self._send_encoded(ws, encoded, channel="player", protobuf_type="report_rate_hint")
+                await self._send_encoded(
+                    ws,
+                    encoded,
+                    channel="player",
+                    protobuf_type="report_rate_hint",
+                )
             except Exception as e:
                 logger.warning(
                     "Error sending report_rate_hint to player=%s state=(%s): %s",
