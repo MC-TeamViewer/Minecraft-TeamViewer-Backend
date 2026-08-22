@@ -1,0 +1,14 @@
+.git
+.venv
+.idea
+.vscode
+.pytest_cache
+.coverage
+**/__pycache__
+*.log
+*.db
+data
+data-*
+admin-ui/node_modules
+admin-ui/dist
+rust-backend/target

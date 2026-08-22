@@ -1,6 +1,6 @@
 services:
   backend:
-    image: ${TEAMVIEWER_IMAGE:-professornuo/team-view-relay:v0.5.14-proto0.7.0}
+    image: ${TEAMVIEWER_IMAGE:-professornuo/team-view-relay:v0.5.14-proto0.7.0.hotfix}
     build:
       context: .
       dockerfile: Dockerfile

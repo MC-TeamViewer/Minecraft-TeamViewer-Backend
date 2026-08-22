@@ -59,6 +59,9 @@ class AdminStore:
         self.config = config
         self._db: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
+        self._pending_player_activity: dict[
+            tuple[str, str, str, str], tuple[int, int]
+        ] = {}
 
     async def initialize(self) -> None:
         db_path = Path(self.config.db_path)
@@ -226,8 +229,33 @@ class AdminStore:
         local_date = local_dt.strftime("%Y-%m-%d")
         local_hour = local_dt.strftime("%Y-%m-%dT%H:00:00")
 
+        key = (local_date, local_hour, player_id, room_code)
         async with self._lock:
-            self._execute_many(
+            previous = self._pending_player_activity.get(key)
+            if previous is None:
+                self._pending_player_activity[key] = (stamp_ms, stamp_ms)
+            else:
+                self._pending_player_activity[key] = (
+                    min(previous[0], stamp_ms),
+                    max(previous[1], stamp_ms),
+                )
+
+        # Explicit timestamps are commonly used by administrative imports/tests and
+        # retain their historical read-after-write behavior.  The hot WS path passes
+        # no timestamp and is flushed in one transaction every five seconds.
+        if occurred_at is not None:
+            await self.flush_player_activity()
+
+    async def flush_player_activity(self) -> bool:
+        async with self._lock:
+            pending = self._pending_player_activity
+            self._pending_player_activity = {}
+        if not pending:
+            return False
+
+        statements: list[tuple[str, tuple[Any, ...]]] = []
+        for (local_date, local_hour, player_id, room_code), (first_seen, last_seen) in pending.items():
+            statements.extend(
                 [
                     (
                         """
@@ -239,9 +267,10 @@ class AdminStore:
                             last_seen_at
                         ) VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT(local_date, player_id, room_code) DO UPDATE SET
-                            last_seen_at = excluded.last_seen_at
+                            first_seen_at = MIN(first_seen_at, excluded.first_seen_at),
+                            last_seen_at = MAX(last_seen_at, excluded.last_seen_at)
                         """,
-                        (local_date, player_id, room_code, stamp_ms, stamp_ms),
+                        (local_date, player_id, room_code, first_seen, last_seen),
                     ),
                     (
                         """
@@ -253,12 +282,26 @@ class AdminStore:
                             last_seen_at
                         ) VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT(local_hour, player_id, room_code) DO UPDATE SET
-                            last_seen_at = excluded.last_seen_at
+                            first_seen_at = MIN(first_seen_at, excluded.first_seen_at),
+                            last_seen_at = MAX(last_seen_at, excluded.last_seen_at)
                         """,
-                        (local_hour, player_id, room_code, stamp_ms, stamp_ms),
+                        (local_hour, player_id, room_code, first_seen, last_seen),
                     ),
-                ],
+                ]
             )
+        try:
+            async with self._lock:
+                await asyncio.to_thread(self._execute_many, statements)
+        except Exception:
+            async with self._lock:
+                for key, value in pending.items():
+                    previous = self._pending_player_activity.get(key)
+                    self._pending_player_activity[key] = value if previous is None else (
+                        min(previous[0], value[0]),
+                        max(previous[1], value[1]),
+                    )
+            raise
+        return True
 
     async def record_audit_event(
         self,
@@ -582,7 +625,7 @@ class AdminStore:
             return
 
         async with self._lock:
-            self._execute_many(statements)
+            await asyncio.to_thread(self._execute_many, statements)
 
     async def query_daily_metrics(self, *, days: int, room_code: str | None = None) -> dict[str, Any]:
         return await self.query_daily_metrics_with_start(days=days, room_code=room_code, start_date=None)
@@ -931,16 +974,19 @@ class AdminStore:
 
     async def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         async with self._lock:
-            return self._fetchall_sync(sql, params)
+            return await asyncio.to_thread(self._fetchall_sync, sql, params)
 
     async def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
         async with self._lock:
-            db = self._require_db()
-            cursor = db.execute(sql, params)
-            try:
-                return cursor.fetchone()
-            finally:
-                cursor.close()
+            return await asyncio.to_thread(self._fetchone_sync, sql, params)
+
+    def _fetchone_sync(self, sql: str, params: tuple[Any, ...]) -> sqlite3.Row | None:
+        db = self._require_db()
+        cursor = db.execute(sql, params)
+        try:
+            return cursor.fetchone()
+        finally:
+            cursor.close()
 
     def _fetchall_sync(self, sql: str, params: tuple[Any, ...]) -> list[sqlite3.Row]:
         db = self._require_db()

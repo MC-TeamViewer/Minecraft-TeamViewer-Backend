@@ -84,6 +84,7 @@ class TrafficStatsService:
         self._pending_minute: dict[tuple[str, str, str, str], int] = defaultdict(int)
         self._pending_hourly: dict[tuple[str, str, str, str], int] = defaultdict(int)
         self._pending_daily: dict[tuple[str, str, str, str], int] = defaultdict(int)
+        self._time_bucket_cache: dict[int, tuple[str, str, str]] = {}
 
     @property
     def live_window_sec(self) -> int:
@@ -123,10 +124,16 @@ class TrafficStatsService:
 
         stamp = time.time() if occurred_at is None else float(occurred_at)
         second_bucket = int(stamp)
-        local_dt = self._store.local_datetime(stamp)
-        minute_bucket = local_dt.strftime("%Y-%m-%dT%H:%M:00")
-        hourly_bucket = local_dt.strftime("%Y-%m-%dT%H:00:00")
-        daily_bucket = local_dt.strftime("%Y-%m-%d")
+        time_buckets = self._time_bucket_cache.get(second_bucket)
+        if time_buckets is None:
+            local_dt = self._store.local_datetime(stamp)
+            time_buckets = (
+                local_dt.strftime("%Y-%m-%dT%H:%M:00"),
+                local_dt.strftime("%Y-%m-%dT%H:00:00"),
+                local_dt.strftime("%Y-%m-%d"),
+            )
+            self._time_bucket_cache[second_bucket] = time_buckets
+        minute_bucket, hourly_bucket, daily_bucket = time_buckets
 
         layer_live_buckets = self._live_buckets[layer]
         live_bucket = layer_live_buckets.get(second_bucket)
@@ -185,6 +192,8 @@ class TrafficStatsService:
         stale_keys = [bucket for bucket in layer_buckets.keys() if bucket < threshold]
         for bucket in stale_keys:
             layer_buckets.pop(bucket, None)
+        for bucket in [key for key in self._time_bucket_cache if key < threshold]:
+            self._time_bucket_cache.pop(bucket, None)
 
     def _build_live_layer_payload_from_totals(self, totals: dict[tuple[str, str], int]) -> dict[str, float]:
         window = float(self._live_window_sec)
@@ -296,16 +305,35 @@ async def send_tracked_websocket_bytes(
     *,
     channel: str | None = None,
     protobuf_type: str | None = None,
-) -> None:
-    await websocket.send_bytes(payload)
-    await record_websocket_payload_traffic(
-        websocket=websocket,
-        direction="egress",
-        payload=payload,
-        channel=channel,
-    )
-    record_protobuf_packet_nowait(
-        websocket=websocket,
-        message_type=protobuf_type,
-        byte_count=len(payload),
+    coalesce_state: bool = False,
+    wait: bool = True,
+) -> bool:
+    """Send through the per-socket writer and account only successful writes.
+
+    State broadcasts can opt into a single latest-value slot.  All other packets use
+    the bounded reliable queue and are serialized with state writes.
+    """
+    from ..ws.sender import websocket_send_hub
+
+    resolved_channel = infer_websocket_traffic_channel(websocket, channel)
+
+    def on_sent() -> None:
+        if resolved_channel is not None:
+            record_websocket_traffic_nowait(
+                channel=resolved_channel,
+                direction="egress",
+                byte_count=len(payload),
+            )
+        record_protobuf_packet_nowait(
+            websocket=websocket,
+            message_type=protobuf_type,
+            byte_count=len(payload),
+        )
+
+    return await websocket_send_hub.send(
+        websocket,
+        payload,
+        coalesce_state=coalesce_state,
+        wait=wait,
+        on_sent=on_sent,
     )

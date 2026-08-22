@@ -46,6 +46,7 @@ from ..tab_history.service import (
     handle_packet as handle_tab_history_packet,
     supported_for_protocol as tab_history_supported_for_protocol,
 )
+from .sender import websocket_send_hub
 from .io import (
     describe_websocket,
     expand_player_packets,
@@ -506,6 +507,7 @@ async def web_map_ws(websocket: WebSocket):
             },
         )
     finally:
+        await websocket_send_hub.unregister(websocket)
         runtime.logger.info(
             "Web-map disconnected (webMapId=%s, roomCode=%s, handshakeCompleted=%s, reason=%s, code=%s, %s, error=%r)",
             web_map_id,
@@ -553,6 +555,8 @@ async def reserved_admin_ws(websocket: WebSocket):
         await websocket.close(code=1008, reason="admin_interface_reserved")
     except PacketDecodeError:
         await websocket.close(code=1008, reason="admin_interface_reserved")
+    finally:
+        await websocket_send_hub.unregister(websocket)
 
 
 async def websocket_endpoint(websocket: WebSocket):
@@ -1242,6 +1246,7 @@ async def websocket_endpoint(websocket: WebSocket):
             },
         )
     finally:
+        await websocket_send_hub.unregister(websocket)
         if submit_player_id:
             is_external_source = runtime.state.is_external_source(submit_player_id)
             trigger_admin_sse_overview()

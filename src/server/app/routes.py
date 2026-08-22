@@ -1,3 +1,4 @@
+import os
 import time
 
 from fastapi.responses import JSONResponse
@@ -6,7 +7,10 @@ from . import runtime
 
 
 async def health_check():
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({
+        "status": "ok",
+        "buildVersion": os.getenv("TEAMVIEWER_BUILD_VERSION", "development"),
+    })
 
 
 async def snapshot(roomCode: str | None = None):

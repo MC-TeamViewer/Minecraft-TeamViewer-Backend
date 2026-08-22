@@ -2,6 +2,10 @@
 
 TeamViewRelay 的后端聚合服务，基于 FastAPI + WebSocket。它负责接收 Minecraft 客户端上报的数据，按房间号（`roomCode`）聚合并广播给游戏内客户端和网页地图端。
 
+本分支归档 Python hotfix `v0.5.14-proto0.7.0.hotfix`。Rust `v1.0.0`
+及后续版本在 main 分支维护；本分支保留旧 Compose、`./data` 数据目录和
+Python 回滚能力。
+
 相关组件：
 
 - [Minecraft_TeamViewer](https://github.com/MC-TeamViewer/Minecraft_TeamViewer)：Minecraft 客户端 Mod
@@ -171,10 +175,10 @@ docker compose up -d --build
 docker compose up -d --build
 ```
 
-当前发布版本为 `v0.5.14-proto0.7.0`。构建带版本号的本地镜像：
+当前归档版本为 `v0.5.14-proto0.7.0.hotfix`。构建带版本号的本地镜像：
 
 ```bash
-docker build -t professornuo/team-view-relay:v0.5.14-proto0.7.0 .
+docker build -t professornuo/team-view-relay:v0.5.14-proto0.7.0.hotfix .
 ```
 
 默认暴露：
