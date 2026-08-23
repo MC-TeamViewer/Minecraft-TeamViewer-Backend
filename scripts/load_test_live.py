@@ -90,7 +90,7 @@ class ProtobufMessageCodec:
 
 
 CODEC = ProtobufMessageCodec()
-PROTOCOL_VERSION = "0.7.0"
+PROTOCOL_VERSION = "0.7.1"
 LOAD_TEST_SCHEMA_VERSION = 3
 
 

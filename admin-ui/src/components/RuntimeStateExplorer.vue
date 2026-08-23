@@ -57,8 +57,23 @@ function summary(row: RuntimeStateItem): string {
     return `${name} · ${data.dimension ?? "-"} · ${coords}`;
   }
   if (activeKind.value === "waypoints") return `${data.name ?? "-"} · ${data.dimension ?? "-"}`;
-  if (activeKind.value === "battle-chunks") return `${data.dimension ?? "-"} · (${data.chunkX ?? "-"}, ${data.chunkZ ?? "-"})`;
+  if (activeKind.value === "battle-chunks") {
+    const ref = row.ref;
+    return `${ref?.dimension ?? "-"} · (${ref?.chunkX ?? "-"}, ${ref?.chunkZ ?? "-"})`;
+  }
   return `${data.team ?? "neutral"} · ${data.label ?? "-"} · ${data.color ?? "-"}`;
+}
+
+function rowKey(row: RuntimeStateItem): string {
+  if (row.id) return row.id;
+  const ref = row.ref;
+  return ref ? `${ref.dimension}|${ref.chunkX}|${ref.chunkZ}` : JSON.stringify(row);
+}
+
+function identity(row: RuntimeStateItem): string {
+  if (row.id) return row.id;
+  const ref = row.ref;
+  return ref ? `${ref.dimension} · (${ref.chunkX}, ${ref.chunkZ})` : "-";
 }
 
 async function load() {
@@ -124,11 +139,13 @@ watch(() => props.refreshKey, () => {
       <el-tab-pane v-for="tab in tabs" :key="tab.value" :label="tab.label" :name="tab.value" />
     </el-tabs>
 
-    <el-table :data="rows" :loading="loading" border row-key="id" table-layout="fixed" class="admin-table" empty-text="暂无实时数据">
+    <el-table :data="rows" :loading="loading" border :row-key="rowKey" table-layout="fixed" class="admin-table" empty-text="暂无实时数据">
       <el-table-column type="expand" width="44">
         <template #default="{ row }"><pre class="audit-detail">{{ formatJson(row.data) }}</pre></template>
       </el-table-column>
-      <el-table-column prop="id" label="ID" min-width="260" show-overflow-tooltip />
+      <el-table-column label="标识" min-width="260" show-overflow-tooltip>
+        <template #default="{ row }">{{ identity(row) }}</template>
+      </el-table-column>
       <el-table-column prop="sourceId" label="来源" min-width="200" show-overflow-tooltip>
         <template #default="{ row }">{{ row.sourceId || "-" }}</template>
       </el-table-column>

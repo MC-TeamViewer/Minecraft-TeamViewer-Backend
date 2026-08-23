@@ -1519,12 +1519,14 @@ impl Relay {
             };
             let include_last_seen = protocol_at_least(&protocol, "0.6.4");
             let include_source_metadata = protocol_at_least(&protocol, "0.6.5");
+            let battle_chunk_contract = battle_chunk_digest_contract(&protocol);
             let bytes = encode_payload(
                 WireChannel::Player,
                 wire_envelope::Payload::Digest(snapshot_digest(
                     &snapshot,
                     include_last_seen,
                     include_source_metadata,
+                    battle_chunk_contract,
                 )),
             );
             if control.try_send(bytes).is_ok()
@@ -1769,9 +1771,15 @@ impl Relay {
             .iter()
             .filter_map(|entry| {
                 let id = battle_entry_key(entry)?;
+                let reference = entry.r#ref.as_ref()?;
+                let coord = reference.coord.as_ref()?;
                 let data = entry.data.as_ref()?;
                 Some(json!({
-                    "id":id,
+                    "ref":{
+                        "dimension":reference.dimension,
+                        "chunkX":coord.chunk_x,
+                        "chunkZ":coord.chunk_z,
+                    },
                     "sourceId":selected_source(&selections.battle_chunks, &id),
                     "reportedAtUtcMs":Value::Null,
                     "data":battle_value_json(data),
@@ -2932,6 +2940,7 @@ fn snapshot_digest(
     snapshot: &SnapshotFull,
     include_last_seen: bool,
     include_source_metadata: bool,
+    battle_chunk_contract: BattleChunkDigestContract,
 ) -> Digest {
     let players = snapshot
         .players
@@ -2961,16 +2970,6 @@ fn snapshot_digest(
         .iter()
         .map(|(id, waypoint)| (id.clone(), waypoint_json(waypoint)))
         .collect();
-    let battle_chunks = snapshot
-        .battle_chunks
-        .iter()
-        .filter_map(|entry| {
-            Some((
-                battle_entry_key(entry)?,
-                battle_value_json(entry.data.as_ref()?),
-            ))
-        })
-        .collect();
     let last_seen_players = snapshot
         .last_seen_players
         .iter()
@@ -2980,8 +2979,78 @@ fn snapshot_digest(
         players: state_digest_plain(players),
         entities: state_digest_plain(entities),
         waypoints: state_digest_plain(waypoints),
-        battle_chunks: Some(state_digest_plain(battle_chunks)),
+        battle_chunks: Some(battle_chunk_digest(
+            &snapshot.battle_chunks,
+            battle_chunk_contract,
+        )),
         last_seen_players: include_last_seen.then(|| state_digest_plain(last_seen_players)),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BattleChunkDigestContract {
+    LegacyKeyed,
+    StructuredV2,
+}
+
+fn battle_chunk_digest_contract(protocol: &str) -> BattleChunkDigestContract {
+    if protocol_at_least(protocol, "0.7.1") {
+        BattleChunkDigestContract::StructuredV2
+    } else {
+        BattleChunkDigestContract::LegacyKeyed
+    }
+}
+
+fn battle_chunk_digest(
+    entries: &[BattleChunkEntry],
+    contract: BattleChunkDigestContract,
+) -> String {
+    match contract {
+        BattleChunkDigestContract::LegacyKeyed => {
+            let values = entries
+                .iter()
+                .filter_map(|entry| {
+                    let reference = entry.r#ref.as_ref()?;
+                    let coord = reference.coord.as_ref()?;
+                    let mut value = battle_digest_data_json(entry.data.as_ref()?);
+                    let object = value.as_object_mut()?;
+                    object.insert(
+                        "dimension".to_owned(),
+                        Value::String(reference.dimension.trim().to_owned()),
+                    );
+                    object.insert("chunkX".to_owned(), Value::from(coord.chunk_x));
+                    object.insert("chunkZ".to_owned(), Value::from(coord.chunk_z));
+                    Some((battle_ref_key(reference)?, value))
+                })
+                .collect();
+            state_digest_plain(values)
+        }
+        BattleChunkDigestContract::StructuredV2 => {
+            let mut values = entries
+                .iter()
+                .filter_map(|entry| {
+                    let reference = entry.r#ref.as_ref()?;
+                    let coord = reference.coord.as_ref()?;
+                    let dimension = reference.dimension.trim();
+                    if dimension.is_empty() {
+                        return None;
+                    }
+                    Some((
+                        (dimension.to_owned(), coord.chunk_x, coord.chunk_z),
+                        json!({
+                            "ref":{
+                                "dimension":dimension,
+                                "chunkX":coord.chunk_x,
+                                "chunkZ":coord.chunk_z,
+                            },
+                            "data":battle_digest_data_json(entry.data.as_ref()?),
+                        }),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            values.sort_by(|left, right| left.0.cmp(&right.0));
+            digest_canonical_values(values.into_iter().map(|(_, value)| value))
+        }
     }
 }
 
@@ -3029,6 +3098,16 @@ fn battle_value_json(value: &BattleChunkValue) -> Value {
     }))
 }
 
+fn battle_digest_data_json(value: &BattleChunkValue) -> Value {
+    let mut value = battle_value_json(value);
+    if let Some(object) = value.as_object_mut() {
+        object
+            .entry("colorMode".to_owned())
+            .or_insert_with(|| Value::String("raw_observed".to_owned()));
+    }
+    value
+}
+
 fn last_seen_json(player: &LastSeenPlayerData) -> Value {
     prune_nulls(json!({
         "x":player.x,"y":player.y,"z":player.z,"dimension":player.dimension,
@@ -3058,6 +3137,16 @@ fn state_digest_plain(values: BTreeMap<String, Value>) -> String {
     for (id, value) in values {
         raw.push_str(&serde_json::to_string(&id).expect("string is JSON serializable"));
         raw.push(':');
+        raw.push_str(&canonical_value(&value));
+        raw.push('\n');
+    }
+    let digest = Sha1::digest(raw.as_bytes());
+    format!("{digest:x}")[..16].to_owned()
+}
+
+fn digest_canonical_values(values: impl IntoIterator<Item = Value>) -> String {
+    let mut raw = String::new();
+    for value in values {
         raw.push_str(&canonical_value(&value));
         raw.push('\n');
     }
@@ -3140,6 +3229,22 @@ fn unix_millis() -> i64 {
 mod tests {
     use super::*;
 
+    fn battle_chunk_fixture(dimension: &str, chunk_x: i32, chunk_z: i32) -> BattleChunkEntry {
+        BattleChunkEntry {
+            r#ref: Some(BattleChunkRef {
+                dimension: dimension.to_owned(),
+                coord: Some(crate::proto::teamviewer::v1::BattleChunkCoord { chunk_x, chunk_z }),
+            }),
+            data: Some(BattleChunkValue {
+                color_raw: "#112233".to_owned(),
+                color_mode: Some("raw_observed".to_owned()),
+                mode: Some("simmc".to_owned()),
+                room_code: Some("default".to_owned()),
+                ..Default::default()
+            }),
+        }
+    }
+
     fn add_test_connection(relay: &mut Relay, id: &str, kind: ConnectionKind) {
         let (control, _) = mpsc::channel(1);
         let (state, _) = watch::channel(None);
@@ -3197,6 +3302,61 @@ mod tests {
         let values = BTreeMap::from([("<id>&".to_owned(), json!({"name":"<A&B>", "x":1.2345645}))]);
         assert_eq!(canonical_number(1.2345645), "1.234565");
         assert_eq!(state_digest_plain(values), "0cabc8c9afc26756");
+    }
+
+    #[test]
+    fn battle_chunk_digests_match_protocol_vectors() {
+        let entry = battle_chunk_fixture("minecraft:overworld", 1, 2);
+        assert_eq!(
+            battle_chunk_digest(
+                std::slice::from_ref(&entry),
+                BattleChunkDigestContract::LegacyKeyed,
+            ),
+            "d6fccb4a1bd18438"
+        );
+        assert_eq!(
+            battle_chunk_digest(
+                std::slice::from_ref(&entry),
+                BattleChunkDigestContract::StructuredV2,
+            ),
+            "31c63cd6e92bbc39"
+        );
+
+        let buggy_projection = BTreeMap::from([(
+            battle_entry_key(&entry).expect("valid ref"),
+            battle_digest_data_json(entry.data.as_ref().expect("data")),
+        )]);
+        assert_eq!(state_digest_plain(buggy_projection), "9cecf13aa4592a1c");
+    }
+
+    #[test]
+    fn battle_chunk_digest_contract_is_versioned_and_order_stable() {
+        assert_eq!(
+            battle_chunk_digest_contract("0.7.0"),
+            BattleChunkDigestContract::LegacyKeyed
+        );
+        assert_eq!(
+            battle_chunk_digest_contract("0.7.1"),
+            BattleChunkDigestContract::StructuredV2
+        );
+        assert_eq!(
+            battle_chunk_digest(&[], BattleChunkDigestContract::LegacyKeyed),
+            "da39a3ee5e6b4b0d"
+        );
+        assert_eq!(
+            battle_chunk_digest(&[], BattleChunkDigestContract::StructuredV2),
+            "da39a3ee5e6b4b0d"
+        );
+
+        let first = battle_chunk_fixture("minecraft:the_nether", -12, 4);
+        let second = battle_chunk_fixture("minecraft:overworld", 12, -4);
+        let forward = battle_chunk_digest(
+            &[first.clone(), second.clone()],
+            BattleChunkDigestContract::StructuredV2,
+        );
+        let reverse =
+            battle_chunk_digest(&[second, first], BattleChunkDigestContract::StructuredV2);
+        assert_eq!(forward, reverse);
     }
 
     #[test]

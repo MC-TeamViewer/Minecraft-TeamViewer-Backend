@@ -162,7 +162,8 @@ impl RuntimeConfig {
         let parsed = toml::from_str::<FileConfig>(STATE_CONFIG).unwrap_or_default();
         let mut congestion_levels = parsed.protocol.congestion_levels;
         congestion_levels.retain(|(threshold, hz)| *threshold > 0 && hz.is_finite());
-        congestion_levels.sort_by(|left, right| right.0.cmp(&left.0));
+        // congestion_levels.sort_by(|left, right| right.0.cmp(&left.0)); // clippy::unnecessary_sort_by)
+        congestion_levels.sort_by_key(|left| std::cmp::Reverse(left.0));
         if congestion_levels.is_empty() {
             congestion_levels = ProtocolConfig::default().congestion_levels;
         }

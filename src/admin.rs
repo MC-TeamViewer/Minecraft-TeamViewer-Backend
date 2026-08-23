@@ -1441,12 +1441,28 @@ pub async fn runtime_state(
         .as_array()
         .cloned()
         .unwrap_or_default();
-    items.sort_by(|left, right| {
-        left["id"]
-            .as_str()
-            .unwrap_or_default()
-            .cmp(right["id"].as_str().unwrap_or_default())
-    });
+    if kind == "battle-chunks" {
+        items.sort_by(|left, right| {
+            let tuple = |value: &Value| {
+                (
+                    value["ref"]["dimension"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    value["ref"]["chunkX"].as_i64().unwrap_or_default(),
+                    value["ref"]["chunkZ"].as_i64().unwrap_or_default(),
+                )
+            };
+            tuple(left).cmp(&tuple(right))
+        });
+    } else {
+        items.sort_by(|left, right| {
+            left["id"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(right["id"].as_str().unwrap_or_default())
+        });
+    }
     let total = items.len();
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(50).clamp(1, 200);

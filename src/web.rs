@@ -49,12 +49,12 @@ use crate::{
     transport::TransportConnectInfo,
 };
 
-const PROTOCOL_VERSION: &str = "0.7.0";
+const PROTOCOL_VERSION: &str = "0.7.1";
 const MIN_PROTOCOL_VERSION: &str = "0.6.1";
 const PROGRAM_VERSION: &str = concat!(
     "team-view-relay-rust-v",
     env!("CARGO_PKG_VERSION"),
-    "-proto0.7.0"
+    "-proto0.7.1"
 );
 
 #[derive(Clone)]

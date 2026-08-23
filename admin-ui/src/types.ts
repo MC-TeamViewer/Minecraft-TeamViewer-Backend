@@ -159,7 +159,12 @@ export type RuntimeStateKind =
   | "player-marks";
 
 export interface RuntimeStateItem {
-  id: string;
+  id?: string;
+  ref?: {
+    dimension: string;
+    chunkX: number;
+    chunkZ: number;
+  };
   sourceId: string | null;
   reportedAtUtcMs: number | null;
   data: Record<string, unknown>;
