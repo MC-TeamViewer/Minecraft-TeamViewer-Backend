@@ -332,6 +332,64 @@ body {
   margin-top: 8px;
 }
 
+.admin-tabs {
+  padding: 0 18px 18px;
+  overflow: hidden;
+}
+
+.admin-tabs > .el-tabs__header {
+  margin: 0 -18px 18px;
+  padding: 0 20px;
+  background: rgba(255, 247, 237, 0.72);
+}
+
+.admin-tabs .el-tabs__nav-wrap {
+  overflow-x: auto;
+}
+
+.tab-stack {
+  display: grid;
+  gap: 18px;
+}
+
+.room-cleanup-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.cleanup-count-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.cleanup-count-item {
+  display: grid;
+  gap: 6px;
+  padding: 14px;
+  border: 1px solid rgba(120, 53, 15, 0.12);
+  border-radius: 14px;
+  background: rgba(255, 247, 237, 0.7);
+}
+
+.cleanup-count-item span,
+.muted-copy {
+  color: #6b7280;
+}
+
+.cleanup-count-item strong {
+  color: #7c2d12;
+  font-size: 1.2rem;
+}
+
+.cleanup-total {
+  background: rgba(194, 65, 12, 0.1);
+}
+
 @media (max-width: 1180px) {
   .card-grid,
   .two-column-grid,
@@ -353,8 +411,17 @@ body {
   .card-grid,
   .two-column-grid,
   .status-summary-grid,
-  .expanded-detail-grid {
+  .expanded-detail-grid,
+  .cleanup-count-grid {
     grid-template-columns: 1fr;
+  }
+
+  .admin-tabs {
+    padding-inline: 10px;
+  }
+
+  .admin-tabs > .el-tabs__header {
+    margin-inline: -10px;
   }
 
   .card-grid.two-up {

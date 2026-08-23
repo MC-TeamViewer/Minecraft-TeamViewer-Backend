@@ -11,6 +11,7 @@ import type { AuditFilters } from "@/types";
 const props = defineProps<{
   modelValue: AuditFilters;
   eventTypes: string[];
+  roomOptions: string[];
 }>();
 
 const emit = defineEmits<{
@@ -35,6 +36,18 @@ function updatePatch(patch: Partial<AuditFilters>) {
 
 <template>
   <div class="audit-filter-row">
+    <el-select
+      :model-value="model.roomCode"
+      placeholder="全部房间"
+      clearable
+      filterable
+      class="filter-control"
+      @update:model-value="(value: string | undefined) => updatePatch({ roomCode: value || '' })"
+    >
+      <el-option label="全部房间" value="" />
+      <el-option v-for="room in roomOptions" :key="room" :label="room" :value="room" />
+    </el-select>
+
     <el-select
       :model-value="model.eventType"
       placeholder="全部事件"

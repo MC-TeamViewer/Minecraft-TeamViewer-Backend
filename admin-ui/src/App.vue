@@ -4,6 +4,7 @@ import ElButton from "element-plus/es/components/button/index";
 import ElCard from "element-plus/es/components/card/index";
 import ElSkeleton from "element-plus/es/components/skeleton/index";
 import ElTag from "element-plus/es/components/tag/index";
+import { ElTabPane, ElTabs } from "element-plus/es/components/tabs/index";
 import { computed, defineAsyncComponent, onMounted, ref, watch } from "vue";
 
 import {
@@ -55,6 +56,7 @@ const AuditFilters = defineAsyncComponent(() => import("@/components/AuditFilter
 const AuditTable = defineAsyncComponent(() => import("@/components/AuditTable.vue"));
 const HistoryDataManager = defineAsyncComponent(() => import("@/components/HistoryDataManager.vue"));
 const RuntimeStateExplorer = defineAsyncComponent(() => import("@/components/RuntimeStateExplorer.vue"));
+const RoomDataCleanup = defineAsyncComponent(() => import("@/components/RoomDataCleanup.vue"));
 
 const auditFilters = ref<AuditFiltersModel>({ ...DEFAULT_AUDIT_FILTERS });
 const metricsFilters = ref<MetricsFilters>({ ...DEFAULT_METRICS_FILTERS });
@@ -77,6 +79,7 @@ const lastSeenRefreshKey = ref(0);
 const tabHistoryRefreshKey = ref(0);
 const runtimeStateRefreshKey = ref(0);
 const protobufTraffic = ref<ProtobufTrafficPayload | null>(null);
+const activeTab = ref("overview");
 
 const { overview, roomOptions, applyOverview, resetOverview } = useOverviewState();
 const {
@@ -91,6 +94,7 @@ const {
   resetMetrics,
 } = useMetricsState();
 const { auditPayload, eventTypes, applyAudit, resetAudit } = useAuditState();
+const auditRoomOptions = computed(() => auditPayload.value?.availableRooms ?? []);
 
 const dashboardFilters = computed<DashboardFilters>(() => ({
   audit: auditFilters.value,
@@ -458,6 +462,10 @@ async function handleManualRefresh() {
   runtimeStateRefreshKey.value += 1;
 }
 
+async function handleRoomPurged() {
+  await handleManualRefresh();
+}
+
 async function handleLogin(payload: { username: string; password: string }) {
   loginLoading.value = true;
   loginError.value = null;
@@ -555,74 +563,93 @@ function updateHistoryTrafficMixedView(value: TrafficMixedViewMode) {
     <el-skeleton v-if="isLoading && !overview" :rows="6" animated class="surface-card section-gap" />
 
     <template v-else>
-      <OverviewCards :overview="overview" />
-      <LiveTrafficCards
-        :traffic="liveTraffic"
-        :selected-layer="liveTrafficLayer"
-        @update:selected-layer="updateLiveTrafficLayer"
-      />
+      <el-tabs v-model="activeTab" class="admin-tabs surface-card">
+        <el-tab-pane label="概览" name="overview">
+          <div class="tab-stack">
+            <OverviewCards :overview="overview" />
+            <RoomOverviewTable :overview="overview" />
+            <ConnectionStatusTable :overview="overview" :protobuf-traffic="protobufTraffic" />
+            <ExternalSourceStatusTable :overview="overview" :protobuf-traffic="protobufTraffic" />
+          </div>
+        </el-tab-pane>
 
-      <el-card shadow="never" class="surface-card">
-        <TrafficToolbar
-          :model-value="trafficFilters"
-          :selected-mode="historyTrafficMode"
-          @update:model-value="updateTrafficFilters"
-          @update:selected-mode="updateHistoryTrafficMode"
-        />
-      </el-card>
+        <el-tab-pane label="流量" name="traffic" lazy>
+          <div class="tab-stack">
+            <LiveTrafficCards
+              :traffic="liveTraffic"
+              :selected-layer="liveTrafficLayer"
+              @update:selected-layer="updateLiveTrafficLayer"
+            />
+            <el-card shadow="never" class="surface-card">
+              <TrafficToolbar
+                :model-value="trafficFilters"
+                :selected-mode="historyTrafficMode"
+                @update:model-value="updateTrafficFilters"
+                @update:selected-mode="updateHistoryTrafficMode"
+              />
+            </el-card>
+            <TrafficChartCard
+              :key="trafficChartKey"
+              :title="trafficChartTitle"
+              description="可查看单层拆分，或以混合模式在同一尺度下对比应用层与传输层的分流量细则。"
+              :metrics="trafficHistory"
+              :selected-mode="historyTrafficMode"
+              :mixed-view-mode="historyTrafficMixedView"
+              @update:mixed-view-mode="updateHistoryTrafficMixedView"
+            />
+          </div>
+        </el-tab-pane>
 
-      <TrafficChartCard
-        :key="trafficChartKey"
-        :title="trafficChartTitle"
-        description="可查看单层拆分，或以混合模式在同一尺度下对比应用层与传输层的分流量细则。"
-        :metrics="trafficHistory"
-        :selected-mode="historyTrafficMode"
-        :mixed-view-mode="historyTrafficMixedView"
-        @update:mixed-view-mode="updateHistoryTrafficMixedView"
-      />
+        <el-tab-pane label="活跃指标" name="metrics" lazy>
+          <div class="tab-stack">
+            <el-card shadow="never" class="surface-card">
+              <MetricsToolbar
+                :model-value="metricsFilters"
+                :room-options="roomOptions"
+                @update:model-value="updateMetricsFilters"
+              />
+            </el-card>
+            <section class="two-column-grid">
+              <MetricChartCard
+                :key="dailyChartKey"
+                :title="dailyChartTitle"
+                description="按 submitPlayerId 去重统计本地自然日活跃玩家，空桶自动补零。"
+                :metrics="dailyMetrics"
+                :loading="dailyMetricsLoading"
+              />
+              <MetricChartCard
+                :key="hourlyChartKey"
+                :title="hourlyChartTitle"
+                description="按本地时区整点统计小时桶内的唯一活跃玩家，空桶自动补零。"
+                :metrics="hourlyMetrics"
+                :loading="hourlyMetricsLoading"
+              />
+            </section>
+          </div>
+        </el-tab-pane>
 
-      <el-card shadow="never" class="surface-card">
-        <MetricsToolbar
-          :model-value="metricsFilters"
-          :room-options="roomOptions"
-          @update:model-value="updateMetricsFilters"
-        />
-      </el-card>
+        <el-tab-pane label="数据管理" name="data" lazy>
+          <div class="tab-stack">
+            <RoomDataCleanup @purged="handleRoomPurged" />
+            <HistoryDataManager kind="last-seen" :refresh-key="lastSeenRefreshKey" />
+            <HistoryDataManager kind="tab" :refresh-key="tabHistoryRefreshKey" />
+            <RuntimeStateExplorer :refresh-key="runtimeStateRefreshKey" />
+          </div>
+        </el-tab-pane>
 
-      <section class="two-column-grid">
-        <MetricChartCard
-          :key="dailyChartKey"
-          :title="dailyChartTitle"
-          description="按 submitPlayerId 去重统计本地自然日活跃玩家，空桶自动补零。"
-          :metrics="dailyMetrics"
-          :loading="dailyMetricsLoading"
-        />
-        <MetricChartCard
-          :key="hourlyChartKey"
-          :title="hourlyChartTitle"
-          description="按本地时区整点统计小时桶内的唯一活跃玩家，空桶自动补零。"
-          :metrics="hourlyMetrics"
-          :loading="hourlyMetricsLoading"
-        />
-      </section>
-
-      <RoomOverviewTable :overview="overview" />
-      <ConnectionStatusTable :overview="overview" :protobuf-traffic="protobufTraffic" />
-      <ExternalSourceStatusTable :overview="overview" :protobuf-traffic="protobufTraffic" />
-
-      <HistoryDataManager kind="last-seen" :refresh-key="lastSeenRefreshKey" />
-      <HistoryDataManager kind="tab" :refresh-key="tabHistoryRefreshKey" />
-      <RuntimeStateExplorer :refresh-key="runtimeStateRefreshKey" />
-
-      <section class="audit-stack">
-        <AuditFilters
-          :model-value="auditFilters"
-          :event-types="eventTypes"
-          @refresh="refreshAuditOnly"
-          @update:model-value="updateAuditFilters"
-        />
-        <AuditTable :audit="auditPayload" />
-      </section>
+        <el-tab-pane label="审计日志" name="audit" lazy>
+          <section class="audit-stack tab-stack">
+            <AuditFilters
+              :model-value="auditFilters"
+              :event-types="eventTypes"
+              :room-options="auditRoomOptions"
+              @refresh="refreshAuditOnly"
+              @update:model-value="updateAuditFilters"
+            />
+            <AuditTable :audit="auditPayload" />
+          </section>
+        </el-tab-pane>
+      </el-tabs>
     </template>
   </div>
 </template>

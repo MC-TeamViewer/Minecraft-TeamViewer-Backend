@@ -49,6 +49,9 @@ export function buildAdminEventsUrl(filters: DashboardFilters, origin = window.l
   if (filters.audit.success) {
     url.searchParams.set("auditSuccess", filters.audit.success);
   }
+  if (filters.audit.roomCode) {
+    url.searchParams.set("auditRoomCode", filters.audit.roomCode);
+  }
   url.searchParams.set("dailyDays", String(filters.metrics.dailyDays));
   url.searchParams.set("hourlyHours", String(filters.metrics.hourlyHours));
   if (filters.metrics.dailyStartDate) {

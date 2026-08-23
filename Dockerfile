@@ -1,32 +1,29 @@
 ARG NODE_IMAGE=node:24-bookworm-slim
-ARG UV_IMAGE=astral/uv:python3.13-bookworm-slim
-ARG BUILD_VERSION=0.5.14-proto0.7.0.hotfix
+ARG RUST_IMAGE=rust:1.94-bookworm
+ARG DEBIAN_IMAGE=debian:bookworm-slim
 
 FROM ${NODE_IMAGE} AS admin-ui-build
-
 WORKDIR /admin-ui
-
 RUN corepack enable
+COPY admin-ui/package.json admin-ui/pnpm-lock.yaml admin-ui/tsconfig.json admin-ui/vite.config.ts admin-ui/index.html ./
+COPY admin-ui/src ./src
+RUN pnpm install --frozen-lockfile && pnpm build
 
-COPY admin-ui/package.json admin-ui/pnpm-lock.yaml admin-ui/tsconfig.json admin-ui/vite.config.ts admin-ui/index.html /admin-ui/
-COPY admin-ui/src /admin-ui/src
+FROM ${RUST_IMAGE} AS backend-build
+WORKDIR /build
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src ./src
+COPY migrations ./migrations
+COPY config ./config
+COPY third_party/TeamViewRelay-Protocol ./third_party/TeamViewRelay-Protocol
+COPY --from=admin-ui-build /admin-ui/dist ./admin-ui/dist
+RUN cargo build --locked --release
 
-RUN pnpm install --frozen-lockfile
-RUN pnpm build
-
-FROM ${UV_IMAGE}
-
-ARG BUILD_VERSION
-ENV TEAMVIEWER_BUILD_VERSION=${BUILD_VERSION}
-
+FROM ${DEBIAN_IMAGE}
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-
-COPY pyproject.toml uv.lock README.md /app/
-COPY src /app/src
-COPY --from=admin-ui-build /admin-ui/dist /app/admin-ui/dist
-
-RUN uv sync --frozen --no-dev
-
+COPY --from=backend-build /build/target/release/teamviewrelay-rust /app/teamviewrelay-rust
 EXPOSE 8765
-
-CMD ["uv", "run", "src/main.py"]
+CMD ["/app/teamviewrelay-rust"]

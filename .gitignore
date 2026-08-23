@@ -9,22 +9,17 @@
 *.tar.gz
 *.rar
 
-.venv
 .idea/
 .vscode/
-**/__pycache__
-.pytest_cache/
+.venv/
+**/__pycache__/
+*.pyc
 admin-ui/node_modules/
 admin-ui/dist/
 admin-ui/coverage/
-src/server/proto_generated/teamviewer/v1/*.py
 *.db
 data/
-
-# Docker
-Dockerfile.*
-!Dockerfile.rust
-*.dockerfile
+data-*/
 
 # Rust build output
-rust-backend/target/
+target/

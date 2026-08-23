@@ -45,7 +45,12 @@ describe("buildAdminEventsUrl", () => {
     const url = new URL(
       buildAdminEventsUrl(
         {
-          audit: { ...DEFAULT_AUDIT_FILTERS, actorTypes: ["player", "system"], success: "false" },
+          audit: {
+            ...DEFAULT_AUDIT_FILTERS,
+            actorTypes: ["player", "system"],
+            success: "false",
+            roomCode: "room / 压测",
+          },
           metrics: {
             ...DEFAULT_METRICS_FILTERS,
             roomCode: "room-a",
@@ -62,6 +67,7 @@ describe("buildAdminEventsUrl", () => {
 
     expect(url.searchParams.getAll("auditActorTypes")).toEqual(["player", "system"]);
     expect(url.searchParams.get("auditSuccess")).toBe("false");
+    expect(url.searchParams.get("auditRoomCode")).toBe("room / 压测");
     expect(url.searchParams.get("dailyRoomCode")).toBe("room-a");
     expect(url.searchParams.get("dailyDays")).toBe("14");
     expect(url.searchParams.get("dailyStartDate")).toBe("2026-04-01");

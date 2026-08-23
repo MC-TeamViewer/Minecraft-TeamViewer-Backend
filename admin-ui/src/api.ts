@@ -15,15 +15,19 @@ import type {
   TrafficHistoryPayload,
   RuntimeStateKind,
   RuntimeStatePayload,
+  RoomDataMaintenancePayload,
+  RoomDataPurgeResponse,
   TabHistoryRecord,
 } from "@/types";
 
 export class ApiError extends Error {
   status: number;
+  detail: string | null;
 
-  constructor(status: number, message?: string) {
-    super(message ?? `request_failed:${status}`);
+  constructor(status: number, detail?: string | null) {
+    super(detail ?? `request_failed:${status}`);
     this.status = status;
+    this.detail = detail ?? null;
   }
 }
 
@@ -69,7 +73,14 @@ async function requestJson<T>(
   });
 
   if (!response.ok) {
-    throw new ApiError(response.status);
+    let detail: string | null = null;
+    try {
+      const payload = await response.json() as { detail?: unknown };
+      detail = typeof payload.detail === "string" ? payload.detail : null;
+    } catch (_error) {
+      // Keep the status-only fallback for non-JSON error responses.
+    }
+    throw new ApiError(response.status, detail);
   }
 
   return response.json() as Promise<T>;
@@ -141,7 +152,19 @@ export function fetchAudit(filters: AuditFilters, limit = 100): Promise<AuditPay
       eventType: filters.eventType,
       actorTypes: filters.actorTypes,
       success: filters.success,
+      roomCode: filters.roomCode,
     },
+  });
+}
+
+export function fetchRoomDataMaintenance(): Promise<RoomDataMaintenancePayload> {
+  return requestJson<RoomDataMaintenancePayload>("/admin/api/maintenance/room-data");
+}
+
+export function purgeRoomData(roomCode: string, confirmation: string): Promise<RoomDataPurgeResponse> {
+  return requestJson<RoomDataPurgeResponse>("/admin/api/maintenance/room-data", {
+    method: "DELETE",
+    body: { roomCode, confirmation },
   });
 }
 

@@ -1,27 +1,13 @@
 [project]
-name = "team-view-relay-web-server"
-version = "0.5.14"
-description = "一个用于共享团队视野的服务端网页代码"
-readme = "README.md"
+name = "teamviewrelay-load-tools"
+version = "1.0.1"
+description = "Black-box load testing tools for TeamViewRelay"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.129.0",
-    "httpx[http2,socks]>=0.28.1",
-    "msgpack>=1.0.0",
-    "protobuf>=7.34.1",
-    "uvicorn[standard]>=0.40.0",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
-    "pytest-cov>=4.1.0",
-]
-test = [
+    "grpcio-tools>=1.76.0",
+    "protobuf>=6.33.0",
     "websockets>=12.0",
 ]
 
-[[tool.uv.index]]
-name = "aliyun"
-url = "https://mirrors.aliyun.com/pypi/simple/"
+[tool.uv]
+package = false

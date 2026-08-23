@@ -20,18 +20,74 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
 import websockets
+from google.protobuf.json_format import MessageToDict
+from grpc_tools import protoc
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+PROTO_ROOT = ROOT / "third_party/TeamViewRelay-Protocol/proto"
+PROTO_FILE = PROTO_ROOT / "teamviewer/v1/teamviewer.proto"
+_PROTO_BUILD = TemporaryDirectory(prefix="teamviewrelay-load-proto-")
 
-from server.core.codec import ProtobufMessageCodec  # noqa: E402
-from server.proto_generated.teamviewer.v1 import teamviewer_pb2  # noqa: E402
+if not PROTO_FILE.is_file():
+    raise RuntimeError(
+        "共享协议 submodule 未初始化；请先执行 "
+        "git submodule update --init --recursive"
+    )
+
+protoc_status = protoc.main(
+    [
+        "grpc_tools.protoc",
+        f"-I{PROTO_ROOT}",
+        f"--python_out={_PROTO_BUILD.name}",
+        str(PROTO_FILE),
+    ]
+)
+if protoc_status != 0:
+    raise RuntimeError(f"生成压测协议 binding 失败，protoc exit={protoc_status}")
+
+sys.path.insert(0, _PROTO_BUILD.name)
+from teamviewer.v1 import teamviewer_pb2  # noqa: E402
+
+
+class ProtobufMessageCodec:
+    """Load-test-only decoder for the response payloads inspected below."""
+
+    @staticmethod
+    def decode(raw: bytes) -> dict:
+        if not isinstance(raw, bytes):
+            raise TypeError("expected a binary Protobuf WebSocket frame")
+        envelope = teamviewer_pb2.WireEnvelope()
+        envelope.ParseFromString(raw)
+        payload_name = envelope.WhichOneof("payload")
+        if payload_name is None:
+            return {"type": "unknown"}
+
+        payload = MessageToDict(getattr(envelope, payload_name))
+        payload["type"] = payload_name
+        if payload_name == "patch":
+            ProtobufMessageCodec._normalize_player_patch(payload)
+        return payload
+
+    @staticmethod
+    def _normalize_player_patch(payload: dict) -> None:
+        players = payload.get("players")
+        if not isinstance(players, dict):
+            return
+        normalized = {}
+        for item in players.get("upsert", []):
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            delta = dict(item.get("data") or {})
+            for field_name in item.get("clearFields", []):
+                delta[field_name] = None
+            normalized[item["id"]] = delta
+        players["upsert"] = normalized
+
 
 CODEC = ProtobufMessageCodec()
 PROTOCOL_VERSION = "0.7.0"

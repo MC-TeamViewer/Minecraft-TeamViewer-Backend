@@ -92,6 +92,7 @@ export interface AuditPayload {
   nextBeforeId: number | null;
   limit: number;
   availableEventTypes: string[];
+  availableRooms?: string[];
   serverTime?: number;
 }
 
@@ -257,6 +258,36 @@ export interface AuditFilters {
   eventType: string;
   actorTypes: string[];
   success: "" | "true" | "false";
+  roomCode: string;
+}
+
+export interface RoomDataSummary {
+  roomCode: string;
+  activeConnections: number;
+  auditEvents: number;
+  dailyActivity: number;
+  hourlyActivity: number;
+  tabHistoryEntries: number;
+  tabHistoryDeltas: number;
+  tabHistoryRevisions: number;
+  tabHistoryHeads: number;
+  lastSeenRecords: number;
+  identityMappings: number;
+  totalRemovable: number;
+}
+
+export interface RoomDataMaintenancePayload {
+  items: RoomDataSummary[];
+  trafficDataRetained: boolean;
+  warning: string;
+  serverTime?: number;
+}
+
+export interface RoomDataPurgeResponse {
+  ok: boolean;
+  roomCode: string;
+  deleted: Record<string, number>;
+  trafficDataRetained: boolean;
 }
 
 export interface MetricsFilters {
@@ -296,6 +327,7 @@ export const DEFAULT_AUDIT_FILTERS: AuditFilters = {
   eventType: "",
   actorTypes: ["player", "external_source", "web_map", "system", "admin"],
   success: "",
+  roomCode: "",
 };
 
 export const DEFAULT_METRICS_FILTERS: MetricsFilters = {

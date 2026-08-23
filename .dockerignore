@@ -1,14 +1,13 @@
 .git
-.venv
 .idea
 .vscode
-.pytest_cache
-.coverage
+.venv
 **/__pycache__
+*.pyc
 *.log
 *.db
 data
 data-*
 admin-ui/node_modules
 admin-ui/dist
-rust-backend/target
+target
