@@ -4,6 +4,7 @@ pub mod metrics;
 pub mod proto;
 pub mod protocol_compat;
 pub mod proxy_ip;
+pub mod relationship_store;
 pub mod relay;
 pub mod tab_history;
 pub mod transport;

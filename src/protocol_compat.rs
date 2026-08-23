@@ -3,7 +3,7 @@ use std::{fmt, str::FromStr, sync::Arc};
 use crate::proto::teamviewer::v1::{PlayerReportBundle, SnapshotFull};
 use serde_json::{Map, Value, json};
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 7, 1);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 8, 0);
 pub const MINIMUM_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 6, 1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -65,10 +65,11 @@ pub enum ProtocolEpoch {
     V0_6_5,
     V0_7_0,
     V0_7_1,
+    V0_8_0,
 }
 
 impl ProtocolEpoch {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::V0_6_1,
         Self::V0_6_2,
         Self::V0_6_3,
@@ -76,6 +77,7 @@ impl ProtocolEpoch {
         Self::V0_6_5,
         Self::V0_7_0,
         Self::V0_7_1,
+        Self::V0_8_0,
     ];
 
     pub const fn version(self) -> ProtocolVersion {
@@ -87,6 +89,7 @@ impl ProtocolEpoch {
             Self::V0_6_5 => ProtocolVersion::new(0, 6, 5),
             Self::V0_7_0 => ProtocolVersion::new(0, 7, 0),
             Self::V0_7_1 => ProtocolVersion::new(0, 7, 1),
+            Self::V0_8_0 => ProtocolVersion::new(0, 8, 0),
         }
     }
 
@@ -266,6 +269,10 @@ impl ProtocolProfile {
 
     pub fn uses_structured_battle_chunk_digest(self) -> bool {
         self.negotiated >= ProtocolVersion::new(0, 7, 1)
+    }
+
+    pub fn supports_relationships(self) -> bool {
+        self.negotiated >= ProtocolVersion::new(0, 8, 0)
     }
 }
 
@@ -487,14 +494,14 @@ mod tests {
 
     #[test]
     fn negotiates_both_ends_of_the_compatibility_interval() {
-        let future = ProtocolProfile::negotiate("0.8.0", "0.7.1").expect("overlap");
+        let future = ProtocolProfile::negotiate("0.9.0", "0.7.1").expect("overlap");
         assert_eq!(future.negotiated(), CURRENT_PROTOCOL_VERSION);
         assert_eq!(
             ProtocolProfile::negotiate("0.6.0", "0.6.0"),
             Err(NegotiationError::ClientProtocolTooOld)
         );
         assert_eq!(
-            ProtocolProfile::negotiate("0.8.0", "0.8.0"),
+            ProtocolProfile::negotiate("0.9.0", "0.9.0"),
             Err(NegotiationError::ServerProtocolTooOld)
         );
         assert_eq!(
@@ -513,6 +520,7 @@ mod tests {
             ("0.6.5", ProtocolEpoch::V0_6_5, 2),
             ("0.7.0", ProtocolEpoch::V0_7_0, 1),
             ("0.7.1", ProtocolEpoch::V0_7_1, 0),
+            ("0.8.0", ProtocolEpoch::V0_8_0, 0),
         ] {
             let profile = ProtocolProfile::negotiate(version, "0.6.1").expect("supported");
             assert_eq!(profile.epoch(), epoch);

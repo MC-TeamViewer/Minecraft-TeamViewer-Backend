@@ -39,7 +39,7 @@ curl --fail http://127.0.0.1:8765/health
 
 ## 协议兼容矩阵
 
-服务端当前协议为 `0.7.1`，最低支持 `0.6.1`。握手要求客户端和服务端声明的
+服务端当前协议为 `0.8.0`，最低支持 `0.6.1`。握手要求客户端和服务端声明的
 `[minimum_compatible_network_protocol_version, network_protocol_version]` 区间相交；实际功能按双方都支持的最高版本选择。
 
 兼容策略集中在 `src/protocol_compat.rs`，领域状态始终使用当前模型，只有连接边界上的 handshake、snapshot、patch、digest
@@ -53,7 +53,8 @@ curl --fail http://127.0.0.1:8765/health
 | `0.6.4` | 4 | 来源元数据、clear-fields、Tab History、legacy digest |
 | `0.6.5` | 2 | Tab History、legacy digest |
 | `0.7.0` | 1 | legacy battle chunk digest |
-| `0.7.1` | 0 | 当前合同，无兼容投影 |
+| `0.7.1` | 0 | 保留实时状态、Tab 历史，不开放关系查询 |
+| `0.8.0` | 0 | 当前合同，支持外部目录和关系查询 |
 
 以后升级协议时，必须同时：新增或更新 epoch 能力、为真实投影登记稳定规则 ID、补边界与摘要向量测试，并确认管理后台能枚举新规则。
 提高最低兼容版本时，应在同一提交中删除已不可触发的 epoch、规则和测试。
@@ -69,7 +70,7 @@ docker build -t teamviewrelay-backend:local .
 已发布镜像：
 
 ```text
-professornuo/teamviewrelay-rust:v1.0.4-proto0.7.1
+professornuo/teamviewrelay-rust:v1.1.0-proto0.8.0
 ```
 
 `docker-compose.yml` 默认使用该版本，并将 SQLite 数据目录挂载到宿主机的 `./data-rust`。
@@ -153,18 +154,18 @@ Vite 会把管理 API、SSE 和管理页请求代理到 `127.0.0.1:8765`。
 git submodule update --init --recursive
 
 uv run python scripts/load_test_live.py \
-  --url http://36.150.231.125:2052/mc \
+  --url http://192.0.2.10:2052/mc \
   --stages 10,20,40 \
   --stage-duration 300 \
   --report-hz 10 \
   --allow-remote \
-  --expected-build team-view-relay-rust-v1.0.4-proto0.7.1
+  --expected-build team-view-relay-rust-v1.1.0-proto0.8.0
 ```
 
 `--expected-build` 必须与目标 `/health` 返回的 `buildVersion` 完全一致，而不是 Docker tag。可先检查：
 
 ```bash
-curl http://36.150.231.125:2052/mc/health
+curl http://192.0.2.10:2052/mc/health
 ```
 
 默认压测房间为 `load-benchmark-v3`，脚本拒绝使用 `default` 房间。每档用户数会创建等量的 Mod 上报端和 Web 消费端，外加一个全局上报源，所以 `10,20,40` 分别对应 21、41、81 条 WebSocket 连接。

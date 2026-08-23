@@ -59,6 +59,7 @@ impl TabHistoryStore {
                 last_observed_at INTEGER NOT NULL,
                 revision INTEGER NOT NULL,
                 etag_sha256 BLOB NOT NULL,
+                source_priority INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (room_code, player_uuid)
             )"#,
             r#"CREATE TABLE IF NOT EXISTS tab_history_deltas (
@@ -84,6 +85,11 @@ impl TabHistoryStore {
         ] {
             sqlx::query(statement).execute(&self.db).await?;
         }
+        let _ = sqlx::query(
+            "ALTER TABLE tab_history_entries ADD COLUMN source_priority INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.db)
+        .await;
         Ok(())
     }
 
@@ -96,6 +102,27 @@ impl TabHistoryStore {
         room: &str,
         players: &[TabPlayerEntry],
         observed_at_ms: i64,
+    ) -> anyhow::Result<bool> {
+        self.upsert_players_with_priority(room, players, observed_at_ms, 0)
+            .await
+    }
+
+    pub async fn upsert_authoritative_players(
+        &self,
+        room: &str,
+        players: &[TabPlayerEntry],
+        observed_at_ms: i64,
+    ) -> anyhow::Result<bool> {
+        self.upsert_players_with_priority(room, players, observed_at_ms, 100)
+            .await
+    }
+
+    async fn upsert_players_with_priority(
+        &self,
+        room: &str,
+        players: &[TabPlayerEntry],
+        observed_at_ms: i64,
+        source_priority: i64,
     ) -> anyhow::Result<bool> {
         let mut normalized = BTreeMap::new();
         for player in players {
@@ -123,13 +150,16 @@ impl TabHistoryStore {
 
         for (player_uuid, player) in normalized {
             let row = sqlx::query(
-                "SELECT player_json, label_signature, label_first_observed_at, last_observed_at FROM tab_history_entries WHERE room_code = ? AND player_uuid = ?",
+                "SELECT player_json, label_signature, label_first_observed_at, last_observed_at, source_priority FROM tab_history_entries WHERE room_code = ? AND player_uuid = ?",
             )
             .bind(room)
             .bind(&player_uuid)
             .fetch_optional(&mut *transaction)
             .await?;
             if let Some(row) = &row {
+                if row.get::<i64, _>("source_priority") > source_priority {
+                    continue;
+                }
                 let persisted = player_from_json(&row.get::<String, _>("player_json"))?;
                 if display_label_quality(&player) < display_label_quality(&persisted) {
                     continue;
@@ -165,7 +195,8 @@ impl TabHistoryStore {
                 r#"INSERT INTO tab_history_entries (
                     room_code, player_uuid, normalized_name, player_json, label_signature,
                     label_first_observed_at, last_observed_at, revision, etag_sha256
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    , source_priority
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(room_code, player_uuid) DO UPDATE SET
                     normalized_name = excluded.normalized_name,
                     player_json = excluded.player_json,
@@ -173,7 +204,8 @@ impl TabHistoryStore {
                     label_first_observed_at = excluded.label_first_observed_at,
                     last_observed_at = excluded.last_observed_at,
                     revision = excluded.revision,
-                    etag_sha256 = excluded.etag_sha256"#,
+                    etag_sha256 = excluded.etag_sha256,
+                    source_priority = excluded.source_priority"#,
             )
             .bind(room)
             .bind(&player_uuid)
@@ -184,6 +216,7 @@ impl TabHistoryStore {
             .bind(observed_at_ms)
             .bind(revision)
             .bind(etag)
+            .bind(source_priority)
             .execute(&mut *transaction)
             .await?;
             sqlx::query(
@@ -895,6 +928,57 @@ mod tests {
         assert_eq!(
             canonical_json(&player_to_value(&player)).expect("json"),
             r#"{"name":"Alice","prefixedName":"[A]","scoreboardPrefix":"[A]","uuid":"00000000-0000-0000-0000-000000000001"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_directory_label_cannot_be_overwritten_by_normal_tab() {
+        let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let store = TabHistoryStore::new(db);
+        store.initialize().await.unwrap();
+        let uuid = "00000000-0000-0000-0000-000000000001";
+        let ordinary = TabPlayerEntry {
+            uuid: Some(uuid.to_owned()),
+            name: Some("Alice".to_owned()),
+            display_name: Some("[Wrong] Alice".to_owned()),
+            ..Default::default()
+        };
+        let official = TabPlayerEntry {
+            uuid: Some(uuid.to_owned()),
+            name: Some("Alice".to_owned()),
+            display_name: Some("[Official] Alice".to_owned()),
+            scoreboard_prefix: Some("[Official]".to_owned()),
+            ..Default::default()
+        };
+        store
+            .upsert_players("room", std::slice::from_ref(&ordinary), 1_000)
+            .await
+            .unwrap();
+        store
+            .upsert_authoritative_players("room", &[official], 2_000)
+            .await
+            .unwrap();
+        store
+            .upsert_players("room", &[ordinary], 3_000)
+            .await
+            .unwrap();
+        let (_, results) = store
+            .lookup(
+                "room",
+                &[TabHistoryLookupSelector {
+                    selector: Some(tab_history_lookup_selector::Selector::Uuid(uuid.to_owned())),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            results[0].entries[0]
+                .player
+                .as_ref()
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("[Official] Alice")
         );
     }
 }

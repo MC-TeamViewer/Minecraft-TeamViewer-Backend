@@ -931,8 +931,10 @@ async fn removable_identity_count(db: &sqlx::SqlitePool, room: &str) -> anyhow::
         r#"SELECT actor_id FROM audit_events WHERE room_code = ? AND actor_id IS NOT NULL
            UNION SELECT player_id FROM daily_player_activity WHERE room_code = ?
            UNION SELECT player_id FROM hourly_player_activity WHERE room_code = ?
-           UNION SELECT player_uuid FROM tab_history_entries WHERE room_code = ?"#,
+           UNION SELECT player_uuid FROM tab_history_entries WHERE room_code = ?
+           UNION SELECT player_id FROM relationship_players WHERE realm_id = ?"#,
     )
+    .bind(room)
     .bind(room)
     .bind(room)
     .bind(room)
@@ -1050,6 +1052,23 @@ async fn delete_room_data_gated(state: &AppState, session: &Value, room: &str) -
         ("tabHistoryHeads", "tab_history_heads"),
     ] {
         let sql = format!("DELETE FROM {table} WHERE room_code = ?");
+        let result = match sqlx::query(&sql)
+            .bind(room)
+            .execute(&mut *transaction)
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        deleted.insert(key.to_owned(), json!(result.rows_affected()));
+    }
+    for (key, table) in [
+        ("relationshipPlayers", "relationship_players"),
+        ("relationshipAffiliations", "relationship_affiliations"),
+        ("relationshipEdges", "relationship_edges"),
+        ("relationshipDatasets", "relationship_datasets"),
+    ] {
+        let sql = format!("DELETE FROM {table} WHERE realm_id = ?");
         let result = match sqlx::query(&sql)
             .bind(room)
             .execute(&mut *transaction)
@@ -1866,11 +1885,19 @@ mod tests {
         sqlx::migrate!().run(&db).await.expect("migrations");
         let tab_history = Arc::new(TabHistoryStore::new(db.clone()));
         tab_history.initialize().await.expect("tab history schema");
+        let relationships = Arc::new(crate::relationship_store::RelationshipStore::new(
+            db.clone(),
+        ));
+        relationships
+            .initialize()
+            .await
+            .expect("relationship schema");
         let config = Arc::new(RuntimeConfig::load());
         let state = AppState {
             relay: RelayHandle::spawn(config.clone()),
             db: db.clone(),
             tab_history: tab_history.clone(),
+            relationships,
             config,
             metrics: Arc::new(Metrics::default()),
             maintenance_rooms: Arc::new(tokio::sync::RwLock::new(HashSet::new())),

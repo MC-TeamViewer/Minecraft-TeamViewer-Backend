@@ -89,6 +89,10 @@ pub enum RelayEvent {
         room: String,
         head: TabHistoryHead,
     },
+    ReportPolicyUpdate {
+        room: String,
+        policy: crate::proto::teamviewer::v1::PlayerReportPolicy,
+    },
     Snapshot {
         room: Option<String>,
         reply: oneshot::Sender<Value>,
@@ -472,6 +476,23 @@ impl Relay {
                         player.clone()
                     };
                     let _ = connection.control.try_send(bytes);
+                }
+            }
+            RelayEvent::ReportPolicyUpdate { room, policy } => {
+                let bytes = encode_payload(
+                    WireChannel::Player,
+                    wire_envelope::Payload::PlayerReportPolicyUpdate(
+                        crate::proto::teamviewer::v1::PlayerReportPolicyUpdate {
+                            policy: Some(policy),
+                        },
+                    ),
+                );
+                for connection in self.connections.values().filter(|connection| {
+                    connection.room == room
+                        && connection.kind == ConnectionKind::Player
+                        && connection.protocol.supports_relationships()
+                }) {
+                    let _ = connection.control.try_send(bytes.clone());
                 }
             }
             RelayEvent::Snapshot { room, reply } => {
@@ -2550,7 +2571,7 @@ fn apply_battle_observation(
     };
     let mode = match report.mode.as_deref().map(str::trim) {
         Some("simmc") => "simmc",
-        _ => "nodemc",
+        _ => "generic",
     };
     let candidates: Vec<_> = report
         .candidates

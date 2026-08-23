@@ -5,6 +5,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use teamviewrelay_rust::{
     config::RuntimeConfig,
     metrics::{Direction, Layer, Metrics, TrafficChannel, TrafficIncrement},
+    relationship_store::RelationshipStore,
     relay::RelayHandle,
     tab_history::TabHistoryStore,
     transport::{CountingListener, TransportConnectInfo},
@@ -40,12 +41,15 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(RuntimeConfig::load());
     let tab_history = Arc::new(TabHistoryStore::new(db.clone()));
     tab_history.initialize().await?;
+    let relationships = Arc::new(RelationshipStore::new(db.clone()));
+    relationships.initialize().await?;
     let metrics = Arc::new(Metrics::default());
     tokio::spawn(flush_traffic_loop(db.clone(), metrics.clone()));
     let state = AppState {
         relay: RelayHandle::spawn(config.clone()),
         db,
         tab_history,
+        relationships,
         config,
         metrics,
         maintenance_rooms: Arc::new(tokio::sync::RwLock::new(HashSet::new())),

@@ -33,14 +33,16 @@ use crate::{
     config::RuntimeConfig,
     metrics::{Direction, Layer, Metrics, TrafficChannel, protobuf_message_type},
     proto::teamviewer::v1::{
-        ClientRole, HandshakeAck, Pong, TabHistoryCapabilities, TabHistoryDigest,
-        TabHistoryErrorCode, TabHistoryLookupChunk, TabHistorySyncChunk, TabHistorySyncMode,
-        WireChannel, WireEnvelope, wire_envelope,
+        ClientRole, ExternalDatasetPublishAck, HandshakeAck, PlayerDirectoryLookupChunk,
+        PlayerDirectoryLookupResult, PlayerRelationQueryChunk, Pong, RelationshipQueryCapabilities,
+        TabHistoryCapabilities, TabHistoryDigest, TabHistoryErrorCode, TabHistoryLookupChunk,
+        TabHistorySyncChunk, TabHistorySyncMode, WireChannel, WireEnvelope, wire_envelope,
     },
     protocol_compat::{
         CURRENT_PROTOCOL_VERSION, MINIMUM_PROTOCOL_VERSION, ProtocolProfile, sanitize_player_report,
     },
     proxy_ip::effective_remote_addr,
+    relationship_store::RelationshipStore,
     relay::{
         CONTROL_CAPACITY, ConnectionKind, RegisterConnection, RelayEvent, RelayHandle, StateFrame,
         encode_payload,
@@ -55,7 +57,7 @@ use crate::{
 const PROGRAM_VERSION: &str = concat!(
     "team-view-relay-rust-v",
     env!("CARGO_PKG_VERSION"),
-    "-proto0.7.1"
+    "-proto0.8.0"
 );
 
 #[derive(Clone)]
@@ -63,6 +65,7 @@ pub struct AppState {
     pub relay: RelayHandle,
     pub db: SqlitePool,
     pub tab_history: Arc<TabHistoryStore>,
+    pub relationships: Arc<crate::relationship_store::RelationshipStore>,
     pub config: Arc<RuntimeConfig>,
     pub metrics: Arc<Metrics>,
     pub maintenance_rooms: Arc<RwLock<HashSet<String>>>,
@@ -248,78 +251,103 @@ async fn serve_socket(
         }
     };
 
-    let (id, room, profile, kind, channel, display_name, position_resolution, program_version) =
-        match (route_kind, envelope.payload) {
-            (
-                ConnectionKind::Player,
-                Some(wire_envelope::Payload::PlayerHandshakeRequest(handshake)),
-            ) => {
-                if handshake.submit_player_id.is_empty() {
-                    reject(&mut socket, WireChannel::Player, "invalid_submit_player_id").await;
-                    return;
-                }
-                let profile = match ProtocolProfile::negotiate(
-                    &handshake.network_protocol_version,
-                    &handshake.minimum_compatible_network_protocol_version,
-                ) {
-                    Ok(profile) => profile,
-                    Err(error) => {
-                        reject(&mut socket, WireChannel::Player, error.reason()).await;
-                        return;
-                    }
-                };
-                let role = if profile.supports_external_source_role()
-                    && matches!(
-                        handshake
-                            .client_role
-                            .and_then(|value| ClientRole::try_from(value).ok()),
-                        Some(ClientRole::ExternalSource)
-                    ) {
-                    ConnectionKind::ExternalSource
-                } else {
-                    ConnectionKind::Player
-                };
-                (
-                    handshake.submit_player_id,
-                    normalize_room(handshake.room_code.as_deref()),
-                    profile,
-                    role,
-                    WireChannel::Player,
-                    handshake.client_display_name,
-                    handshake.position_resolution,
-                    handshake.local_program_version,
-                )
-            }
-            (
-                ConnectionKind::WebMap,
-                Some(wire_envelope::Payload::WebMapHandshakeRequest(handshake)),
-            ) => {
-                let profile = match ProtocolProfile::negotiate(
-                    &handshake.network_protocol_version,
-                    &handshake.minimum_compatible_network_protocol_version,
-                ) {
-                    Ok(profile) => profile,
-                    Err(error) => {
-                        reject(&mut socket, WireChannel::WebMap, error.reason()).await;
-                        return;
-                    }
-                };
-                (
-                    format!("web-map-{}", Uuid::new_v4()),
-                    normalize_room(handshake.room_code.as_deref()),
-                    profile,
-                    ConnectionKind::WebMap,
-                    WireChannel::WebMap,
-                    Some("Web Map".to_owned()),
-                    None,
-                    handshake.local_program_version,
-                )
-            }
-            _ => {
-                reject(&mut socket, channel_for(route_kind), "channel_mismatch").await;
+    let (
+        id,
+        room,
+        profile,
+        kind,
+        channel,
+        display_name,
+        position_resolution,
+        program_version,
+        complete_online_roster,
+    ) = match (route_kind, envelope.payload) {
+        (
+            ConnectionKind::Player,
+            Some(wire_envelope::Payload::PlayerHandshakeRequest(handshake)),
+        ) => {
+            if handshake.submit_player_id.is_empty() {
+                reject(&mut socket, WireChannel::Player, "invalid_submit_player_id").await;
                 return;
             }
-        };
+            let profile = match ProtocolProfile::negotiate(
+                &handshake.network_protocol_version,
+                &handshake.minimum_compatible_network_protocol_version,
+            ) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    reject(&mut socket, WireChannel::Player, error.reason()).await;
+                    return;
+                }
+            };
+            let role = if profile.supports_external_source_role()
+                && matches!(
+                    handshake
+                        .client_role
+                        .and_then(|value| ClientRole::try_from(value).ok()),
+                    Some(ClientRole::ExternalSource)
+                ) {
+                ConnectionKind::ExternalSource
+            } else {
+                ConnectionKind::Player
+            };
+            let complete_online_roster = role == ConnectionKind::ExternalSource
+                && handshake
+                    .external_source_capabilities
+                    .as_ref()
+                    .is_some_and(|caps| {
+                        caps.datasets.iter().any(|dataset| {
+                            dataset.coverage
+                                == crate::proto::teamviewer::v1::DatasetCoverage::Complete as i32
+                                && dataset.scopes.contains(
+                                    &(crate::proto::teamviewer::v1::ExternalDataScope::OnlineRoster
+                                        as i32),
+                                )
+                        })
+                    });
+            (
+                handshake.submit_player_id,
+                normalize_room(handshake.room_code.as_deref()),
+                profile,
+                role,
+                WireChannel::Player,
+                handshake.client_display_name,
+                handshake.position_resolution,
+                handshake.local_program_version,
+                complete_online_roster,
+            )
+        }
+        (
+            ConnectionKind::WebMap,
+            Some(wire_envelope::Payload::WebMapHandshakeRequest(handshake)),
+        ) => {
+            let profile = match ProtocolProfile::negotiate(
+                &handshake.network_protocol_version,
+                &handshake.minimum_compatible_network_protocol_version,
+            ) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    reject(&mut socket, WireChannel::WebMap, error.reason()).await;
+                    return;
+                }
+            };
+            (
+                format!("web-map-{}", Uuid::new_v4()),
+                normalize_room(handshake.room_code.as_deref()),
+                profile,
+                ConnectionKind::WebMap,
+                WireChannel::WebMap,
+                Some("Web Map".to_owned()),
+                None,
+                handshake.local_program_version,
+                false,
+            )
+        }
+        _ => {
+            reject(&mut socket, channel_for(route_kind), "channel_mismatch").await;
+            return;
+        }
+    };
 
     let accepted_role = match kind {
         ConnectionKind::ExternalSource => ClientRole::ExternalSource,
@@ -364,6 +392,19 @@ async fn serve_socket(
         tab_history: profile
             .supports_tab_history()
             .then(|| tab_capabilities(&state.config)),
+        relationship_query: profile.supports_relationships().then_some(
+            RelationshipQueryCapabilities {
+                supported: true,
+                max_selectors: 256,
+                default_chunk_entries: 256,
+                max_chunk_entries: 256,
+                max_chunk_bytes: 256 * 1024,
+                relation_kinds: vec![1, 2, 3, 4, 5],
+            },
+        ),
+        report_policy: profile
+            .supports_relationships()
+            .then(|| report_policy(false)),
         ..Default::default()
     };
     let ack = encode_payload(channel, wire_envelope::Payload::HandshakeAck(ack));
@@ -434,10 +475,13 @@ async fn serve_socket(
             control: control_tx,
             events: event_tx.clone(),
             channel,
+            kind,
             tab_history: state.tab_history.clone(),
+            relationships: state.relationships.clone(),
             metrics: state.metrics.clone(),
             traffic_channel,
             profile,
+            complete_online_roster,
         },
     ));
     let last_wire_ingress = Arc::new(AtomicU64::new(0));
@@ -562,10 +606,13 @@ struct ReaderContext {
     control: mpsc::Sender<Arc<[u8]>>,
     events: mpsc::Sender<RelayEvent>,
     channel: WireChannel,
+    kind: ConnectionKind,
     tab_history: Arc<TabHistoryStore>,
+    relationships: Arc<RelationshipStore>,
     metrics: Arc<Metrics>,
     traffic_channel: TrafficChannel,
     profile: ProtocolProfile,
+    complete_online_roster: bool,
 }
 
 async fn reader_loop(
@@ -578,10 +625,13 @@ async fn reader_loop(
         control,
         events,
         channel,
+        kind,
         tab_history,
+        relationships,
         metrics,
         traffic_channel,
         profile,
+        complete_online_roster,
     } = context;
     while let Some(frame) = stream.next().await {
         if frame.opcode() != OpCode::Binary {
@@ -604,6 +654,19 @@ async fn reader_loop(
                 if report.submit_player_id == id =>
             {
                 sanitize_player_report(profile, &mut report);
+                if kind == ConnectionKind::ExternalSource
+                    && complete_online_roster
+                    && let Some(status) = &report.external_source_status
+                {
+                    let healthy = status.health
+                        == crate::proto::teamviewer::v1::ExternalSourceHealth::Healthy as i32;
+                    let _ = events
+                        .send(RelayEvent::ReportPolicyUpdate {
+                            room: room.clone(),
+                            policy: report_policy(healthy),
+                        })
+                        .await;
+                }
                 let tab_players = report
                     .tab_players_replace
                     .as_ref()
@@ -725,6 +788,184 @@ async fn reader_loop(
                 };
                 if result.is_err() {
                     break;
+                }
+            }
+            Some(wire_envelope::Payload::ExternalDatasetPublish(publish))
+                if kind == ConnectionKind::ExternalSource =>
+            {
+                if !profile.supports_relationships() {
+                    continue;
+                }
+                let Some(descriptor) = publish.descriptor.clone() else {
+                    continue;
+                };
+                if descriptor.realm_id != room {
+                    continue;
+                }
+                let mut accepted = false;
+                let mut error_detail = None;
+                match publish.update {
+                    Some(crate::proto::teamviewer::v1::external_dataset_publish::Update::Status(status)) => {
+                        let health = status.health;
+                        if let Err(error) = relationships.set_health(&descriptor, health, unix_millis()).await {
+                            error_detail = Some(error.to_string());
+                        } else {
+                            accepted = true;
+                        }
+                    }
+                    Some(crate::proto::teamviewer::v1::external_dataset_publish::Update::RelationshipSnapshotChunk(chunk)) => {
+                        if chunk.head.is_some() {
+                            let compatibility_tabs = chunk.players.iter().filter_map(|player| player.compatibility_tab_entry.clone()).collect::<Vec<_>>();
+                            if let Err(error) = relationships.upsert_chunk(&descriptor, &chunk, unix_millis()).await {
+                                error_detail = Some(error.to_string());
+                            } else {
+                                accepted = true;
+                                if !compatibility_tabs.is_empty()
+                                    && matches!(tab_history.upsert_authoritative_players(&room, &compatibility_tabs, unix_millis()).await, Ok(true))
+                                    && let Ok(head) = tab_history.head(&room).await
+                                {
+                                    let _ = events.send(RelayEvent::TabHistoryChanged { room: room.clone(), head }).await;
+                                }
+                            }
+                        }
+                    }
+                    _ => error_detail = Some("missing_dataset_update".to_owned()),
+                }
+                let ack = ExternalDatasetPublishAck {
+                    request_id: publish.request_id,
+                    dataset_id: descriptor.dataset_id,
+                    accepted,
+                    accepted_revision: None,
+                    error_code: (!accepted).then_some(
+                        crate::proto::teamviewer::v1::ExternalDatasetPublishErrorCode::Internal
+                            as i32,
+                    ),
+                    error_detail,
+                };
+                if control
+                    .send(encode_payload(
+                        channel,
+                        wire_envelope::Payload::ExternalDatasetPublishAck(ack),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Some(wire_envelope::Payload::PlayerDirectoryLookupRequest(request))
+                if profile.supports_relationships() =>
+            {
+                if request.selectors.len() > 256 {
+                    continue;
+                }
+                let entries = relationships
+                    .lookup(
+                        &room,
+                        request.dataset_id.as_deref(),
+                        &request.selectors,
+                        unix_millis(),
+                    )
+                    .await
+                    .unwrap_or_default();
+                let results = entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, entries)| PlayerDirectoryLookupResult {
+                        selector_index: index as u32,
+                        entries,
+                        error_code: None,
+                    })
+                    .collect::<Vec<_>>();
+                let limit = request.max_chunk_entries.unwrap_or(256).clamp(1, 256) as usize;
+                let chunk_count = results.len().max(1).div_ceil(limit) as u32;
+                for index in 0..chunk_count {
+                    let start = index as usize * limit;
+                    let end = (start + limit).min(results.len());
+                    let chunk = PlayerDirectoryLookupChunk {
+                        request_id: request.request_id.clone(),
+                        results: results.get(start..end).unwrap_or_default().to_vec(),
+                        chunk_index: index,
+                        chunk_count,
+                        r#final: index + 1 == chunk_count,
+                        error_code: None,
+                        error_detail: None,
+                    };
+                    if control
+                        .send(encode_payload(
+                            channel,
+                            wire_envelope::Payload::PlayerDirectoryLookupChunk(chunk),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            Some(wire_envelope::Payload::PlayerRelationQueryRequest(request))
+                if profile.supports_relationships() =>
+            {
+                let (subjects, results) = relationships
+                    .relations(
+                        &room,
+                        request.dataset_id.as_deref(),
+                        request.subject.as_ref().unwrap_or(
+                            &crate::proto::teamviewer::v1::PlayerSelector { selector: None },
+                        ),
+                        &request.targets,
+                        unix_millis(),
+                    )
+                    .await
+                    .unwrap_or_default();
+                let limit = request.max_chunk_entries.unwrap_or(256).clamp(1, 256) as usize;
+                let filtered = results
+                    .into_iter()
+                    .filter(|result| {
+                        request.include_relations.is_empty()
+                            || request.include_relations.contains(&result.relation)
+                    })
+                    .collect::<Vec<_>>();
+                let chunk_count = filtered.len().max(1).div_ceil(limit) as u32;
+                for index in 0..chunk_count {
+                    let start = index as usize * limit;
+                    let end = (start + limit).min(filtered.len());
+                    let chunk = PlayerRelationQueryChunk {
+                        request_id: request.request_id.clone(),
+                        subjects: if index == 0 {
+                            subjects.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        results: filtered.get(start..end).unwrap_or_default().to_vec(),
+                        chunk_index: index,
+                        chunk_count,
+                        r#final: index + 1 == chunk_count,
+                        error_code: if subjects.len() > 1 {
+                            Some(
+                                crate::proto::teamviewer::v1::RelationshipQueryErrorCode::Ambiguous
+                                    as i32,
+                            )
+                        } else if subjects.is_empty() {
+                            Some(
+                                crate::proto::teamviewer::v1::RelationshipQueryErrorCode::NotFound
+                                    as i32,
+                            )
+                        } else {
+                            None
+                        },
+                        error_detail: None,
+                    };
+                    if control
+                        .send(encode_payload(
+                            channel,
+                            wire_envelope::Payload::PlayerRelationQueryChunk(chunk),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             }
             Some(wire_envelope::Payload::Ping(_)) => {
@@ -1058,6 +1299,38 @@ fn tab_capabilities(config: &RuntimeConfig) -> TabHistoryCapabilities {
         delta_retention_days: config.tab_history_delta_retention_days,
         max_formatted_text_spans: 64,
         max_formatted_text_utf8_bytes: 4096,
+    }
+}
+
+fn report_policy(suppress_tab: bool) -> crate::proto::teamviewer::v1::PlayerReportPolicy {
+    use crate::proto::teamviewer::v1::{
+        PlayerReportPolicy, ReportRecommendation, ReportRecommendationMode, ReportScope,
+    };
+    PlayerReportPolicy {
+        recommendations: vec![
+            ReportRecommendation {
+                scope: ReportScope::Tab as i32,
+                mode: if suppress_tab {
+                    ReportRecommendationMode::Suppress as i32
+                } else {
+                    ReportRecommendationMode::Report as i32
+                },
+                reason: if suppress_tab {
+                    "healthy complete external online roster is active"
+                } else {
+                    "no healthy complete external online roster is active"
+                }
+                .to_owned(),
+                replacement_dataset_id: suppress_tab.then_some("external-online-roster".to_owned()),
+            },
+            ReportRecommendation {
+                scope: ReportScope::Positions as i32,
+                mode: ReportRecommendationMode::Report as i32,
+                reason: "continue player position reporting".to_owned(),
+                replacement_dataset_id: None,
+            },
+        ],
+        generated_at_utc_ms: unix_millis(),
     }
 }
 
