@@ -11,6 +11,7 @@ export const connectionColumns: ConnectionColumn[] = [
   { prop: "displayName", label: "显示名", minWidth: 180, showOverflowTooltip: true },
   { prop: "roomCode", label: "房间", minWidth: 140, showOverflowTooltip: true },
   { prop: "protocolVersion", label: "协议版本", minWidth: 120, showOverflowTooltip: true },
+  { prop: "compatibilityRuleCount", label: "兼容规则", minWidth: 100, width: 100 },
   { prop: "programVersion", label: "程序版本", minWidth: 220, showOverflowTooltip: true },
   { prop: "remoteAddr", label: "远端地址", minWidth: 180, showOverflowTooltip: true },
   { prop: "actorId", label: "连接 ID", minWidth: 220, showOverflowTooltip: true },

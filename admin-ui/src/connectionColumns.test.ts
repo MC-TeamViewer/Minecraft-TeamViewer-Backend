@@ -10,4 +10,10 @@ describe("connectionColumns", () => {
       new Set(["displayName", "roomCode", "protocolVersion", "programVersion", "remoteAddr", "actorId"]),
     );
   });
+
+  it("shows the active compatibility rule count", () => {
+    expect(connectionColumns).toContainEqual(
+      expect.objectContaining({ prop: "compatibilityRuleCount", label: "兼容规则" }),
+    );
+  });
 });

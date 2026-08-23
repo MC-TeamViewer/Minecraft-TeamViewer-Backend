@@ -22,6 +22,9 @@ const expandedKeys = ref<string[]>([]);
 const trafficByActor = computed(() => new Map(
   (props.protobufTraffic?.connections ?? []).map((item) => [`${item.channel}:${item.actorId}`, item]),
 ));
+const compatibilityRuleSummary = computed(() => new Map(
+  (props.overview?.protocolCompatibility?.rules ?? []).map((rule) => [rule.id, rule.summary]),
+));
 
 function formatChannel(value: ConnectionDetail["channel"]): string {
   if (value === "player") {
@@ -69,6 +72,12 @@ function snapshotSummary(metric: ProtobufMetric | undefined): string {
   if (!metric || metric.messageCount === 0) return "0";
   return `${metric.messageCount} 包 / ${formatBytes(metric.byteCount)}`;
 }
+
+function activeCompatibilitySummary(row: ConnectionDetail): string {
+  const rules = row.activeCompatibilityRules ?? [];
+  if (rules.length === 0) return "无需兼容适配";
+  return rules.map((rule) => compatibilityRuleSummary.value.get(rule) ?? rule).join("；");
+}
 </script>
 
 <template>
@@ -100,6 +109,14 @@ function snapshotSummary(metric: ProtobufMetric | undefined): string {
       <div class="status-summary-card">
         <span class="status-summary-label">活跃房间</span>
         <strong class="status-summary-value">{{ overview?.activeRooms ?? 0 }}</strong>
+      </div>
+      <div class="status-summary-card">
+        <span class="status-summary-label">兼容连接</span>
+        <strong class="status-summary-value">{{ overview?.protocolCompatibility?.compatibilityConnectionCount ?? 0 }}</strong>
+      </div>
+      <div class="status-summary-card">
+        <span class="status-summary-label">规则命中</span>
+        <strong class="status-summary-value">{{ overview?.protocolCompatibility?.activeRuleBindingCount ?? 0 }}</strong>
       </div>
       <div class="status-summary-card">
         <span class="status-summary-label">Protobuf 发包频率</span>
@@ -139,6 +156,9 @@ function snapshotSummary(metric: ProtobufMetric | undefined): string {
             <div><span class="detail-key">显示名</span><span>{{ row.displayName || "-" }}</span></div>
             <div><span class="detail-key">房间</span><span>{{ row.roomCode || "-" }}</span></div>
             <div><span class="detail-key">协议版本</span><span>{{ row.protocolVersion || "-" }}</span></div>
+            <div><span class="detail-key">协商版本</span><span>{{ row.negotiatedProtocolVersion || "-" }}</span></div>
+            <div><span class="detail-key">兼容 Epoch</span><span>{{ row.compatibilityEpoch || "-" }}</span></div>
+            <div><span class="detail-key">兼容规则</span><span>{{ activeCompatibilitySummary(row) }}</span></div>
             <div><span class="detail-key">程序版本</span><span>{{ row.programVersion || "-" }}</span></div>
             <div><span class="detail-key">远端地址</span><span>{{ row.remoteAddr || "-" }}</span></div>
             <div><span class="detail-key">连接 ID</span><span class="mono-text">{{ row.actorId || "-" }}</span></div>
@@ -189,6 +209,9 @@ function snapshotSummary(metric: ProtobufMetric | undefined): string {
       >
         <template v-if="column.prop === 'channel'" #default="{ row }">
           {{ formatChannel(row.channel) }}
+        </template>
+        <template v-else-if="column.prop === 'compatibilityRuleCount'" #default="{ row }">
+          {{ row.compatibilityRuleCount ?? 0 }}
         </template>
         <template v-else #default="{ row }">
           <span :class="{ 'mono-text': column.prop === 'actorId' }">{{ row[column.prop] || "-" }}</span>

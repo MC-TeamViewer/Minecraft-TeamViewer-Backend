@@ -37,6 +37,9 @@ use crate::{
         TabHistoryErrorCode, TabHistoryLookupChunk, TabHistorySyncChunk, TabHistorySyncMode,
         WireChannel, WireEnvelope, wire_envelope,
     },
+    protocol_compat::{
+        CURRENT_PROTOCOL_VERSION, MINIMUM_PROTOCOL_VERSION, ProtocolProfile, sanitize_player_report,
+    },
     proxy_ip::effective_remote_addr,
     relay::{
         CONTROL_CAPACITY, ConnectionKind, RegisterConnection, RelayEvent, RelayHandle, StateFrame,
@@ -49,8 +52,6 @@ use crate::{
     transport::TransportConnectInfo,
 };
 
-const PROTOCOL_VERSION: &str = "0.7.1";
-const MIN_PROTOCOL_VERSION: &str = "0.6.1";
 const PROGRAM_VERSION: &str = concat!(
     "team-view-relay-rust-v",
     env!("CARGO_PKG_VERSION"),
@@ -247,29 +248,41 @@ async fn serve_socket(
         }
     };
 
-    let (id, room, protocol, kind, channel, display_name, position_resolution, program_version) =
+    let (id, room, profile, kind, channel, display_name, position_resolution, program_version) =
         match (route_kind, envelope.payload) {
             (
                 ConnectionKind::Player,
                 Some(wire_envelope::Payload::PlayerHandshakeRequest(handshake)),
             ) => {
-                if handshake.submit_player_id.is_empty()
-                    || !protocol_at_least(&handshake.network_protocol_version, MIN_PROTOCOL_VERSION)
-                {
-                    reject(&mut socket, WireChannel::Player, "client_protocol_too_old").await;
+                if handshake.submit_player_id.is_empty() {
+                    reject(&mut socket, WireChannel::Player, "invalid_submit_player_id").await;
                     return;
                 }
-                let role = match handshake
-                    .client_role
-                    .and_then(|value| ClientRole::try_from(value).ok())
-                {
-                    Some(ClientRole::ExternalSource) => ConnectionKind::ExternalSource,
-                    _ => ConnectionKind::Player,
+                let profile = match ProtocolProfile::negotiate(
+                    &handshake.network_protocol_version,
+                    &handshake.minimum_compatible_network_protocol_version,
+                ) {
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        reject(&mut socket, WireChannel::Player, error.reason()).await;
+                        return;
+                    }
+                };
+                let role = if profile.supports_external_source_role()
+                    && matches!(
+                        handshake
+                            .client_role
+                            .and_then(|value| ClientRole::try_from(value).ok()),
+                        Some(ClientRole::ExternalSource)
+                    ) {
+                    ConnectionKind::ExternalSource
+                } else {
+                    ConnectionKind::Player
                 };
                 (
                     handshake.submit_player_id,
                     normalize_room(handshake.room_code.as_deref()),
-                    handshake.network_protocol_version,
+                    profile,
                     role,
                     WireChannel::Player,
                     handshake.client_display_name,
@@ -281,14 +294,20 @@ async fn serve_socket(
                 ConnectionKind::WebMap,
                 Some(wire_envelope::Payload::WebMapHandshakeRequest(handshake)),
             ) => {
-                if !protocol_at_least(&handshake.network_protocol_version, MIN_PROTOCOL_VERSION) {
-                    reject(&mut socket, WireChannel::WebMap, "client_protocol_too_old").await;
-                    return;
-                }
+                let profile = match ProtocolProfile::negotiate(
+                    &handshake.network_protocol_version,
+                    &handshake.minimum_compatible_network_protocol_version,
+                ) {
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        reject(&mut socket, WireChannel::WebMap, error.reason()).await;
+                        return;
+                    }
+                };
                 (
                     format!("web-map-{}", Uuid::new_v4()),
                     normalize_room(handshake.room_code.as_deref()),
-                    handshake.network_protocol_version,
+                    profile,
                     ConnectionKind::WebMap,
                     WireChannel::WebMap,
                     Some("Web Map".to_owned()),
@@ -318,8 +337,8 @@ async fn serve_socket(
     state.metrics.register(&id, traffic_channel);
     let ack = HandshakeAck {
         ready: true,
-        network_protocol_version: PROTOCOL_VERSION.to_owned(),
-        minimum_compatible_network_protocol_version: MIN_PROTOCOL_VERSION.to_owned(),
+        network_protocol_version: CURRENT_PROTOCOL_VERSION.to_string(),
+        minimum_compatible_network_protocol_version: MINIMUM_PROTOCOL_VERSION.to_string(),
         local_program_version: PROGRAM_VERSION.to_owned(),
         room_code: room.clone(),
         delta_enabled: true,
@@ -339,8 +358,12 @@ async fn serve_socket(
         player_timeout_sec: Some(state.config.player_timeout_sec as i32),
         entity_timeout_sec: Some(state.config.entity_timeout_sec as i32),
         battle_chunk_timeout_sec: Some(state.config.battle_chunk_timeout_sec as i32),
-        accepted_client_role: Some(accepted_role as i32),
-        tab_history: protocol_at_least(&protocol, "0.7.0").then(|| tab_capabilities(&state.config)),
+        accepted_client_role: profile
+            .supports_external_source_role()
+            .then_some(accepted_role as i32),
+        tab_history: profile
+            .supports_tab_history()
+            .then(|| tab_capabilities(&state.config)),
         ..Default::default()
     };
     let ack = encode_payload(channel, wire_envelope::Payload::HandshakeAck(ack));
@@ -370,7 +393,7 @@ async fn serve_socket(
         .send(RelayEvent::Register(RegisterConnection {
             id: id.clone(),
             room: room.clone(),
-            protocol: protocol.clone(),
+            protocol: profile,
             kind,
             display_name,
             position_resolution,
@@ -387,7 +410,7 @@ async fn serve_socket(
     }
     drop(maintenance_guard);
     record_connection_started(&state.db, &id, &room, kind, &remote_addr).await;
-    info!(connection_id = %id, %room, ?kind, %protocol, %remote_addr, "websocket connected");
+    info!(connection_id = %id, %room, ?kind, protocol = %profile.peer_current(), %remote_addr, "websocket connected");
 
     let (sink, stream) = socket.split();
     let event_tx = state.relay.sender();
@@ -414,6 +437,7 @@ async fn serve_socket(
             tab_history: state.tab_history.clone(),
             metrics: state.metrics.clone(),
             traffic_channel,
+            profile,
         },
     ));
     let last_wire_ingress = Arc::new(AtomicU64::new(0));
@@ -541,6 +565,7 @@ struct ReaderContext {
     tab_history: Arc<TabHistoryStore>,
     metrics: Arc<Metrics>,
     traffic_channel: TrafficChannel,
+    profile: ProtocolProfile,
 }
 
 async fn reader_loop(
@@ -556,6 +581,7 @@ async fn reader_loop(
         tab_history,
         metrics,
         traffic_channel,
+        profile,
     } = context;
     while let Some(frame) = stream.next().await {
         if frame.opcode() != OpCode::Binary {
@@ -574,9 +600,10 @@ async fn reader_loop(
             continue;
         };
         match envelope.payload {
-            Some(wire_envelope::Payload::PlayerReportBundle(report))
+            Some(wire_envelope::Payload::PlayerReportBundle(mut report))
                 if report.submit_player_id == id =>
             {
+                sanitize_player_report(profile, &mut report);
                 let tab_players = report
                     .tab_players_replace
                     .as_ref()
@@ -591,18 +618,19 @@ async fn reader_loop(
                         })
                     })
                     .unwrap_or_default();
-                let changed_history_head = if tab_players.is_empty() {
-                    None
-                } else if matches!(
-                    tab_history
-                        .upsert_players(&room, &tab_players, unix_millis())
-                        .await,
-                    Ok(true)
-                ) {
-                    tab_history.head(&room).await.ok()
-                } else {
-                    None
-                };
+                let changed_history_head =
+                    if !profile.supports_tab_history() || tab_players.is_empty() {
+                        None
+                    } else if matches!(
+                        tab_history
+                            .upsert_players(&room, &tab_players, unix_millis())
+                            .await,
+                        Ok(true)
+                    ) {
+                        tab_history.head(&room).await.ok()
+                    } else {
+                        None
+                    };
                 if events
                     .send(RelayEvent::PlayerReport {
                         id: id.clone(),
@@ -644,6 +672,9 @@ async fn reader_loop(
                     .await;
             }
             Some(wire_envelope::Payload::TabHistorySubscribeRequest(request)) => {
+                if !profile.supports_tab_history() {
+                    continue;
+                }
                 let _ = events
                     .send(RelayEvent::TabHistorySubscription {
                         id: id.clone(),
@@ -665,18 +696,34 @@ async fn reader_loop(
                 }
             }
             Some(wire_envelope::Payload::TabHistorySyncRequest(request)) => {
-                if send_tab_sync(&tab_history, &control, channel, &room, request)
+                let result = if profile.supports_tab_history() {
+                    send_tab_sync(&tab_history, &control, channel, &room, request).await
+                } else {
+                    send_tab_sync_error(
+                        &control,
+                        channel,
+                        request.request_id,
+                        TabHistoryErrorCode::Unsupported,
+                    )
                     .await
-                    .is_err()
-                {
+                };
+                if result.is_err() {
                     break;
                 }
             }
             Some(wire_envelope::Payload::TabHistoryLookupRequest(request)) => {
-                if send_tab_lookup(&tab_history, &control, channel, &room, request)
+                let result = if profile.supports_tab_history() {
+                    send_tab_lookup(&tab_history, &control, channel, &room, request).await
+                } else {
+                    send_tab_lookup_error(
+                        &control,
+                        channel,
+                        request.request_id,
+                        TabHistoryErrorCode::Unsupported,
+                    )
                     .await
-                    .is_err()
-                {
+                };
+                if result.is_err() {
                     break;
                 }
             }
@@ -937,8 +984,8 @@ async fn send_tab_lookup_error(
 async fn reject(socket: &mut HttpWebSocket, channel: WireChannel, reason: &str) {
     let ack = HandshakeAck {
         ready: false,
-        network_protocol_version: PROTOCOL_VERSION.to_owned(),
-        minimum_compatible_network_protocol_version: MIN_PROTOCOL_VERSION.to_owned(),
+        network_protocol_version: CURRENT_PROTOCOL_VERSION.to_string(),
+        minimum_compatible_network_protocol_version: MINIMUM_PROTOCOL_VERSION.to_string(),
         local_program_version: PROGRAM_VERSION.to_owned(),
         error: Some("version_incompatible".to_owned()),
         reject_reason: Some(reason.to_owned()),
@@ -980,18 +1027,6 @@ fn embedded_response(path: &str) -> Response {
         .header(header::CONTENT_TYPE, mime.as_ref())
         .body(Body::from(asset.data))
         .expect("embedded response")
-}
-
-fn protocol_at_least(current: &str, minimum: &str) -> bool {
-    fn parse(value: &str) -> [u32; 3] {
-        let mut parts = value.split('.').filter_map(|part| part.parse().ok());
-        [
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-        ]
-    }
-    parse(current) >= parse(minimum)
 }
 
 fn normalize_room(room: Option<&str>) -> String {

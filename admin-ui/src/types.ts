@@ -14,6 +14,10 @@ export interface ConnectionDetail {
   displayName: string | null;
   roomCode: string | null;
   protocolVersion: string | null;
+  negotiatedProtocolVersion?: string | null;
+  compatibilityEpoch?: string | null;
+  compatibilityRuleCount?: number;
+  activeCompatibilityRules?: string[];
   programVersion: string | null;
   remoteAddr: string | null;
   connected?: boolean;
@@ -23,6 +27,24 @@ export interface ConnectionDetail {
   lastHealthyAt?: number | null;
 }
 
+export interface ProtocolCompatibilityRule {
+  id: string;
+  introducedIn: string;
+  summary: string;
+  activeConnections: number;
+}
+
+export interface ProtocolCompatibilityOverview {
+  currentVersion: string;
+  minimumSupportedVersion: string;
+  knownEpochCount: number;
+  registeredRuleCount: number;
+  compatibilityConnectionCount: number;
+  activeRuleBindingCount: number;
+  connectionsByEpoch: Array<{ epoch: string; connections: number }>;
+  rules: ProtocolCompatibilityRule[];
+}
+
 export interface OverviewPayload {
   playerConnections: number;
   webMapConnections: number;
@@ -30,6 +52,7 @@ export interface OverviewPayload {
   activeRooms: number;
   rooms: RoomOverview[];
   connectionDetails: ConnectionDetail[];
+  protocolCompatibility?: ProtocolCompatibilityOverview;
   timezone: string;
   dbPathMasked: string;
   broadcastHz: number;

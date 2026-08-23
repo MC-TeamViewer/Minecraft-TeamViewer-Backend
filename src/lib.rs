@@ -2,6 +2,7 @@ pub mod admin;
 pub mod config;
 pub mod metrics;
 pub mod proto;
+pub mod protocol_compat;
 pub mod proxy_ip;
 pub mod relay;
 pub mod tab_history;

@@ -26,11 +26,12 @@ use crate::proto::teamviewer::v1::{
     WebMapTacticalWaypointAckDetail, WebMapWaypointsDeleteAckDetail, WireChannel, WireEnvelope,
     web_map_ack, web_map_command, wire_envelope,
 };
+use crate::protocol_compat::{ProtocolEpoch, ProtocolProfile, project_snapshot};
 
 pub const EVENT_CAPACITY: usize = 2_048;
 pub const CONTROL_CAPACITY: usize = 32;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConnectionKind {
     Player,
     ExternalSource,
@@ -46,7 +47,7 @@ pub struct StateFrame {
 pub struct RegisterConnection {
     pub id: String,
     pub room: String,
-    pub protocol: String,
+    pub protocol: ProtocolProfile,
     pub kind: ConnectionKind,
     pub display_name: Option<String>,
     pub position_resolution: Option<f64>,
@@ -177,7 +178,7 @@ impl RelayHandle {
 
 struct Connection {
     room: String,
-    protocol: String,
+    protocol: ProtocolProfile,
     kind: ConnectionKind,
     display_name: Option<String>,
     position_resolution: Option<f64>,
@@ -380,7 +381,7 @@ impl Relay {
                         "actorId":id,
                         "displayName":connection.display_name.as_deref().unwrap_or(&id),
                         "roomCode":connection.room,
-                        "protocolVersion":connection.protocol,
+                        "protocolVersion":connection.protocol.peer_current().to_string(),
                         "programVersion":connection.program_version,
                         "remoteAddr":connection.remote_addr,
                         "connectedAt":connection.connected_at,
@@ -1507,7 +1508,7 @@ impl Relay {
             .map(|(id, connection)| {
                 (
                     id.clone(),
-                    connection.protocol.clone(),
+                    connection.protocol,
                     connection.control.clone(),
                     connection.delivered_snapshot.clone(),
                 )
@@ -1517,17 +1518,9 @@ impl Relay {
             let Some(snapshot) = delivered_snapshot else {
                 continue;
             };
-            let include_last_seen = protocol_at_least(&protocol, "0.6.4");
-            let include_source_metadata = protocol_at_least(&protocol, "0.6.5");
-            let battle_chunk_contract = battle_chunk_digest_contract(&protocol);
             let bytes = encode_payload(
                 WireChannel::Player,
-                wire_envelope::Payload::Digest(snapshot_digest(
-                    &snapshot,
-                    include_last_seen,
-                    include_source_metadata,
-                    battle_chunk_contract,
-                )),
+                wire_envelope::Payload::Digest(snapshot_digest(&snapshot, protocol)),
             );
             if control.try_send(bytes).is_ok()
                 && let Some(connection) = self.connections.get_mut(&id)
@@ -1562,66 +1555,58 @@ impl Relay {
                     (
                         id.clone(),
                         connection.kind,
-                        connection.protocol.clone(),
+                        connection.protocol,
                         connection.force_full,
                         connection.delivered_snapshot.clone(),
                     )
                 })
                 .collect::<Vec<_>>();
             let mut scoped_snapshots: HashMap<Vec<String>, Arc<SnapshotFull>> = HashMap::new();
+            let mut projected_snapshots: HashMap<
+                (ConnectionKind, Vec<String>, ProtocolEpoch),
+                Arc<SnapshotFull>,
+            > = HashMap::new();
 
             for (id, kind, protocol, force_full, delivered_snapshot) in recipients {
-                let mut target = if kind == ConnectionKind::WebMap {
-                    web_snapshot.clone()
+                let (base_target, scope_key) = if kind == ConnectionKind::WebMap {
+                    (web_snapshot.clone(), Vec::new())
                 } else {
                     let allowed = self.allowed_sources_for_player(&id, &grouping);
+                    let mut scope_key = allowed.iter().cloned().collect::<Vec<_>>();
+                    scope_key.sort();
                     if allowed == grouping.active_sources {
-                        player_snapshot.clone()
+                        (player_snapshot.clone(), scope_key)
                     } else {
-                        let mut scope_key = allowed.iter().cloned().collect::<Vec<_>>();
-                        scope_key.sort();
                         if let Some(snapshot) = scoped_snapshots.get(&scope_key) {
-                            snapshot.clone()
+                            (snapshot.clone(), scope_key)
                         } else {
                             let snapshot =
                                 Arc::new(self.build_room_snapshot(&room, false, Some(&allowed)));
-                            scoped_snapshots.insert(scope_key, snapshot.clone());
-                            snapshot
+                            scoped_snapshots.insert(scope_key.clone(), snapshot.clone());
+                            (snapshot, scope_key)
                         }
                     }
                 };
-                if !protocol_at_least(&protocol, "0.6.4") {
-                    let mut legacy = (*target).clone();
-                    legacy.last_seen_players.clear();
-                    target = Arc::new(legacy);
-                }
+                let projection_key = (kind, scope_key, protocol.epoch());
+                let target = projected_snapshots
+                    .entry(projection_key)
+                    .or_insert_with(|| project_snapshot(protocol, base_target))
+                    .clone();
 
                 let channel = if kind == ConnectionKind::WebMap {
                     WireChannel::WebMap
                 } else {
                     WireChannel::Player
                 };
-                let bytes = if force_full || delivered_snapshot.is_none() {
-                    encode_payload(
-                        channel,
-                        wire_envelope::Payload::SnapshotFull((*target).clone()),
-                    )
-                } else {
-                    let patch =
-                        build_patch(delivered_snapshot.as_deref().expect("checked"), &target);
-                    let Some(patch) = patch else {
-                        continue;
-                    };
-                    if !protocol_at_least(&protocol, "0.6.5") && patch_requires_clear_fields(&patch)
-                    {
-                        encode_payload(
-                            channel,
-                            wire_envelope::Payload::SnapshotFull((*target).clone()),
-                        )
-                    } else {
-                        encode_payload(channel, wire_envelope::Payload::Patch(patch))
-                    }
+                let Some(payload) = state_payload_for_profile(
+                    protocol,
+                    force_full,
+                    delivered_snapshot.as_deref(),
+                    &target,
+                ) else {
+                    continue;
                 };
+                let bytes = encode_payload(channel, payload);
 
                 if let Some(connection) = self.connections.get_mut(&id) {
                     connection
@@ -1700,7 +1685,7 @@ impl Relay {
                     "actorId": connection_id,
                     "displayName": connection.display_name.as_deref().unwrap_or(connection_id),
                     "roomCode": connection.room,
-                    "protocolVersion": connection.protocol,
+                    "protocolVersion": connection.protocol.peer_current().to_string(),
                     "programVersion": connection.program_version,
                     "remoteAddr": connection.remote_addr,
                     "connectedAt": connection.connected_at,
@@ -1998,18 +1983,6 @@ fn resolve_candidates<T: Clone>(
     resolved
 }
 
-fn protocol_at_least(current: &str, minimum: &str) -> bool {
-    fn parse(value: &str) -> [u32; 3] {
-        let mut parts = value.split('.').filter_map(|part| part.parse().ok());
-        [
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-        ]
-    }
-    parse(current) >= parse(minimum)
-}
-
 fn send_web_ack(control: &mpsc::Sender<Arc<[u8]>>, ack: WebMapAck) {
     let _ = control.try_send(encode_payload(
         WireChannel::WebMap,
@@ -2111,6 +2084,23 @@ fn build_patch(old: &SnapshotFull, new: &SnapshotFull) -> Option<Patch> {
         connections_count,
         server_time: new.server_time,
     })
+}
+
+fn state_payload_for_profile(
+    profile: ProtocolProfile,
+    force_full: bool,
+    delivered_snapshot: Option<&SnapshotFull>,
+    target: &SnapshotFull,
+) -> Option<wire_envelope::Payload> {
+    if force_full || delivered_snapshot.is_none() {
+        return Some(wire_envelope::Payload::SnapshotFull(target.clone()));
+    }
+    let patch = build_patch(delivered_snapshot.expect("checked"), target)?;
+    if !profile.supports_clear_fields() && patch_requires_clear_fields(&patch) {
+        Some(wire_envelope::Payload::SnapshotFull(target.clone()))
+    } else {
+        Some(wire_envelope::Payload::Patch(patch))
+    }
 }
 
 fn patch_requires_clear_fields(patch: &Patch) -> bool {
@@ -2936,18 +2926,15 @@ fn player_json_map(players: &HashMap<String, PlayerData>) -> Value {
     }).collect())
 }
 
-fn snapshot_digest(
-    snapshot: &SnapshotFull,
-    include_last_seen: bool,
-    include_source_metadata: bool,
-    battle_chunk_contract: BattleChunkDigestContract,
-) -> Digest {
+fn snapshot_digest(snapshot: &SnapshotFull, profile: ProtocolProfile) -> Digest {
     let players = snapshot
         .players
         .iter()
         .map(|(id, player)| {
             let mut value = player_json(player);
-            if !include_source_metadata && let Some(object) = value.as_object_mut() {
+            if !profile.supports_player_source_metadata()
+                && let Some(object) = value.as_object_mut()
+            {
                 for field in [
                     "positionSourceId",
                     "positionSourceKind",
@@ -2981,9 +2968,12 @@ fn snapshot_digest(
         waypoints: state_digest_plain(waypoints),
         battle_chunks: Some(battle_chunk_digest(
             &snapshot.battle_chunks,
-            battle_chunk_contract,
+            battle_chunk_digest_contract(profile),
+            profile.supports_battle_chunk_mode(),
         )),
-        last_seen_players: include_last_seen.then(|| state_digest_plain(last_seen_players)),
+        last_seen_players: profile
+            .supports_last_seen_players()
+            .then(|| state_digest_plain(last_seen_players)),
     }
 }
 
@@ -2993,8 +2983,8 @@ enum BattleChunkDigestContract {
     StructuredV2,
 }
 
-fn battle_chunk_digest_contract(protocol: &str) -> BattleChunkDigestContract {
-    if protocol_at_least(protocol, "0.7.1") {
+fn battle_chunk_digest_contract(profile: ProtocolProfile) -> BattleChunkDigestContract {
+    if profile.uses_structured_battle_chunk_digest() {
         BattleChunkDigestContract::StructuredV2
     } else {
         BattleChunkDigestContract::LegacyKeyed
@@ -3004,6 +2994,7 @@ fn battle_chunk_digest_contract(protocol: &str) -> BattleChunkDigestContract {
 fn battle_chunk_digest(
     entries: &[BattleChunkEntry],
     contract: BattleChunkDigestContract,
+    include_mode: bool,
 ) -> String {
     match contract {
         BattleChunkDigestContract::LegacyKeyed => {
@@ -3012,7 +3003,7 @@ fn battle_chunk_digest(
                 .filter_map(|entry| {
                     let reference = entry.r#ref.as_ref()?;
                     let coord = reference.coord.as_ref()?;
-                    let mut value = battle_digest_data_json(entry.data.as_ref()?);
+                    let mut value = battle_digest_data_json(entry.data.as_ref()?, include_mode);
                     let object = value.as_object_mut()?;
                     object.insert(
                         "dimension".to_owned(),
@@ -3043,7 +3034,7 @@ fn battle_chunk_digest(
                                 "chunkX":coord.chunk_x,
                                 "chunkZ":coord.chunk_z,
                             },
-                            "data":battle_digest_data_json(entry.data.as_ref()?),
+                            "data":battle_digest_data_json(entry.data.as_ref()?, include_mode),
                         }),
                     ))
                 })
@@ -3098,9 +3089,12 @@ fn battle_value_json(value: &BattleChunkValue) -> Value {
     }))
 }
 
-fn battle_digest_data_json(value: &BattleChunkValue) -> Value {
+fn battle_digest_data_json(value: &BattleChunkValue, include_mode: bool) -> Value {
     let mut value = battle_value_json(value);
     if let Some(object) = value.as_object_mut() {
+        if !include_mode {
+            object.remove("mode");
+        }
         object
             .entry("colorMode".to_owned())
             .or_insert_with(|| Value::String("raw_observed".to_owned()));
@@ -3229,6 +3223,10 @@ fn unix_millis() -> i64 {
 mod tests {
     use super::*;
 
+    fn protocol_profile(version: &str) -> ProtocolProfile {
+        ProtocolProfile::negotiate(version, "0.6.1").expect("supported protocol")
+    }
+
     fn battle_chunk_fixture(dimension: &str, chunk_x: i32, chunk_z: i32) -> BattleChunkEntry {
         BattleChunkEntry {
             r#ref: Some(BattleChunkRef {
@@ -3252,7 +3250,7 @@ mod tests {
             id.to_owned(),
             Connection {
                 room: "room".to_owned(),
-                protocol: "0.7.0".to_owned(),
+                protocol: protocol_profile("0.7.0"),
                 kind,
                 display_name: None,
                 position_resolution: None,
@@ -3298,6 +3296,29 @@ mod tests {
     }
 
     #[test]
+    fn clear_fields_fall_back_only_before_protocol_0_6_5() {
+        let mut old = SnapshotFull::default();
+        old.players.insert(
+            "player".into(),
+            PlayerData {
+                player_name: Some("Alice".into()),
+                ..Default::default()
+            },
+        );
+        let mut new = old.clone();
+        new.players.get_mut("player").expect("player").player_name = None;
+
+        assert!(matches!(
+            state_payload_for_profile(protocol_profile("0.6.4"), false, Some(&old), &new,),
+            Some(wire_envelope::Payload::SnapshotFull(_))
+        ));
+        assert!(matches!(
+            state_payload_for_profile(protocol_profile("0.6.5"), false, Some(&old), &new,),
+            Some(wire_envelope::Payload::Patch(_))
+        ));
+    }
+
+    #[test]
     fn canonical_digest_matches_protocol_contract() {
         let values = BTreeMap::from([("<id>&".to_owned(), json!({"name":"<A&B>", "x":1.2345645}))]);
         assert_eq!(canonical_number(1.2345645), "1.234565");
@@ -3311,6 +3332,7 @@ mod tests {
             battle_chunk_digest(
                 std::slice::from_ref(&entry),
                 BattleChunkDigestContract::LegacyKeyed,
+                true,
             ),
             "d6fccb4a1bd18438"
         );
@@ -3318,13 +3340,14 @@ mod tests {
             battle_chunk_digest(
                 std::slice::from_ref(&entry),
                 BattleChunkDigestContract::StructuredV2,
+                true,
             ),
             "31c63cd6e92bbc39"
         );
 
         let buggy_projection = BTreeMap::from([(
             battle_entry_key(&entry).expect("valid ref"),
-            battle_digest_data_json(entry.data.as_ref().expect("data")),
+            battle_digest_data_json(entry.data.as_ref().expect("data"), true),
         )]);
         assert_eq!(state_digest_plain(buggy_projection), "9cecf13aa4592a1c");
     }
@@ -3332,19 +3355,19 @@ mod tests {
     #[test]
     fn battle_chunk_digest_contract_is_versioned_and_order_stable() {
         assert_eq!(
-            battle_chunk_digest_contract("0.7.0"),
+            battle_chunk_digest_contract(protocol_profile("0.7.0")),
             BattleChunkDigestContract::LegacyKeyed
         );
         assert_eq!(
-            battle_chunk_digest_contract("0.7.1"),
+            battle_chunk_digest_contract(protocol_profile("0.7.1")),
             BattleChunkDigestContract::StructuredV2
         );
         assert_eq!(
-            battle_chunk_digest(&[], BattleChunkDigestContract::LegacyKeyed),
+            battle_chunk_digest(&[], BattleChunkDigestContract::LegacyKeyed, true),
             "da39a3ee5e6b4b0d"
         );
         assert_eq!(
-            battle_chunk_digest(&[], BattleChunkDigestContract::StructuredV2),
+            battle_chunk_digest(&[], BattleChunkDigestContract::StructuredV2, true),
             "da39a3ee5e6b4b0d"
         );
 
@@ -3353,10 +3376,29 @@ mod tests {
         let forward = battle_chunk_digest(
             &[first.clone(), second.clone()],
             BattleChunkDigestContract::StructuredV2,
+            true,
         );
-        let reverse =
-            battle_chunk_digest(&[second, first], BattleChunkDigestContract::StructuredV2);
+        let reverse = battle_chunk_digest(
+            &[second, first],
+            BattleChunkDigestContract::StructuredV2,
+            true,
+        );
         assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn protocol_0_6_1_battle_digest_omits_mode() {
+        let with_mode = battle_chunk_fixture("minecraft:overworld", 1, 2);
+        let mut without_mode = with_mode.clone();
+        without_mode.data.as_mut().expect("data").mode = None;
+        assert_eq!(
+            battle_chunk_digest(&[with_mode], BattleChunkDigestContract::LegacyKeyed, false,),
+            battle_chunk_digest(
+                &[without_mode],
+                BattleChunkDigestContract::LegacyKeyed,
+                false,
+            )
+        );
     }
 
     #[test]

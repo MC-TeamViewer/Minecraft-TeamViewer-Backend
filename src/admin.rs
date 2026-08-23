@@ -20,6 +20,7 @@ use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
+    protocol_compat::compatibility_overview,
     proxy_ip::{effective_remote_addr, request_is_secure},
     transport::TransportConnectInfo,
     web::AppState,
@@ -1780,13 +1781,15 @@ fn session_json(
     json!({"sessionId":id,"actorId":actor,"remoteAddr":remote_addr,"createdAt":created,"lastSeenAt":seen,"expiresAt":expires})
 }
 fn overview_value(snapshot: &Value) -> Value {
+    let compatibility = compatibility_overview(&snapshot["connectionDetails"]);
     json!({
         "playerConnections": snapshot["playerConnections"].as_u64().unwrap_or(0),
         "webMapConnections": snapshot["webMapConnections"].as_u64().unwrap_or(0),
         "externalSourceConnections": snapshot["externalSourceConnections"].as_u64().unwrap_or(0),
         "activeRooms": snapshot["activeRooms"].as_u64().unwrap_or(0),
         "rooms": snapshot["rooms"].clone(),
-        "connectionDetails": snapshot["connectionDetails"].clone(),
+        "connectionDetails": compatibility.connection_details,
+        "protocolCompatibility": compatibility.summary,
         "timezone":"local","dbPathMasked":".../teamviewer-admin.db",
         "broadcastHz":snapshot["broadcastHz"].as_f64().unwrap_or(20.0),"hourlyPeak24h":0,
         "observability":{"sseSubscribers":0,"lastRetentionCleanup":null,"apiErrors":0,"sseErrors":0,"trustProxyHeaders":env_bool("TEAMVIEWER_TRUST_PROXY_HEADERS")}

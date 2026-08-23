@@ -37,6 +37,27 @@ curl --fail http://127.0.0.1:8765/health
 
 `/playeresp` 和 `/adminws` 仅作为旧客户端兼容入口保留。
 
+## 协议兼容矩阵
+
+服务端当前协议为 `0.7.1`，最低支持 `0.6.1`。握手要求客户端和服务端声明的
+`[minimum_compatible_network_protocol_version, network_protocol_version]` 区间相交；实际功能按双方都支持的最高版本选择。
+
+兼容策略集中在 `src/protocol_compat.rs`，领域状态始终使用当前模型，只有连接边界上的 handshake、snapshot、patch、digest
+和入站报告会经过 profile 投影。管理后台会显示每个在线连接的 epoch 和命中的规则。
+
+| 客户端 epoch | 活跃兼容规则数 | 主要适配 |
+| --- | ---: | --- |
+| `0.6.1` | 7 | 移除 battle mode、角色、last seen、来源元数据和 Tab History；clear-fields 回退；legacy digest |
+| `0.6.2` | 6 | 角色、last seen、来源元数据、clear-fields、Tab History、legacy digest |
+| `0.6.3` | 5 | last seen、来源元数据、clear-fields、Tab History、legacy digest |
+| `0.6.4` | 4 | 来源元数据、clear-fields、Tab History、legacy digest |
+| `0.6.5` | 2 | Tab History、legacy digest |
+| `0.7.0` | 1 | legacy battle chunk digest |
+| `0.7.1` | 0 | 当前合同，无兼容投影 |
+
+以后升级协议时，必须同时：新增或更新 epoch 能力、为真实投影登记稳定规则 ID、补边界与摘要向量测试，并确认管理后台能枚举新规则。
+提高最低兼容版本时，应在同一提交中删除已不可触发的 epoch、规则和测试。
+
 ## Docker
 
 构建当前源码：
@@ -48,7 +69,7 @@ docker build -t teamviewrelay-backend:local .
 已发布镜像：
 
 ```text
-professornuo/teamviewrelay-rust:v1.0.3-proto0.7.1
+professornuo/teamviewrelay-rust:v1.0.4-proto0.7.1
 ```
 
 `docker-compose.yml` 默认使用该版本，并将 SQLite 数据目录挂载到宿主机的 `./data-rust`。
@@ -137,7 +158,7 @@ uv run python scripts/load_test_live.py \
   --stage-duration 300 \
   --report-hz 10 \
   --allow-remote \
-  --expected-build team-view-relay-rust-v1.0.3-proto0.7.1
+  --expected-build team-view-relay-rust-v1.0.4-proto0.7.1
 ```
 
 `--expected-build` 必须与目标 `/health` 返回的 `buildVersion` 完全一致，而不是 Docker tag。可先检查：
