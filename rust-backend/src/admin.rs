@@ -1,4 +1,4 @@
-use std::{collections::HashMap, convert::Infallible, env, net::IpAddr};
+use std::{collections::HashMap, convert::Infallible, env};
 
 use axum::{
     Json,
@@ -8,7 +8,6 @@ use axum::{
 };
 use chrono::{Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, Timelike};
 use futures_util::{StreamExt, stream};
-use ipnet::IpNet;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -16,7 +15,11 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 use url::form_urlencoded;
 use uuid::Uuid;
 
-use crate::{transport::TransportConnectInfo, web::AppState};
+use crate::{
+    proxy_ip::{effective_remote_addr, request_is_secure},
+    transport::TransportConnectInfo,
+    web::AppState,
+};
 
 const COOKIE_NAME: &str = "teamviewer_admin_session";
 
@@ -35,7 +38,7 @@ pub async fn login(
     let expected_user = env::var("TEAMVIEWER_ADMIN_USERNAME").unwrap_or_else(|_| "admin".into());
     let expected_password =
         env::var("TEAMVIEWER_ADMIN_PASSWORD").unwrap_or_else(|_| "admin".into());
-    let remote_addr = request_remote_addr(&headers, &transport);
+    let remote_addr = effective_remote_addr(&headers, &transport);
     if expected_user.is_empty() || expected_password.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1179,40 +1182,6 @@ fn env_bool(name: &str) -> bool {
             "1" | "true" | "yes" | "on"
         )
     })
-}
-
-fn trusted_proxy(remote: IpAddr) -> bool {
-    if !env_bool("TEAMVIEWER_TRUST_PROXY_HEADERS") {
-        return false;
-    }
-    env::var("TEAMVIEWER_TRUSTED_PROXY_CIDRS")
-        .unwrap_or_else(|_| "127.0.0.1/32,::1/128,172.16.0.0/12".to_owned())
-        .split(',')
-        .filter_map(|value| value.trim().parse::<IpNet>().ok())
-        .any(|network| network.contains(&remote))
-}
-
-fn request_remote_addr(headers: &HeaderMap, transport: &TransportConnectInfo) -> String {
-    if trusted_proxy(transport.remote_addr.ip()) {
-        for name in ["x-forwarded-for", "x-real-ip"] {
-            if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok())
-                && let Some(first) = value.split(',').next().map(str::trim)
-                && !first.is_empty()
-            {
-                return first.to_owned();
-            }
-        }
-    }
-    transport.remote_addr.ip().to_string()
-}
-
-fn request_is_secure(headers: &HeaderMap, transport: &TransportConnectInfo) -> bool {
-    trusted_proxy(transport.remote_addr.ip())
-        && headers
-            .get("x-forwarded-proto")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(',').next())
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"))
 }
 
 async fn record_audit(

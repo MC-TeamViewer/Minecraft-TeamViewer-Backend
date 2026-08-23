@@ -515,18 +515,6 @@ impl Relay {
             }
         }
 
-        let touches_tab = report.players_replace.is_some()
-            || report.players_patch.is_some()
-            || report.entities_replace.is_some()
-            || report.entities_patch.is_some()
-            || report.waypoints_replace.is_some()
-            || report.waypoints_patch.is_some()
-            || report.battle_map_observation.is_some()
-            || report.state_keepalive.is_some()
-            || report.waypoints_delete.is_some()
-            || report.waypoints_entity_death_cancel.is_some()
-            || report.external_source_status.is_some();
-
         if let Some(replace) = report.players_replace {
             source.players = replace
                 .players
@@ -696,10 +684,6 @@ impl Relay {
                 source.battle_chunks.clear();
                 source.battle_projection = None;
             }
-        }
-        if touches_tab && !source.tab_players.is_empty() {
-            source.tab_received_at = Some(now);
-            source.tab_timestamp = Some(unix_seconds());
         }
         let battle_cache_update = battle_touched.then(|| {
             (
@@ -1337,10 +1321,12 @@ impl Relay {
             });
             changed |= before != source.battle_chunks.len();
 
-            if source.tab_received_at.is_some_and(|received_at| {
-                now.duration_since(received_at)
-                    > Duration::from_secs(self.config.tab_report_timeout_sec)
-            }) {
+            if !self.connections.contains_key(source_id)
+                && source.tab_received_at.is_some_and(|received_at| {
+                    now.duration_since(received_at)
+                        > Duration::from_secs(self.config.tab_report_timeout_sec)
+                })
+            {
                 changed |= !source.tab_players.is_empty();
                 source.tab_players.clear();
                 source.tab_received_at = None;
@@ -3129,6 +3115,145 @@ mod tests {
         let values = BTreeMap::from([("<id>&".to_owned(), json!({"name":"<A&B>", "x":1.2345645}))]);
         assert_eq!(canonical_number(1.2345645), "1.234565");
         assert_eq!(state_digest_plain(values), "0cabc8c9afc26756");
+    }
+
+    #[test]
+    fn connected_tab_report_survives_report_timeout() {
+        let config = Arc::new(RuntimeConfig::load());
+        let timeout = config.tab_report_timeout_sec;
+        let mut relay = Relay::new(config, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        add_test_connection(&mut relay, "source", ConnectionKind::Player);
+        let received_at = Instant::now() - Duration::from_secs(timeout + 1);
+        relay.sources.insert(
+            "source".to_owned(),
+            SourceState {
+                room: "room".to_owned(),
+                tab_players: vec![TabPlayerEntry {
+                    name: Some("Alice".to_owned()),
+                    ..Default::default()
+                }],
+                tab_received_at: Some(received_at),
+                tab_timestamp: Some(100.0),
+                ..Default::default()
+            },
+        );
+
+        relay.cleanup_timeouts(Instant::now());
+
+        let report = relay.sources.get("source").expect("source");
+        assert_eq!(report.tab_players.len(), 1);
+        assert_eq!(report.tab_received_at, Some(received_at));
+        assert_eq!(report.tab_timestamp, Some(100.0));
+    }
+
+    #[test]
+    fn unrelated_player_report_does_not_change_tab_report_time() {
+        let config = Arc::new(RuntimeConfig::load());
+        let mut relay = Relay::new(config, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        add_test_connection(&mut relay, "source", ConnectionKind::Player);
+        let received_at = Instant::now() - Duration::from_secs(5);
+        relay.sources.insert(
+            "source".to_owned(),
+            SourceState {
+                room: "room".to_owned(),
+                tab_players: vec![TabPlayerEntry {
+                    name: Some("Alice".to_owned()),
+                    ..Default::default()
+                }],
+                tab_received_at: Some(received_at),
+                tab_timestamp: Some(100.0),
+                ..Default::default()
+            },
+        );
+
+        relay.apply_report(
+            "source",
+            PlayerReportBundle {
+                players_replace: Some(Default::default()),
+                ..Default::default()
+            },
+        );
+
+        let report = relay.sources.get("source").expect("source");
+        assert_eq!(report.tab_received_at, Some(received_at));
+        assert_eq!(report.tab_timestamp, Some(100.0));
+    }
+
+    #[test]
+    fn explicit_clear_and_empty_report_remain_authoritative() {
+        let config = Arc::new(RuntimeConfig::load());
+        let mut relay = Relay::new(config, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        add_test_connection(&mut relay, "source", ConnectionKind::Player);
+        relay.sources.insert(
+            "source".to_owned(),
+            SourceState {
+                room: "room".to_owned(),
+                tab_players: vec![TabPlayerEntry::default()],
+                tab_received_at: Some(Instant::now()),
+                tab_timestamp: Some(100.0),
+                ..Default::default()
+            },
+        );
+
+        relay.apply_report(
+            "source",
+            PlayerReportBundle {
+                source_state_clear: Some(Default::default()),
+                ..Default::default()
+            },
+        );
+        let cleared = relay.sources.get("source").expect("source");
+        assert!(cleared.tab_players.is_empty());
+        assert!(cleared.tab_received_at.is_none());
+        assert!(cleared.tab_timestamp.is_none());
+
+        relay.apply_report(
+            "source",
+            PlayerReportBundle {
+                tab_players_replace: Some(Default::default()),
+                ..Default::default()
+            },
+        );
+        let empty_report = relay.sources.get("source").expect("source");
+        assert!(empty_report.tab_players.is_empty());
+        assert!(empty_report.tab_received_at.is_some());
+        assert!(empty_report.tab_timestamp.is_some());
+    }
+
+    #[test]
+    fn orphaned_tab_report_expires_and_disconnect_clears_immediately() {
+        let config = Arc::new(RuntimeConfig::load());
+        let timeout = config.tab_report_timeout_sec;
+        let mut relay = Relay::new(config, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let old = Instant::now() - Duration::from_secs(timeout + 1);
+        relay.sources.insert(
+            "orphan".to_owned(),
+            SourceState {
+                room: "room".to_owned(),
+                tab_players: vec![TabPlayerEntry::default()],
+                tab_received_at: Some(old),
+                tab_timestamp: Some(100.0),
+                ..Default::default()
+            },
+        );
+        relay.cleanup_timeouts(Instant::now());
+        assert!(relay.sources["orphan"].tab_players.is_empty());
+        assert!(relay.sources["orphan"].tab_received_at.is_none());
+
+        add_test_connection(&mut relay, "connected", ConnectionKind::Player);
+        relay.sources.insert(
+            "connected".to_owned(),
+            SourceState {
+                room: "room".to_owned(),
+                tab_players: vec![TabPlayerEntry::default()],
+                tab_received_at: Some(Instant::now()),
+                ..Default::default()
+            },
+        );
+        relay.handle_event(RelayEvent::Disconnect {
+            id: "connected".to_owned(),
+        });
+        assert!(!relay.sources.contains_key("connected"));
     }
 
     #[test]

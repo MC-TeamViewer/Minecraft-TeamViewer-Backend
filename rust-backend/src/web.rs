@@ -10,7 +10,7 @@ use axum::{
     Router,
     body::Body,
     extract::{ConnectInfo, Path, Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
@@ -36,6 +36,7 @@ use crate::{
         TabHistoryErrorCode, TabHistoryLookupChunk, TabHistorySyncChunk, TabHistorySyncMode,
         WireChannel, WireEnvelope, wire_envelope,
     },
+    proxy_ip::effective_remote_addr,
     relay::{
         CONTROL_CAPACITY, ConnectionKind, RegisterConnection, RelayEvent, RelayHandle, StateFrame,
         encode_payload,
@@ -135,16 +136,20 @@ async fn player_ws(
     ws: IncomingUpgrade,
     State(state): State<AppState>,
     ConnectInfo(transport): ConnectInfo<TransportConnectInfo>,
+    headers: HeaderMap,
 ) -> Response {
-    upgrade_websocket(ws, state, ConnectionKind::Player, transport)
+    let remote_addr = effective_remote_addr(&headers, &transport);
+    upgrade_websocket(ws, state, ConnectionKind::Player, transport, remote_addr)
 }
 
 async fn web_map_ws(
     ws: IncomingUpgrade,
     State(state): State<AppState>,
     ConnectInfo(transport): ConnectInfo<TransportConnectInfo>,
+    headers: HeaderMap,
 ) -> Response {
-    upgrade_websocket(ws, state, ConnectionKind::WebMap, transport)
+    let remote_addr = effective_remote_addr(&headers, &transport);
+    upgrade_websocket(ws, state, ConnectionKind::WebMap, transport, remote_addr)
 }
 
 async fn reserved_admin_ws(
@@ -174,6 +179,7 @@ fn upgrade_websocket(
     state: AppState,
     route_kind: ConnectionKind,
     transport: TransportConnectInfo,
+    remote_addr: String,
 ) -> Response {
     let Ok((response, upgraded)) = ws.upgrade(websocket_options()) else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -182,7 +188,7 @@ fn upgrade_websocket(
         match upgraded.await {
             Ok(socket) => {
                 transport.wire.activate();
-                serve_socket(socket, state, route_kind, &transport).await;
+                serve_socket(socket, state, route_kind, &transport, remote_addr).await;
                 transport.wire.deactivate();
             }
             Err(error) => warn!(%error, "websocket upgrade failed"),
@@ -203,6 +209,7 @@ async fn serve_socket(
     state: AppState,
     route_kind: ConnectionKind,
     transport: &TransportConnectInfo,
+    remote_addr: String,
 ) {
     let first = match tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
         Ok(Some(frame)) if frame.opcode() == OpCode::Binary => frame.payload().clone(),
@@ -353,7 +360,7 @@ async fn serve_socket(
             display_name,
             position_resolution,
             program_version,
-            remote_addr: transport.remote_addr.to_string(),
+            remote_addr: remote_addr.clone(),
             control: control_tx.clone(),
             state: state_tx,
         }))
@@ -363,15 +370,8 @@ async fn serve_socket(
         state.metrics.unregister(&id);
         return;
     }
-    record_connection_started(
-        &state.db,
-        &id,
-        &room,
-        kind,
-        &transport.remote_addr.to_string(),
-    )
-    .await;
-    info!(connection_id = %id, %room, ?kind, %protocol, remote_addr = %transport.remote_addr, "websocket connected");
+    record_connection_started(&state.db, &id, &room, kind, &remote_addr).await;
+    info!(connection_id = %id, %room, ?kind, %protocol, %remote_addr, "websocket connected");
 
     let (sink, stream) = socket.split();
     let event_tx = state.relay.sender();
@@ -431,14 +431,7 @@ async fn serve_socket(
     let _ = event_tx
         .send(RelayEvent::Disconnect { id: id.clone() })
         .await;
-    record_connection_ended(
-        &state.db,
-        &id,
-        &room,
-        kind,
-        &transport.remote_addr.to_string(),
-    )
-    .await;
+    record_connection_ended(&state.db, &id, &room, kind, &remote_addr).await;
     state.metrics.unregister(&id);
     info!(connection_id = %id, "websocket disconnected");
 }

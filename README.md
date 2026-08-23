@@ -141,10 +141,12 @@ cargo run --release --manifest-path rust-backend/Cargo.toml
 
 ### OpenResty / Nginx 反向代理与真实 IP
 
-如果前面挂了 OpenResty / Nginx，后台默认只会看到反代地址。要让审计日志和当前连接状态里的 `remoteAddr` 变成真实客户端 IP，需要同时满足两件事：
+如果前面挂了 OpenResty / Nginx，后台默认只会看到反代地址。要让管理 HTTP、玩家客户端和 Web Map 的审计日志及当前连接状态里的 `remoteAddr` 变成真实客户端 IP，需要同时满足两件事：
 
-- 反代把 `X-Forwarded-For` 和 `X-Real-IP` 传给后端
+- 反代把 `CF-Connecting-IP`、`X-Real-IP` 或 `X-Forwarded-For` 中至少一种传给后端
 - 后端显式开启 `TEAMVIEWER_TRUST_PROXY_HEADERS=true`，并把你的反代源地址段写进 `TEAMVIEWER_TRUSTED_PROXY_CIDRS`
+
+Rust 后端只在 TCP 直连来源位于可信 CIDR 时读取这些头，并按 `CF-Connecting-IP`、`X-Real-IP`、`X-Forwarded-For` 的顺序选取第一个合法 IP。否则会忽略所有代理头并使用 TCP peer IP。
 
 推荐 Docker Compose 环境变量：
 
@@ -162,9 +164,9 @@ docker compose up -d --build
 
 - 所有 HTTP、SSE、WebSocket 请求都反代到 `http://127.0.0.1:8765`
 - `/admin/api/events` 关闭 `proxy_buffering`
-- 统一转发 `X-Real-IP`、`X-Forwarded-For`、`X-Forwarded-Proto`
+- 统一转发 `X-Real-IP`、`X-Forwarded-For`、`X-Forwarded-Proto`；Cloudflare 部署可同时保留 `CF-Connecting-IP`
 
-如果你的 OpenResty 前面还有 Cloudflare 之类的上游代理，应该先在 OpenResty 层把真实访客 IP 还原到 `$remote_addr`，再把它转发给本后端。
+如果你的 OpenResty 前面还有 Cloudflare 之类的上游代理，应该先在 OpenResty 层校验 Cloudflare 来源并把真实访客 IP 还原到 `$remote_addr`，再把它转发给本后端。不要让可绕过 Cloudflare 的请求把自带的 `CF-Connecting-IP` 原样传入可信后端。
 
 ## Docker Compose 部署
 
