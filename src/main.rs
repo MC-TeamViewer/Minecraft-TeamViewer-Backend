@@ -16,6 +16,11 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "memory-debug")]
+    if let Some(result) = render_heap_profile_command() {
+        return result;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -45,14 +50,27 @@ async fn main() -> anyhow::Result<()> {
     relationships.initialize().await?;
     let metrics = Arc::new(Metrics::default());
     tokio::spawn(flush_traffic_loop(db.clone(), metrics.clone()));
+    let relay = RelayHandle::spawn(config.clone());
+    #[cfg(feature = "memory-debug")]
+    let resource_debug = Some(
+        teamviewrelay_rust::resource_debug::ResourceDebugHandle::start(
+            relay.clone(),
+            db.clone(),
+            metrics.clone(),
+            db_path.clone(),
+        )
+        .await?,
+    );
     let state = AppState {
-        relay: RelayHandle::spawn(config.clone()),
+        relay,
         db,
         tab_history,
         relationships,
         config,
         metrics,
         maintenance_rooms: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
+        #[cfg(feature = "memory-debug")]
+        resource_debug,
     };
     let port = env::var("TEAMVIEWER_PORT")
         .ok()
@@ -69,6 +87,26 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("HTTP server failed")?;
     Ok(())
+}
+
+#[cfg(feature = "memory-debug")]
+fn render_heap_profile_command() -> Option<anyhow::Result<()>> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--render-heap-profile")) {
+        return None;
+    }
+    let result = (|| {
+        let raw = args.next().context("missing raw heap profile path")?;
+        let mappings = args.next().context("missing heap mapping path")?;
+        let output_prefix = args.next().context("missing heap output prefix")?;
+        anyhow::ensure!(args.next().is_none(), "unexpected heap renderer arguments");
+        teamviewrelay_rust::resource_debug::render_heap_profile(
+            std::path::Path::new(&raw),
+            std::path::Path::new(&mappings),
+            std::path::Path::new(&output_prefix),
+        )
+    })();
+    Some(result)
 }
 
 async fn shutdown_signal() {

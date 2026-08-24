@@ -12,6 +12,8 @@ waypointTimeoutSec = 60
 battleChunkTimeoutSec = 120
 # 战局区块服务端缓存保留时间（秒）
 battleChunkCacheRetentionSec = 7200
+# 每个房间最多保留的战局区块数量；达到时间或数量任一上限即淘汰最老记录
+battleChunkCacheMaxEntries = 65536
 
 [refreshRequest]
 # 同一来源两次 refresh_req 的最小间隔（秒）

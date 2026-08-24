@@ -9,6 +9,7 @@ pub struct RuntimeConfig {
     pub waypoint_timeout_sec: u64,
     pub battle_chunk_timeout_sec: u64,
     pub battle_chunk_cache_retention_sec: u64,
+    pub battle_chunk_cache_max_entries: usize,
     pub refresh_cooldown_sec: f64,
     pub refresh_lead_sec: f64,
     pub refresh_max_items: usize,
@@ -53,6 +54,8 @@ struct TimeoutConfig {
     battle_chunk_timeout_sec: u64,
     #[serde(rename = "battleChunkCacheRetentionSec")]
     battle_chunk_cache_retention_sec: u64,
+    #[serde(rename = "battleChunkCacheMaxEntries")]
+    battle_chunk_cache_max_entries: usize,
 }
 
 impl Default for TimeoutConfig {
@@ -63,6 +66,7 @@ impl Default for TimeoutConfig {
             waypoint_timeout_sec: 60,
             battle_chunk_timeout_sec: 120,
             battle_chunk_cache_retention_sec: 7_200,
+            battle_chunk_cache_max_entries: 65_536,
         }
     }
 }
@@ -177,6 +181,10 @@ impl RuntimeConfig {
                 .timeouts
                 .battle_chunk_cache_retention_sec
                 .clamp(60, 604_800),
+            battle_chunk_cache_max_entries: parsed
+                .timeouts
+                .battle_chunk_cache_max_entries
+                .clamp(1_024, 1_048_576),
             refresh_cooldown_sec: parsed.refresh_request.cooldown_sec.clamp(0.1, 120.0),
             refresh_lead_sec: parsed.refresh_request.lead_sec.clamp(0.1, 30.0),
             refresh_max_items: parsed.refresh_request.max_items_per_scope.clamp(1, 500),
@@ -239,5 +247,7 @@ mod tests {
         assert_eq!(config.broadcast_hz(20), 5.0);
         assert_eq!(config.broadcast_hz(40), 2.0);
         assert_eq!(config.report_interval_ticks(2.0), 10);
+        assert_eq!(config.battle_chunk_cache_retention_sec, 7_200);
+        assert_eq!(config.battle_chunk_cache_max_entries, 65_536);
     }
 }

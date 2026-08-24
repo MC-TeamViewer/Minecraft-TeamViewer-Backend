@@ -1,6 +1,7 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    sync::Arc,
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -41,7 +42,10 @@ pub enum ConnectionKind {
 #[derive(Clone)]
 pub struct StateFrame {
     pub revision: u64,
-    pub bytes: Arc<[u8]>,
+    pub bytes: Option<Arc<[u8]>>,
+    pub digest: Option<Arc<[u8]>>,
+    pub snapshot: Arc<SnapshotFull>,
+    pub battle_revision: u64,
 }
 
 pub struct RegisterConnection {
@@ -65,6 +69,8 @@ pub enum RelayEvent {
     Delivered {
         id: String,
         revision: u64,
+        snapshot: Arc<SnapshotFull>,
+        battle_revision: u64,
     },
     PlayerReport {
         id: String,
@@ -109,6 +115,10 @@ pub enum RelayEvent {
         room: String,
         reply: oneshot::Sender<usize>,
     },
+    #[cfg(feature = "memory-debug")]
+    DebugStats {
+        reply: oneshot::Sender<RelayDebugStats>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -118,6 +128,79 @@ pub struct RoomPurgeResult {
     pub sources: usize,
     pub room_frames: usize,
     pub disconnected_external_sources: usize,
+}
+
+#[cfg(feature = "memory-debug")]
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayDebugStats {
+    pub connections: usize,
+    pub player_connections: usize,
+    pub web_map_connections: usize,
+    pub external_source_connections: usize,
+    pub active_rooms: usize,
+    pub sources: usize,
+    pub cache_sources: usize,
+    pub tactical_sources: usize,
+    pub disconnected_sources: usize,
+    pub source_players: usize,
+    pub source_entities: usize,
+    pub source_waypoints: usize,
+    pub source_battle_chunks: usize,
+    pub battle_cache_chunks: usize,
+    pub battle_cache_value_entries: usize,
+    pub battle_cache_dimension_entries: usize,
+    pub battle_cache_change_batches: usize,
+    pub battle_cache_revisions: u64,
+    pub battle_cache_evictions: u64,
+    pub battle_cache_full_expansions: u64,
+    pub battle_cache_patch_builds: u64,
+    pub source_last_seen_players: usize,
+    pub source_tab_players: usize,
+    pub room_frames: usize,
+    pub room_snapshot_objects: usize,
+    pub room_web_snapshot_objects: usize,
+    pub scoped_selections: usize,
+    pub scoped_selection_entries: usize,
+    pub player_marks: usize,
+    pub refresh_entries: usize,
+    pub disconnected_external_records: usize,
+    pub relay_queue_remaining: usize,
+    pub relay_queue_capacity: usize,
+    pub broadcast_hz: f64,
+    pub events_total: u64,
+    pub player_reports: u64,
+    pub delivered_events: u64,
+    pub ticks_total: u64,
+    pub cleanup_nanoseconds: u64,
+    pub broadcasts_total: u64,
+    pub broadcast_nanoseconds: u64,
+    pub broadcast_recipients: u64,
+    pub encoded_payload_bytes: u64,
+    pub payload_builds_total: u64,
+    pub payload_cache_hits: u64,
+    pub digests_total: u64,
+    pub digest_cache_hits: u64,
+    pub digest_nanoseconds: u64,
+}
+
+#[cfg(feature = "memory-debug")]
+#[derive(Default)]
+struct RelayDebugCounters {
+    events_total: u64,
+    player_reports: u64,
+    delivered_events: u64,
+    ticks_total: u64,
+    cleanup_nanoseconds: u64,
+    broadcasts_total: u64,
+    broadcast_nanoseconds: u64,
+    broadcast_recipients: u64,
+    encoded_payload_bytes: u64,
+    payload_builds_total: u64,
+    payload_cache_hits: u64,
+    digests_total: u64,
+    digest_cache_hits: u64,
+    digest_nanoseconds: u64,
 }
 
 #[derive(Clone)]
@@ -178,6 +261,16 @@ impl RelayHandle {
             .await?;
         response.await.context("relay room count response dropped")
     }
+
+    #[cfg(feature = "memory-debug")]
+    pub async fn debug_stats(&self) -> anyhow::Result<RelayDebugStats> {
+        let (reply, response) = oneshot::channel();
+        self.send(RelayEvent::DebugStats { reply }).await?;
+        let mut stats = response.await.context("relay debug response dropped")?;
+        stats.relay_queue_remaining = self.tx.capacity();
+        stats.relay_queue_capacity = EVENT_CAPACITY;
+        Ok(stats)
+    }
 }
 
 struct Connection {
@@ -192,12 +285,11 @@ struct Connection {
     control: mpsc::Sender<Arc<[u8]>>,
     state: watch::Sender<Option<StateFrame>>,
     delivered_revision: u64,
-    queued_revision: u64,
     delivered_snapshot: Option<Arc<SnapshotFull>>,
-    queued_snapshot: Option<Arc<SnapshotFull>>,
+    delivered_battle_revision: u64,
+    next_digest_at: Instant,
     force_full: bool,
     tab_history_subscribed: bool,
-    last_digest_sent: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -239,6 +331,368 @@ struct BattleProjection {
     chunk_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct BattleCacheKey {
+    dimension: Arc<str>,
+    chunk_x: i32,
+    chunk_z: i32,
+}
+
+impl BattleCacheKey {
+    fn from_ref(reference: &BattleChunkRef, dimension: Arc<str>) -> Option<Self> {
+        let coord = reference.coord.as_ref()?;
+        Some(Self {
+            dimension,
+            chunk_x: coord.chunk_x,
+            chunk_z: coord.chunk_z,
+        })
+    }
+
+    fn to_ref(&self) -> BattleChunkRef {
+        BattleChunkRef {
+            dimension: self.dimension.to_string(),
+            coord: Some(crate::proto::teamviewer::v1::BattleChunkCoord {
+                chunk_x: self.chunk_x,
+                chunk_z: self.chunk_z,
+            }),
+        }
+    }
+}
+
+struct CachedBattleChunk {
+    value: Arc<BattleChunkValue>,
+    generation: u64,
+}
+
+struct BattleExpiryBatch {
+    received_at: Instant,
+    generation: u64,
+    keys: VecDeque<BattleCacheKey>,
+}
+
+struct BattleChangeBatch {
+    revision: u64,
+    keys: Vec<BattleCacheKey>,
+    requires_clear: bool,
+}
+
+#[derive(Default)]
+struct BattleRoomCache {
+    entries: BTreeMap<BattleCacheKey, CachedBattleChunk>,
+    dimensions: HashMap<String, Weak<str>>,
+    values: HashMap<Vec<u8>, Weak<BattleChunkValue>>,
+    expiry: VecDeque<BattleExpiryBatch>,
+    changes: VecDeque<BattleChangeBatch>,
+    change_operations: usize,
+    revision: u64,
+    next_generation: u64,
+    evictions_total: u64,
+    full_expansions_total: Cell<u64>,
+    patch_builds_total: Cell<u64>,
+}
+
+impl BattleRoomCache {
+    const MAX_CHANGE_BATCHES: usize = 256;
+    const MAX_CHANGE_OPERATIONS: usize = 65_536;
+
+    fn upsert(
+        &mut self,
+        entries: Vec<BattleChunkEntry>,
+        received_at: Instant,
+        max_entries: usize,
+    ) -> bool {
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        let generation = self.next_generation;
+        let mut expiry_keys = Vec::with_capacity(entries.len());
+        let mut changed = BTreeSet::new();
+        let mut requires_clear = false;
+
+        for entry in entries {
+            let Some(reference) = entry.r#ref.as_ref() else {
+                continue;
+            };
+            let dimension = reference.dimension.trim();
+            if dimension.is_empty() {
+                continue;
+            }
+            let dimension = self.intern_dimension(dimension);
+            let Some(key) = BattleCacheKey::from_ref(reference, dimension) else {
+                continue;
+            };
+            let Some(value) = entry.data else {
+                continue;
+            };
+            let value = self.intern_value(value);
+            let previous = self.entries.get(&key);
+            let visible_changed =
+                previous.is_none_or(|current| current.value.as_ref() != value.as_ref());
+            requires_clear |= previous.is_some_and(|current| {
+                !battle_cleared_fields(current.value.as_ref(), value.as_ref()).is_empty()
+            });
+            self.entries
+                .insert(key.clone(), CachedBattleChunk { value, generation });
+            expiry_keys.push(key.clone());
+            if visible_changed {
+                changed.insert(key);
+            }
+        }
+
+        if !expiry_keys.is_empty() {
+            self.expiry.push_back(BattleExpiryBatch {
+                received_at,
+                generation,
+                keys: expiry_keys.into(),
+            });
+        }
+        self.evict_to_limit(max_entries, &mut changed);
+        let changed = self.record_changes(changed, requires_clear);
+        if generation.is_multiple_of(64) {
+            self.prune_stale_indexes();
+        }
+        changed
+    }
+
+    fn cleanup(&mut self, now: Instant, retention: Duration, max_entries: usize) -> bool {
+        let mut changed = BTreeSet::new();
+        while self
+            .expiry
+            .front()
+            .is_some_and(|batch| now.saturating_duration_since(batch.received_at) > retention)
+        {
+            self.pop_expiry_batch(&mut changed);
+        }
+        self.evict_to_limit(max_entries, &mut changed);
+        let changed = self.record_changes(changed, false);
+        if changed {
+            self.prune_interners();
+        }
+        changed
+    }
+
+    fn full_entries(&self, include_mode: bool) -> Vec<BattleChunkEntry> {
+        self.full_expansions_total
+            .set(self.full_expansions_total.get().saturating_add(1));
+        self.entries
+            .iter()
+            .map(|(key, entry)| self.proto_entry(key, entry, include_mode))
+            .collect()
+    }
+
+    fn digest(&self, contract: BattleChunkDigestContract, include_mode: bool) -> String {
+        battle_cache_digest(self, contract, include_mode)
+    }
+
+    fn patch_since(
+        &self,
+        delivered_revision: u64,
+        include_mode: bool,
+        include_clear_fields: bool,
+    ) -> Option<Option<BattleChunkPatchScope>> {
+        if delivered_revision == self.revision {
+            return Some(None);
+        }
+        if delivered_revision > self.revision
+            || self
+                .changes
+                .front()
+                .is_none_or(|batch| batch.revision > delivered_revision.saturating_add(1))
+        {
+            return None;
+        }
+
+        let keys = self
+            .changes
+            .iter()
+            .filter(|batch| batch.revision > delivered_revision)
+            .flat_map(|batch| batch.keys.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let mut upsert = Vec::new();
+        let mut delete = Vec::new();
+        for key in keys {
+            if let Some(entry) = self.entries.get(&key) {
+                let proto = self.proto_entry(&key, entry, include_mode);
+                upsert.push(BattleChunkUpsert {
+                    r#ref: proto.r#ref,
+                    clear_fields: if include_clear_fields {
+                        battle_missing_fields(
+                            proto.data.as_ref().expect("cache entries have data"),
+                            include_mode,
+                        )
+                    } else {
+                        Vec::new()
+                    },
+                    data: proto.data,
+                });
+            } else {
+                delete.push(key.to_ref());
+            }
+        }
+        self.patch_builds_total
+            .set(self.patch_builds_total.get().saturating_add(1));
+        Some(Some(BattleChunkPatchScope { upsert, delete }))
+    }
+
+    fn requires_clear_since(&self, delivered_revision: u64) -> Option<bool> {
+        if delivered_revision == self.revision {
+            return Some(false);
+        }
+        if delivered_revision > self.revision
+            || self
+                .changes
+                .front()
+                .is_none_or(|batch| batch.revision > delivered_revision.saturating_add(1))
+        {
+            return None;
+        }
+        Some(
+            self.changes
+                .iter()
+                .filter(|batch| batch.revision > delivered_revision)
+                .any(|batch| batch.requires_clear),
+        )
+    }
+
+    fn meta_entries(&self, requested: &HashSet<String>) -> Vec<BattleChunkMetaEntry> {
+        self.entries
+            .iter()
+            .filter(|(key, _)| {
+                requested.contains(&battle_key(&key.dimension, key.chunk_x, key.chunk_z))
+            })
+            .map(|(key, entry)| BattleChunkMetaEntry {
+                r#ref: Some(key.to_ref()),
+                data: Some(entry.value.as_ref().clone()),
+            })
+            .collect()
+    }
+
+    fn proto_entry(
+        &self,
+        key: &BattleCacheKey,
+        entry: &CachedBattleChunk,
+        include_mode: bool,
+    ) -> BattleChunkEntry {
+        let mut value = entry.value.as_ref().clone();
+        value.observed_at = None;
+        value.position_sampled_at = None;
+        value.alignment_source = None;
+        value.reporter_id = None;
+        if !include_mode {
+            value.mode = None;
+        }
+        BattleChunkEntry {
+            r#ref: Some(key.to_ref()),
+            data: Some(value),
+        }
+    }
+
+    fn intern_dimension(&mut self, value: &str) -> Arc<str> {
+        if let Some(value) = self.dimensions.get(value).and_then(Weak::upgrade) {
+            return value;
+        }
+        let interned: Arc<str> = Arc::from(value);
+        self.dimensions
+            .insert(value.to_owned(), Arc::downgrade(&interned));
+        interned
+    }
+
+    fn intern_value(&mut self, value: BattleChunkValue) -> Arc<BattleChunkValue> {
+        let encoded = value.encode_to_vec();
+        if let Some(value) = self.values.get(&encoded).and_then(Weak::upgrade) {
+            return value;
+        }
+        let interned = Arc::new(value);
+        self.values.insert(encoded, Arc::downgrade(&interned));
+        interned
+    }
+
+    fn evict_to_limit(&mut self, max_entries: usize, changed: &mut BTreeSet<BattleCacheKey>) {
+        while self.entries.len() > max_entries && !self.expiry.is_empty() {
+            self.pop_oldest_key(changed);
+        }
+    }
+
+    fn pop_oldest_key(&mut self, changed: &mut BTreeSet<BattleCacheKey>) {
+        let Some(batch) = self.expiry.front_mut() else {
+            return;
+        };
+        let generation = batch.generation;
+        let key = batch.keys.pop_front();
+        if batch.keys.is_empty() {
+            self.expiry.pop_front();
+        }
+        let Some(key) = key else {
+            return;
+        };
+        if self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            self.entries.remove(&key);
+            self.evictions_total = self.evictions_total.saturating_add(1);
+            changed.insert(key);
+        }
+    }
+
+    fn pop_expiry_batch(&mut self, changed: &mut BTreeSet<BattleCacheKey>) {
+        let Some(batch) = self.expiry.pop_front() else {
+            return;
+        };
+        for key in batch.keys {
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.generation == batch.generation)
+            {
+                self.entries.remove(&key);
+                self.evictions_total = self.evictions_total.saturating_add(1);
+                changed.insert(key);
+            }
+        }
+    }
+
+    fn record_changes(&mut self, changed: BTreeSet<BattleCacheKey>, requires_clear: bool) -> bool {
+        if changed.is_empty() {
+            return false;
+        }
+        self.revision = self.revision.wrapping_add(1).max(1);
+        let keys = changed.into_iter().collect::<Vec<_>>();
+        self.change_operations = self.change_operations.saturating_add(keys.len());
+        self.changes.push_back(BattleChangeBatch {
+            revision: self.revision,
+            keys,
+            requires_clear,
+        });
+        while self.changes.len() > Self::MAX_CHANGE_BATCHES
+            || self.change_operations > Self::MAX_CHANGE_OPERATIONS
+        {
+            let Some(batch) = self.changes.pop_front() else {
+                break;
+            };
+            self.change_operations = self.change_operations.saturating_sub(batch.keys.len());
+        }
+        true
+    }
+
+    fn prune_interners(&mut self) {
+        self.dimensions.retain(|_, value| value.strong_count() > 0);
+        self.values.retain(|_, value| value.strong_count() > 0);
+    }
+
+    fn prune_stale_indexes(&mut self) {
+        let entries = &self.entries;
+        for batch in &mut self.expiry {
+            batch.keys.retain(|key| {
+                entries
+                    .get(key)
+                    .is_some_and(|entry| entry.generation == batch.generation)
+            });
+        }
+        self.expiry.retain(|batch| !batch.keys.is_empty());
+        self.prune_interners();
+    }
+}
+
 #[derive(Default)]
 struct RoomFrame {
     revision: u64,
@@ -270,6 +724,7 @@ struct SameServerGrouping {
 struct Relay {
     connections: HashMap<String, Connection>,
     sources: HashMap<String, SourceState>,
+    battle_caches: HashMap<String, BattleRoomCache>,
     rooms: HashMap<String, RoomFrame>,
     dirty: bool,
     config: Arc<RuntimeConfig>,
@@ -280,6 +735,8 @@ struct Relay {
     same_server_filter_enabled: bool,
     scoped_selections: HashMap<(String, Vec<String>), ScopeSelections>,
     disconnected_external_sources: VecDeque<Value>,
+    #[cfg(feature = "memory-debug")]
+    debug_counters: RelayDebugCounters,
 }
 
 impl Relay {
@@ -291,6 +748,7 @@ impl Relay {
         Self {
             connections: HashMap::new(),
             sources: HashMap::new(),
+            battle_caches: HashMap::new(),
             rooms: HashMap::new(),
             dirty: false,
             broadcast_hz: config.default_broadcast_hz,
@@ -301,6 +759,8 @@ impl Relay {
             same_server_filter_enabled,
             scoped_selections: HashMap::new(),
             disconnected_external_sources: VecDeque::new(),
+            #[cfg(feature = "memory-debug")]
+            debug_counters: RelayDebugCounters::default(),
         }
     }
 
@@ -310,9 +770,36 @@ impl Relay {
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else { break };
+                    #[cfg(feature = "memory-debug")]
+                    {
+                        match &event {
+                            RelayEvent::DebugStats { .. } => {}
+                            RelayEvent::PlayerReport { .. } => {
+                                self.debug_counters.events_total =
+                                    self.debug_counters.events_total.saturating_add(1);
+                                self.debug_counters.player_reports =
+                                    self.debug_counters.player_reports.saturating_add(1);
+                            }
+                            RelayEvent::Delivered { .. } => {
+                                self.debug_counters.events_total =
+                                    self.debug_counters.events_total.saturating_add(1);
+                                self.debug_counters.delivered_events =
+                                    self.debug_counters.delivered_events.saturating_add(1);
+                            }
+                            _ => {
+                                self.debug_counters.events_total =
+                                    self.debug_counters.events_total.saturating_add(1);
+                            }
+                        }
+                    }
                     self.handle_event(event);
                 }
                 _ = tokio::time::sleep_until(next_tick) => {
+                    #[cfg(feature = "memory-debug")]
+                    {
+                        self.debug_counters.ticks_total =
+                            self.debug_counters.ticks_total.saturating_add(1);
+                    }
                     let next_hz = self.config.broadcast_hz(
                         self.player_connection_count.load(std::sync::atomic::Ordering::Relaxed)
                     );
@@ -321,15 +808,24 @@ impl Relay {
                         self.broadcast_report_rate_hints("congestion");
                     }
                     let now = Instant::now();
+                    #[cfg(feature = "memory-debug")]
+                    let cleanup_started = Instant::now();
                     if self.cleanup_timeouts(now) {
                         self.dirty = true;
                     }
+                    #[cfg(feature = "memory-debug")]
+                    {
+                        self.debug_counters.cleanup_nanoseconds = self
+                            .debug_counters
+                            .cleanup_nanoseconds
+                            .saturating_add(duration_nanoseconds(cleanup_started.elapsed()));
+                    }
                     self.send_preexpiry_refresh_requests(now);
-                    if self.dirty {
-                        self.broadcast();
+                    let state_dirty = self.dirty;
+                    if state_dirty || self.digest_due(now) {
+                        self.broadcast(now, state_dirty);
                         self.dirty = false;
                     }
-                    self.send_due_digests(now);
                     next_tick = tokio::time::Instant::now()
                         + Duration::from_secs_f64(
                             1.0 / self.broadcast_hz.max(self.config.min_broadcast_hz)
@@ -356,12 +852,11 @@ impl Relay {
                         control: register.control,
                         state: register.state,
                         delivered_revision: 0,
-                        queued_revision: 0,
                         delivered_snapshot: None,
-                        queued_snapshot: None,
+                        delivered_battle_revision: 0,
+                        next_digest_at: Instant::now(),
                         force_full: true,
                         tab_history_subscribed: false,
-                        last_digest_sent: None,
                     },
                 );
                 self.update_player_connection_count();
@@ -423,12 +918,18 @@ impl Relay {
                 }
                 self.last_refresh_sent.remove(&id);
             }
-            RelayEvent::Delivered { id, revision } => {
-                if let Some(connection) = self.connections.get_mut(&id) {
-                    connection.delivered_revision = connection.delivered_revision.max(revision);
-                    if connection.queued_revision == revision {
-                        connection.delivered_snapshot = connection.queued_snapshot.clone();
-                    }
+            RelayEvent::Delivered {
+                id,
+                revision,
+                snapshot,
+                battle_revision,
+            } => {
+                if let Some(connection) = self.connections.get_mut(&id)
+                    && revision >= connection.delivered_revision
+                {
+                    connection.delivered_revision = revision;
+                    connection.delivered_snapshot = Some(snapshot);
+                    connection.delivered_battle_revision = battle_revision;
                 }
             }
             RelayEvent::PlayerReport { id, report } => {
@@ -546,6 +1047,7 @@ impl Relay {
                     self.last_refresh_sent.remove(source_id);
                 }
                 let room_frames = usize::from(self.rooms.remove(&room).is_some());
+                self.battle_caches.remove(&room);
                 let before_disconnected = self.disconnected_external_sources.len();
                 self.disconnected_external_sources
                     .retain(|record| record["roomCode"].as_str() != Some(room.as_str()));
@@ -569,6 +1071,10 @@ impl Relay {
                     .count();
                 let _ = reply.send(active_connections);
             }
+            #[cfg(feature = "memory-debug")]
+            RelayEvent::DebugStats { reply } => {
+                let _ = reply.send(self.debug_stats());
+            }
         }
     }
 
@@ -580,6 +1086,12 @@ impl Relay {
                 .count(),
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    fn digest_due(&self, now: Instant) -> bool {
+        self.connections.values().any(|connection| {
+            connection.kind == ConnectionKind::Player && connection.next_digest_at <= now
+        })
     }
 
     fn broadcast_report_rate_hints(&self, reason: &str) {
@@ -602,7 +1114,6 @@ impl Relay {
 
     fn apply_report(&mut self, id: &str, report: PlayerReportBundle) {
         let now = Instant::now();
-        let battle_touched = report.battle_map_observation.is_some();
         let room = self
             .connections
             .get(id)
@@ -733,9 +1244,10 @@ impl Relay {
             source.tab_received_at = Some(now);
             source.tab_timestamp = Some(unix_seconds());
         }
-        if let Some(observation) = report.battle_map_observation {
-            apply_battle_observation(source, id, observation, now);
-        }
+        let battle_cache_update = report.battle_map_observation.and_then(|observation| {
+            let entries = apply_battle_observation(source, id, observation, now);
+            (!entries.is_empty()).then(|| (source.room.clone(), entries))
+        });
         if let Some(keepalive) = report.state_keepalive {
             for object_id in keepalive.players {
                 if let Some(value) = source.players.get_mut(&object_id) {
@@ -789,22 +1301,12 @@ impl Relay {
                 source.battle_projection = None;
             }
         }
-        let battle_cache_update = battle_touched.then(|| {
-            (
-                source.room.clone(),
-                source.battle_chunks.clone(),
-                source.battle_projection.clone(),
-            )
-        });
-
-        if let Some((room, chunks, projection)) = battle_cache_update {
-            let cache = self
-                .sources
-                .entry(format!("__battle_chunk_cache__:{room}"))
-                .or_default();
-            cache.room = room;
-            cache.battle_chunks.extend(chunks);
-            cache.battle_projection = projection;
+        if let Some((room, entries)) = battle_cache_update {
+            self.battle_caches.entry(room).or_default().upsert(
+                entries,
+                now,
+                self.config.battle_chunk_cache_max_entries,
+            );
         }
 
         let death_targets: HashSet<_> = report
@@ -1138,16 +1640,7 @@ impl Relay {
         .into_iter()
         .map(|(id, (_, data))| (id, data))
         .collect();
-        snapshot.battle_chunks = resolve_candidates(
-            collect_candidates(&self.sources, room, allowed_sources, true, |source| {
-                &source.battle_chunks
-            }),
-            &mut selected_battle_chunks,
-            |_, source_id| i32::from(!source_id.starts_with("__battle_chunk_cache__:")),
-        )
-        .into_values()
-        .map(|(_, entry)| battle_chunk_without_meta(entry))
-        .collect();
+        selected_battle_chunks.clear();
         snapshot.last_seen_players = resolve_candidates(
             collect_candidates(&self.sources, room, allowed_sources, false, |source| {
                 &source.last_seen_players
@@ -1186,7 +1679,6 @@ impl Relay {
                 );
             }
         }
-        snapshot.battle_chunks.sort_by_key(battle_entry_key);
         snapshot.player_marks = self.player_marks.clone();
 
         if let Some(key) = scoped_key {
@@ -1348,23 +1840,10 @@ impl Relay {
         };
         let requested: std::collections::HashSet<_> =
             requested.iter().filter_map(battle_ref_key).collect();
-        let mut battle_chunks = Vec::new();
-        for source in self
-            .sources
-            .values()
-            .filter(|source| source.room == connection.room)
-        {
-            battle_chunks.extend(
-                source
-                    .battle_chunks
-                    .iter()
-                    .filter(|(key, _)| requested.contains(*key))
-                    .map(|(_, entry)| BattleChunkMetaEntry {
-                        r#ref: entry.data.r#ref.clone(),
-                        data: entry.data.data.clone(),
-                    }),
-            );
-        }
+        let mut battle_chunks = self
+            .battle_caches
+            .get(&connection.room)
+            .map_or_else(Vec::new, |cache| cache.meta_entries(&requested));
         battle_chunks.sort_by_key(|entry| entry.r#ref.as_ref().and_then(battle_ref_key));
         let channel = if connection.kind == ConnectionKind::WebMap {
             WireChannel::WebMap
@@ -1415,13 +1894,9 @@ impl Relay {
             changed |= before != source.waypoints.len();
 
             let before = source.battle_chunks.len();
-            let battle_timeout = if source_id.starts_with("__battle_chunk_cache__:") {
-                self.config.battle_chunk_cache_retention_sec
-            } else {
-                self.config.battle_chunk_timeout_sec
-            };
             source.battle_chunks.retain(|_, value| {
-                now.duration_since(value.received_at) <= Duration::from_secs(battle_timeout)
+                now.duration_since(value.received_at)
+                    <= Duration::from_secs(self.config.battle_chunk_timeout_sec)
             });
             changed |= before != source.battle_chunks.len();
 
@@ -1436,6 +1911,10 @@ impl Relay {
                 source.tab_received_at = None;
                 source.tab_timestamp = None;
             }
+        }
+        let retention = Duration::from_secs(self.config.battle_chunk_cache_retention_sec);
+        for cache in self.battle_caches.values_mut() {
+            changed |= cache.cleanup(now, retention, self.config.battle_chunk_cache_max_entries);
         }
         changed
     }
@@ -1515,43 +1994,24 @@ impl Relay {
         }
     }
 
-    fn send_due_digests(&mut self, now: Instant) {
-        let interval = Duration::from_secs(self.config.digest_interval_sec);
-        let due = self
-            .connections
-            .iter()
-            .filter(|(_, connection)| {
-                connection.kind == ConnectionKind::Player
-                    && connection
-                        .last_digest_sent
-                        .is_none_or(|last| now.duration_since(last) >= interval)
-            })
-            .map(|(id, connection)| {
-                (
-                    id.clone(),
-                    connection.protocol,
-                    connection.control.clone(),
-                    connection.delivered_snapshot.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (id, protocol, control, delivered_snapshot) in due {
-            let Some(snapshot) = delivered_snapshot else {
-                continue;
-            };
-            let bytes = encode_payload(
-                WireChannel::Player,
-                wire_envelope::Payload::Digest(snapshot_digest(&snapshot, protocol)),
-            );
-            if control.try_send(bytes).is_ok()
-                && let Some(connection) = self.connections.get_mut(&id)
-            {
-                connection.last_digest_sent = Some(now);
-            }
-        }
-    }
+    fn broadcast(&mut self, now: Instant, state_dirty: bool) {
+        #[cfg(feature = "memory-debug")]
+        let debug_started = Instant::now();
+        #[cfg(feature = "memory-debug")]
+        let mut debug_recipients = 0_u64;
+        #[cfg(feature = "memory-debug")]
+        let mut debug_payload_bytes = 0_u64;
+        #[cfg(feature = "memory-debug")]
+        let mut debug_payload_builds = 0_u64;
+        #[cfg(feature = "memory-debug")]
+        let mut debug_payload_cache_hits = 0_u64;
+        #[cfg(feature = "memory-debug")]
+        let mut debug_digests = 0_u64;
+        #[cfg(feature = "memory-debug")]
+        let mut debug_digest_cache_hits = 0_u64;
+        #[cfg(feature = "memory-debug")]
+        let mut debug_digest_nanoseconds = 0_u64;
 
-    fn broadcast(&mut self) {
         let mut rooms: Vec<String> = self
             .connections
             .values()
@@ -1563,6 +2023,10 @@ impl Relay {
         for room in rooms {
             let player_snapshot = Arc::new(self.build_room_snapshot(&room, false, None));
             let web_snapshot = Arc::new(self.build_room_snapshot(&room, true, None));
+            let battle_revision = self
+                .battle_caches
+                .get(&room)
+                .map_or(0, |cache| cache.revision);
             let previous_revision = self.rooms.get(&room).map_or(0, |frame| frame.revision);
             let revision = previous_revision + 1;
             let grouping = self.same_server_grouping(&room);
@@ -1579,16 +2043,33 @@ impl Relay {
                         connection.protocol,
                         connection.force_full,
                         connection.delivered_snapshot.clone(),
+                        connection.delivered_battle_revision,
+                        connection.kind == ConnectionKind::Player
+                            && connection.next_digest_at <= now,
                     )
                 })
                 .collect::<Vec<_>>();
             let mut scoped_snapshots: HashMap<Vec<String>, Arc<SnapshotFull>> = HashMap::new();
-            let mut projected_snapshots: HashMap<
-                (ConnectionKind, Vec<String>, ProtocolEpoch),
-                Arc<SnapshotFull>,
-            > = HashMap::new();
+            type ProjectionKey = (ConnectionKind, Vec<String>, ProtocolEpoch);
+            type PayloadKey = (ProjectionKey, bool, Option<usize>, u64);
+            type DigestKey = (Vec<String>, bool, bool, bool, bool);
+            let mut projected_snapshots: HashMap<ProjectionKey, Arc<SnapshotFull>> = HashMap::new();
+            let mut encoded_payloads: HashMap<PayloadKey, Option<Arc<[u8]>>> = HashMap::new();
+            let mut encoded_digests: HashMap<DigestKey, Arc<[u8]>> = HashMap::new();
 
-            for (id, kind, protocol, force_full, delivered_snapshot) in recipients {
+            for (
+                id,
+                kind,
+                protocol,
+                force_full,
+                delivered_snapshot,
+                delivered_battle_revision,
+                digest_due,
+            ) in recipients
+            {
+                if !state_dirty && kind != ConnectionKind::Player {
+                    continue;
+                }
                 let (base_target, scope_key) = if kind == ConnectionKind::WebMap {
                     (web_snapshot.clone(), Vec::new())
                 } else {
@@ -1610,7 +2091,7 @@ impl Relay {
                 };
                 let projection_key = (kind, scope_key, protocol.epoch());
                 let target = projected_snapshots
-                    .entry(projection_key)
+                    .entry(projection_key.clone())
                     .or_insert_with(|| project_snapshot(protocol, base_target))
                     .clone();
 
@@ -1619,23 +2100,128 @@ impl Relay {
                 } else {
                     WireChannel::Player
                 };
-                let Some(payload) = state_payload_for_profile(
-                    protocol,
+                let delivered_key = delivered_snapshot
+                    .as_ref()
+                    .map(|snapshot| Arc::as_ptr(snapshot) as usize);
+                let payload_key = (
+                    projection_key.clone(),
                     force_full,
-                    delivered_snapshot.as_deref(),
-                    &target,
-                ) else {
-                    continue;
+                    delivered_key,
+                    delivered_battle_revision,
+                );
+                let bytes = match encoded_payloads.entry(payload_key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        #[cfg(feature = "memory-debug")]
+                        {
+                            debug_payload_cache_hits = debug_payload_cache_hits.saturating_add(1);
+                        }
+                        entry.get().clone()
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        #[cfg(feature = "memory-debug")]
+                        {
+                            debug_payload_builds = debug_payload_builds.saturating_add(1);
+                        }
+                        let bytes = state_payload_for_profile_with_battle(
+                            protocol,
+                            force_full,
+                            delivered_snapshot.as_deref(),
+                            delivered_battle_revision,
+                            &target,
+                            self.battle_caches.get(&room),
+                        )
+                        .map(|payload| encode_payload(channel, payload));
+                        entry.insert(bytes.clone());
+                        bytes
+                    }
                 };
-                let bytes = encode_payload(channel, payload);
+                let digest = if digest_due {
+                    let digest_key = (
+                        projection_key.1.clone(),
+                        protocol.supports_battle_chunk_mode(),
+                        protocol.uses_structured_battle_chunk_digest(),
+                        protocol.supports_player_source_metadata(),
+                        protocol.supports_last_seen_players(),
+                    );
+                    Some(match encoded_digests.entry(digest_key) {
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            #[cfg(feature = "memory-debug")]
+                            {
+                                debug_digest_cache_hits = debug_digest_cache_hits.saturating_add(1);
+                            }
+                            entry.get().clone()
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            #[cfg(feature = "memory-debug")]
+                            let digest_started = Instant::now();
+                            let battle_digest = self.battle_caches.get(&room).map_or_else(
+                                || {
+                                    battle_chunk_digest(
+                                        &[],
+                                        battle_chunk_digest_contract(protocol),
+                                        true,
+                                    )
+                                },
+                                |cache| {
+                                    cache.digest(
+                                        battle_chunk_digest_contract(protocol),
+                                        protocol.supports_battle_chunk_mode(),
+                                    )
+                                },
+                            );
+                            let bytes = encode_payload(
+                                WireChannel::Player,
+                                wire_envelope::Payload::Digest(snapshot_digest_with_battle_digest(
+                                    &target,
+                                    battle_digest,
+                                    protocol,
+                                )),
+                            );
+                            #[cfg(feature = "memory-debug")]
+                            {
+                                debug_digests = debug_digests.saturating_add(1);
+                                debug_digest_nanoseconds = debug_digest_nanoseconds
+                                    .saturating_add(duration_nanoseconds(digest_started.elapsed()));
+                            }
+                            entry.insert(bytes.clone());
+                            bytes
+                        }
+                    })
+                } else {
+                    None
+                };
+                if bytes.is_none() && digest.is_none() {
+                    continue;
+                }
+                #[cfg(feature = "memory-debug")]
+                {
+                    debug_recipients = debug_recipients.saturating_add(1);
+                    if let Some(bytes) = &bytes {
+                        debug_payload_bytes =
+                            debug_payload_bytes.saturating_add(bytes.len() as u64);
+                    }
+                    if let Some(digest) = &digest {
+                        debug_payload_bytes =
+                            debug_payload_bytes.saturating_add(digest.len() as u64);
+                    }
+                }
 
                 if let Some(connection) = self.connections.get_mut(&id) {
-                    connection
-                        .state
-                        .send_replace(Some(StateFrame { revision, bytes }));
-                    connection.queued_revision = revision;
-                    connection.queued_snapshot = Some(target);
-                    connection.force_full = false;
+                    let sent_state = bytes.is_some();
+                    connection.state.send_replace(Some(StateFrame {
+                        revision,
+                        bytes,
+                        digest,
+                        snapshot: target,
+                        battle_revision,
+                    }));
+                    if sent_state {
+                        connection.force_full = false;
+                    }
+                    if digest_due {
+                        connection.next_digest_at =
+                            now + Duration::from_secs(self.config.digest_interval_sec);
+                    }
                 }
             }
             let frame = self.rooms.entry(room).or_default();
@@ -1643,11 +2229,234 @@ impl Relay {
             frame.snapshot = (*player_snapshot).clone();
             frame.web_snapshot = (*web_snapshot).clone();
         }
+
+        #[cfg(feature = "memory-debug")]
+        {
+            self.debug_counters.broadcasts_total =
+                self.debug_counters.broadcasts_total.saturating_add(1);
+            self.debug_counters.broadcast_nanoseconds = self
+                .debug_counters
+                .broadcast_nanoseconds
+                .saturating_add(duration_nanoseconds(debug_started.elapsed()));
+            self.debug_counters.broadcast_recipients = self
+                .debug_counters
+                .broadcast_recipients
+                .saturating_add(debug_recipients);
+            self.debug_counters.encoded_payload_bytes = self
+                .debug_counters
+                .encoded_payload_bytes
+                .saturating_add(debug_payload_bytes);
+            self.debug_counters.payload_builds_total = self
+                .debug_counters
+                .payload_builds_total
+                .saturating_add(debug_payload_builds);
+            self.debug_counters.payload_cache_hits = self
+                .debug_counters
+                .payload_cache_hits
+                .saturating_add(debug_payload_cache_hits);
+            self.debug_counters.digests_total = self
+                .debug_counters
+                .digests_total
+                .saturating_add(debug_digests);
+            self.debug_counters.digest_cache_hits = self
+                .debug_counters
+                .digest_cache_hits
+                .saturating_add(debug_digest_cache_hits);
+            self.debug_counters.digest_nanoseconds = self
+                .debug_counters
+                .digest_nanoseconds
+                .saturating_add(debug_digest_nanoseconds);
+        }
+    }
+
+    #[cfg(feature = "memory-debug")]
+    fn debug_stats(&self) -> RelayDebugStats {
+        let player_connections = self
+            .connections
+            .values()
+            .filter(|connection| connection.kind == ConnectionKind::Player)
+            .count();
+        let web_map_connections = self
+            .connections
+            .values()
+            .filter(|connection| connection.kind == ConnectionKind::WebMap)
+            .count();
+        let external_source_connections = self
+            .connections
+            .values()
+            .filter(|connection| connection.kind == ConnectionKind::ExternalSource)
+            .count();
+        let active_rooms = self
+            .connections
+            .values()
+            .map(|connection| &connection.room)
+            .collect::<HashSet<_>>()
+            .len();
+        let source_players = self
+            .sources
+            .values()
+            .map(|source| source.players.len())
+            .sum();
+        let source_entities = self
+            .sources
+            .values()
+            .map(|source| source.entities.len())
+            .sum();
+        let source_waypoints = self
+            .sources
+            .values()
+            .map(|source| source.waypoints.len())
+            .sum();
+        let source_battle_chunks = self
+            .sources
+            .values()
+            .map(|source| source.battle_chunks.len())
+            .sum();
+        let battle_cache_chunks = self
+            .battle_caches
+            .values()
+            .map(|cache| cache.entries.len())
+            .sum();
+        let battle_cache_value_entries = self
+            .battle_caches
+            .values()
+            .map(|cache| cache.values.len())
+            .sum();
+        let battle_cache_dimension_entries = self
+            .battle_caches
+            .values()
+            .map(|cache| cache.dimensions.len())
+            .sum();
+        let battle_cache_change_batches = self
+            .battle_caches
+            .values()
+            .map(|cache| cache.changes.len())
+            .sum();
+        let battle_cache_revisions = self
+            .battle_caches
+            .values()
+            .map(|cache| cache.revision)
+            .sum();
+        let battle_cache_evictions = self
+            .battle_caches
+            .values()
+            .map(|cache| cache.evictions_total)
+            .sum();
+        let battle_cache_full_expansions = self
+            .battle_caches
+            .values()
+            .map(|cache| cache.full_expansions_total.get())
+            .sum();
+        let battle_cache_patch_builds = self
+            .battle_caches
+            .values()
+            .map(|cache| cache.patch_builds_total.get())
+            .sum();
+        let source_last_seen_players = self
+            .sources
+            .values()
+            .map(|source| source.last_seen_players.len())
+            .sum();
+        let source_tab_players = self
+            .sources
+            .values()
+            .map(|source| source.tab_players.len())
+            .sum();
+        let scoped_selection_entries = self
+            .scoped_selections
+            .values()
+            .map(scope_selection_count)
+            .sum();
+        let room_snapshot_objects = self
+            .rooms
+            .iter()
+            .map(|(room_id, room)| {
+                snapshot_object_count(&room.snapshot)
+                    + self
+                        .battle_caches
+                        .get(room_id)
+                        .map_or(0, |cache| cache.entries.len())
+            })
+            .sum();
+        let room_web_snapshot_objects = self
+            .rooms
+            .iter()
+            .map(|(room_id, room)| {
+                snapshot_object_count(&room.web_snapshot)
+                    + self
+                        .battle_caches
+                        .get(room_id)
+                        .map_or(0, |cache| cache.entries.len())
+            })
+            .sum();
+        let counters = &self.debug_counters;
+        RelayDebugStats {
+            connections: self.connections.len(),
+            player_connections,
+            web_map_connections,
+            external_source_connections,
+            active_rooms,
+            sources: self.sources.len(),
+            cache_sources: self.battle_caches.len(),
+            tactical_sources: self
+                .sources
+                .keys()
+                .filter(|id| id.starts_with("__web_map_tactical__:"))
+                .count(),
+            disconnected_sources: self
+                .sources
+                .keys()
+                .filter(|id| !self.connections.contains_key(*id))
+                .count(),
+            source_players,
+            source_entities,
+            source_waypoints,
+            source_battle_chunks,
+            battle_cache_chunks,
+            battle_cache_value_entries,
+            battle_cache_dimension_entries,
+            battle_cache_change_batches,
+            battle_cache_revisions,
+            battle_cache_evictions,
+            battle_cache_full_expansions,
+            battle_cache_patch_builds,
+            source_last_seen_players,
+            source_tab_players,
+            room_frames: self.rooms.len(),
+            room_snapshot_objects,
+            room_web_snapshot_objects,
+            scoped_selections: self.scoped_selections.len(),
+            scoped_selection_entries,
+            player_marks: self.player_marks.len(),
+            refresh_entries: self.last_refresh_sent.len(),
+            disconnected_external_records: self.disconnected_external_sources.len(),
+            relay_queue_remaining: 0,
+            relay_queue_capacity: EVENT_CAPACITY,
+            broadcast_hz: self.broadcast_hz,
+            events_total: counters.events_total,
+            player_reports: counters.player_reports,
+            delivered_events: counters.delivered_events,
+            ticks_total: counters.ticks_total,
+            cleanup_nanoseconds: counters.cleanup_nanoseconds,
+            broadcasts_total: counters.broadcasts_total,
+            broadcast_nanoseconds: counters.broadcast_nanoseconds,
+            broadcast_recipients: counters.broadcast_recipients,
+            encoded_payload_bytes: counters.encoded_payload_bytes,
+            payload_builds_total: counters.payload_builds_total,
+            payload_cache_hits: counters.payload_cache_hits,
+            digests_total: counters.digests_total,
+            digest_cache_hits: counters.digest_cache_hits,
+            digest_nanoseconds: counters.digest_nanoseconds,
+        }
     }
 
     fn snapshot_json(&mut self, requested_room: Option<&str>) -> Value {
         let room = requested_room.unwrap_or("default");
-        let snapshot = self.build_room_snapshot(room, true, None);
+        let mut snapshot = self.build_room_snapshot(room, true, None);
+        snapshot.battle_chunks = self
+            .battle_caches
+            .get(room)
+            .map_or_else(Vec::new, |cache| cache.full_entries(true));
         let connections: Vec<_> = self.connections.keys().cloned().collect();
         let mut room_index: BTreeMap<String, Value> = BTreeMap::new();
         for connection in self.connections.values() {
@@ -1907,6 +2716,34 @@ impl Relay {
     }
 }
 
+#[cfg(feature = "memory-debug")]
+fn snapshot_object_count(snapshot: &SnapshotFull) -> usize {
+    snapshot.players.len()
+        + snapshot.entities.len()
+        + snapshot.waypoints.len()
+        + snapshot.battle_chunks.len()
+        + snapshot.player_marks.len()
+        + snapshot.last_seen_players.len()
+        + snapshot.connections.len()
+        + snapshot.tab_state.as_ref().map_or(0, |tab_state| {
+            tab_state.reports.len() + tab_state.groups.len()
+        })
+}
+
+#[cfg(feature = "memory-debug")]
+fn scope_selection_count(selections: &ScopeSelections) -> usize {
+    selections.players.len()
+        + selections.entities.len()
+        + selections.waypoints.len()
+        + selections.battle_chunks.len()
+        + selections.last_seen_players.len()
+}
+
+#[cfg(feature = "memory-debug")]
+fn duration_nanoseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
 fn collect_candidates<'a, T>(
     sources: &'a HashMap<String, SourceState>,
     room: &str,
@@ -2107,6 +2944,7 @@ fn build_patch(old: &SnapshotFull, new: &SnapshotFull) -> Option<Patch> {
     })
 }
 
+#[cfg(test)]
 fn state_payload_for_profile(
     profile: ProtocolProfile,
     force_full: bool,
@@ -2122,6 +2960,74 @@ fn state_payload_for_profile(
     } else {
         Some(wire_envelope::Payload::Patch(patch))
     }
+}
+
+fn state_payload_for_profile_with_battle(
+    profile: ProtocolProfile,
+    force_full: bool,
+    delivered_snapshot: Option<&SnapshotFull>,
+    delivered_battle_revision: u64,
+    target: &SnapshotFull,
+    battle_cache: Option<&BattleRoomCache>,
+) -> Option<wire_envelope::Payload> {
+    let battle_revision = battle_cache.map_or(0, |cache| cache.revision);
+    let battle_changed = delivered_battle_revision != battle_revision;
+    let battle_patch = if battle_changed {
+        battle_cache.and_then(|cache| {
+            cache.patch_since(
+                delivered_battle_revision,
+                profile.supports_battle_chunk_mode(),
+                profile.supports_clear_fields(),
+            )
+        })
+    } else {
+        Some(None)
+    };
+    let requires_full_battle = battle_changed
+        && (battle_patch.is_none()
+            || (!profile.supports_clear_fields()
+                && battle_cache
+                    .and_then(|cache| cache.requires_clear_since(delivered_battle_revision))
+                    .unwrap_or(true)));
+
+    if force_full || delivered_snapshot.is_none() || requires_full_battle {
+        let mut full = target.clone();
+        full.battle_chunks = battle_cache.map_or_else(Vec::new, |cache| {
+            cache.full_entries(profile.supports_battle_chunk_mode())
+        });
+        return Some(wire_envelope::Payload::SnapshotFull(full));
+    }
+
+    let mut patch = build_patch(delivered_snapshot.expect("checked"), target);
+    if let Some(battle_chunks) = battle_patch.flatten() {
+        patch.get_or_insert_with(Patch::default).battle_chunks = Some(battle_chunks);
+    }
+    let patch = patch?;
+    if !profile.supports_clear_fields() && patch_requires_clear_fields(&patch) {
+        let mut full = target.clone();
+        full.battle_chunks = battle_cache.map_or_else(Vec::new, |cache| {
+            cache.full_entries(profile.supports_battle_chunk_mode())
+        });
+        Some(wire_envelope::Payload::SnapshotFull(full))
+    } else {
+        Some(wire_envelope::Payload::Patch(patch))
+    }
+}
+
+fn battle_missing_fields(value: &BattleChunkValue, include_mode: bool) -> Vec<String> {
+    [
+        ("symbol", value.symbol.is_none()),
+        ("markerType", value.marker_type.is_none()),
+        ("colorNote", value.color_note.is_none()),
+        ("roomCode", value.room_code.is_none()),
+        ("colorMode", value.color_mode.is_none()),
+        ("colorSemanticKey", value.color_semantic_key.is_none()),
+        ("mode", include_mode && value.mode.is_none()),
+    ]
+    .into_iter()
+    .filter(|(_, missing)| *missing)
+    .map(|(field, _)| field.to_owned())
+    .collect()
 }
 
 fn patch_requires_clear_fields(patch: &Patch) -> bool {
@@ -2563,7 +3469,7 @@ fn apply_battle_observation(
     reporter_id: &str,
     report: BattleMapObservation,
     received_at: Instant,
-) {
+) -> Vec<BattleChunkEntry> {
     let dimension = if report.dimension.trim().is_empty() {
         "minecraft:overworld".to_owned()
     } else {
@@ -2589,7 +3495,7 @@ fn apply_battle_observation(
         .filter(|cell| !cell.color_raw.trim().is_empty())
         .collect();
     if candidates.is_empty() || cells.is_empty() {
-        return;
+        return Vec::new();
     }
 
     let chosen = if candidates.len() == 1 {
@@ -2618,7 +3524,7 @@ fn apply_battle_observation(
         choose_battle_candidate_by_overlap(&candidates, &cells, &dimension, &source.battle_chunks)
     };
     let Some(chosen) = chosen else {
-        return;
+        return Vec::new();
     };
 
     if let Some(previous) = source.battle_projection.take() {
@@ -2627,6 +3533,7 @@ fn apply_battle_observation(
         }
     }
     let mut chunk_ids = Vec::with_capacity(cells.len());
+    let mut cache_entries = Vec::with_capacity(cells.len());
     for cell in cells {
         let chunk_x = chosen.base_chunk_x.saturating_add(cell.rel_chunk_x);
         let chunk_z = chosen.base_chunk_z.saturating_add(cell.rel_chunk_z);
@@ -2642,29 +3549,27 @@ fn apply_battle_observation(
             .as_deref()
             .filter(|symbol| matches!(*symbol, "╫" | "╬"))
             .map(|_| "war_core".to_owned());
-        source.battle_chunks.insert(
-            key.clone(),
-            Timed::new(
-                BattleChunkEntry {
-                    r#ref: Some(reference),
-                    data: Some(BattleChunkValue {
-                        symbol,
-                        marker_type,
-                        color_raw: cell.color_raw.trim().to_owned(),
-                        color_note: None,
-                        observed_at: Some(report.snapshot_observed_at),
-                        position_sampled_at: Some(chosen.position_sampled_at),
-                        alignment_source: Some(chosen.source.clone()),
-                        reporter_id: Some(reporter_id.to_owned()),
-                        room_code: Some(source.room.clone()),
-                        color_mode: Some("raw_observed".to_owned()),
-                        color_semantic_key: None,
-                        mode: Some(mode.to_owned()),
-                    }),
-                },
-                received_at,
-            ),
-        );
+        let entry = BattleChunkEntry {
+            r#ref: Some(reference),
+            data: Some(BattleChunkValue {
+                symbol,
+                marker_type,
+                color_raw: cell.color_raw.trim().to_owned(),
+                color_note: None,
+                observed_at: Some(report.snapshot_observed_at),
+                position_sampled_at: Some(chosen.position_sampled_at),
+                alignment_source: Some(chosen.source.clone()),
+                reporter_id: Some(reporter_id.to_owned()),
+                room_code: Some(source.room.clone()),
+                color_mode: Some("raw_observed".to_owned()),
+                color_semantic_key: None,
+                mode: Some(mode.to_owned()),
+            }),
+        };
+        source
+            .battle_chunks
+            .insert(key.clone(), Timed::new(entry.clone(), received_at));
+        cache_entries.push(entry);
         chunk_ids.push(key);
     }
     source.battle_projection = Some(BattleProjection {
@@ -2674,6 +3579,7 @@ fn apply_battle_observation(
         snapshot_observed_at: report.snapshot_observed_at,
         chunk_ids,
     });
+    cache_entries
 }
 
 fn choose_battle_candidate_by_overlap<'a>(
@@ -2715,16 +3621,6 @@ fn choose_battle_candidate_by_overlap<'a>(
     } else {
         None
     }
-}
-
-fn battle_chunk_without_meta(mut entry: BattleChunkEntry) -> BattleChunkEntry {
-    if let Some(data) = entry.data.as_mut() {
-        data.observed_at = None;
-        data.position_sampled_at = None;
-        data.alignment_source = None;
-        data.reporter_id = None;
-    }
-    entry
 }
 
 fn battle_key(dimension: &str, chunk_x: i32, chunk_z: i32) -> String {
@@ -2947,7 +3843,11 @@ fn player_json_map(players: &HashMap<String, PlayerData>) -> Value {
     }).collect())
 }
 
-fn snapshot_digest(snapshot: &SnapshotFull, profile: ProtocolProfile) -> Digest {
+fn snapshot_digest_with_battle_digest(
+    snapshot: &SnapshotFull,
+    battle_digest: String,
+    profile: ProtocolProfile,
+) -> Digest {
     let players = snapshot
         .players
         .iter()
@@ -2987,11 +3887,7 @@ fn snapshot_digest(snapshot: &SnapshotFull, profile: ProtocolProfile) -> Digest 
         players: state_digest_plain(players),
         entities: state_digest_plain(entities),
         waypoints: state_digest_plain(waypoints),
-        battle_chunks: Some(battle_chunk_digest(
-            &snapshot.battle_chunks,
-            battle_chunk_digest_contract(profile),
-            profile.supports_battle_chunk_mode(),
-        )),
+        battle_chunks: Some(battle_digest),
         last_seen_players: profile
             .supports_last_seen_players()
             .then(|| state_digest_plain(last_seen_players)),
@@ -3019,23 +3915,22 @@ fn battle_chunk_digest(
 ) -> String {
     match contract {
         BattleChunkDigestContract::LegacyKeyed => {
-            let values = entries
+            let mut values = entries
                 .iter()
                 .filter_map(|entry| {
                     let reference = entry.r#ref.as_ref()?;
-                    let coord = reference.coord.as_ref()?;
-                    let mut value = battle_digest_data_json(entry.data.as_ref()?, include_mode);
-                    let object = value.as_object_mut()?;
-                    object.insert(
-                        "dimension".to_owned(),
-                        Value::String(reference.dimension.trim().to_owned()),
-                    );
-                    object.insert("chunkX".to_owned(), Value::from(coord.chunk_x));
-                    object.insert("chunkZ".to_owned(), Value::from(coord.chunk_z));
-                    Some((battle_ref_key(reference)?, value))
+                    Some((battle_ref_key(reference)?, reference, entry.data.as_ref()?))
                 })
-                .collect();
-            state_digest_plain(values)
+                .collect::<Vec<_>>();
+            values.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut writer = Sha1Writer::default();
+            for (key, reference, value) in values {
+                serde_json::to_writer(&mut writer, &key).expect("hash writer cannot fail");
+                writer.update(b":");
+                write_battle_digest_data(&mut writer, value, include_mode, Some(reference));
+                writer.update(b"\n");
+            }
+            writer.finish_short_hex()
         }
         BattleChunkDigestContract::StructuredV2 => {
             let mut values = entries
@@ -3049,21 +3944,151 @@ fn battle_chunk_digest(
                     }
                     Some((
                         (dimension.to_owned(), coord.chunk_x, coord.chunk_z),
-                        json!({
-                            "ref":{
-                                "dimension":dimension,
-                                "chunkX":coord.chunk_x,
-                                "chunkZ":coord.chunk_z,
-                            },
-                            "data":battle_digest_data_json(entry.data.as_ref()?, include_mode),
-                        }),
+                        reference,
+                        entry.data.as_ref()?,
                     ))
                 })
                 .collect::<Vec<_>>();
             values.sort_by(|left, right| left.0.cmp(&right.0));
-            digest_canonical_values(values.into_iter().map(|(_, value)| value))
+            let mut writer = Sha1Writer::default();
+            for (_, reference, value) in values {
+                let coord = reference.coord.as_ref().expect("validated coordinate");
+                writer.update(b"{\"data\":");
+                write_battle_digest_data(&mut writer, value, include_mode, None);
+                writer.update(b",\"ref\":{\"chunkX\":");
+                serde_json::to_writer(&mut writer, &coord.chunk_x)
+                    .expect("hash writer cannot fail");
+                writer.update(b",\"chunkZ\":");
+                serde_json::to_writer(&mut writer, &coord.chunk_z)
+                    .expect("hash writer cannot fail");
+                writer.update(b",\"dimension\":");
+                serde_json::to_writer(&mut writer, reference.dimension.trim())
+                    .expect("hash writer cannot fail");
+                writer.update(b"}}\n");
+            }
+            writer.finish_short_hex()
         }
     }
+}
+
+fn battle_cache_digest(
+    cache: &BattleRoomCache,
+    contract: BattleChunkDigestContract,
+    include_mode: bool,
+) -> String {
+    let mut writer = Sha1Writer::default();
+    match contract {
+        BattleChunkDigestContract::LegacyKeyed => {
+            let mut entries = cache
+                .entries
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        battle_key(&key.dimension, key.chunk_x, key.chunk_z),
+                        key,
+                        value,
+                    )
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            for (wire_key, key, entry) in entries {
+                serde_json::to_writer(&mut writer, &wire_key).expect("hash writer cannot fail");
+                writer.update(b":");
+                let reference = key.to_ref();
+                write_battle_digest_data(
+                    &mut writer,
+                    entry.value.as_ref(),
+                    include_mode,
+                    Some(&reference),
+                );
+                writer.update(b"\n");
+            }
+        }
+        BattleChunkDigestContract::StructuredV2 => {
+            for (key, entry) in &cache.entries {
+                writer.update(b"{\"data\":");
+                write_battle_digest_data(&mut writer, entry.value.as_ref(), include_mode, None);
+                writer.update(b",\"ref\":{\"chunkX\":");
+                serde_json::to_writer(&mut writer, &key.chunk_x).expect("hash writer cannot fail");
+                writer.update(b",\"chunkZ\":");
+                serde_json::to_writer(&mut writer, &key.chunk_z).expect("hash writer cannot fail");
+                writer.update(b",\"dimension\":");
+                serde_json::to_writer(&mut writer, key.dimension.as_ref())
+                    .expect("hash writer cannot fail");
+                writer.update(b"}}\n");
+            }
+        }
+    }
+    writer.finish_short_hex()
+}
+
+fn write_battle_digest_data(
+    writer: &mut Sha1Writer,
+    value: &BattleChunkValue,
+    include_mode: bool,
+    legacy_ref: Option<&BattleChunkRef>,
+) {
+    let mut first = true;
+    writer.update(b"{");
+    if let Some(reference) = legacy_ref {
+        let coord = reference.coord.as_ref().expect("validated coordinate");
+        write_i64_field(writer, &mut first, "chunkX", i64::from(coord.chunk_x));
+        write_i64_field(writer, &mut first, "chunkZ", i64::from(coord.chunk_z));
+    }
+    write_string_field(
+        writer,
+        &mut first,
+        "colorMode",
+        value.color_mode.as_deref().unwrap_or("raw_observed"),
+    );
+    write_optional_string_field(writer, &mut first, "colorNote", &value.color_note);
+    write_string_field(writer, &mut first, "colorRaw", &value.color_raw);
+    write_optional_string_field(
+        writer,
+        &mut first,
+        "colorSemanticKey",
+        &value.color_semantic_key,
+    );
+    if let Some(reference) = legacy_ref {
+        write_string_field(writer, &mut first, "dimension", reference.dimension.trim());
+    }
+    write_optional_string_field(writer, &mut first, "markerType", &value.marker_type);
+    if include_mode {
+        write_optional_string_field(writer, &mut first, "mode", &value.mode);
+    }
+    write_optional_string_field(writer, &mut first, "roomCode", &value.room_code);
+    write_optional_string_field(writer, &mut first, "symbol", &value.symbol);
+    writer.update(b"}");
+}
+
+fn write_field_name(writer: &mut Sha1Writer, first: &mut bool, name: &str) {
+    if !*first {
+        writer.update(b",");
+    }
+    *first = false;
+    serde_json::to_writer(&mut *writer, name).expect("hash writer cannot fail");
+    writer.update(b":");
+}
+
+fn write_string_field(writer: &mut Sha1Writer, first: &mut bool, name: &str, value: &str) {
+    write_field_name(writer, first, name);
+    serde_json::to_writer(writer, value).expect("hash writer cannot fail");
+}
+
+fn write_optional_string_field(
+    writer: &mut Sha1Writer,
+    first: &mut bool,
+    name: &str,
+    value: &Option<String>,
+) {
+    if let Some(value) = value {
+        write_string_field(writer, first, name, value);
+    }
+}
+
+fn write_i64_field(writer: &mut Sha1Writer, first: &mut bool, name: &str, value: i64) {
+    write_field_name(writer, first, name);
+    serde_json::to_writer(writer, &value).expect("hash writer cannot fail");
 }
 
 fn player_json(player: &PlayerData) -> Value {
@@ -3110,6 +4135,7 @@ fn battle_value_json(value: &BattleChunkValue) -> Value {
     }))
 }
 
+#[cfg(test)]
 fn battle_digest_data_json(value: &BattleChunkValue, include_mode: bool) -> Value {
     let mut value = battle_value_json(value);
     if let Some(object) = value.as_object_mut() {
@@ -3148,64 +4174,87 @@ fn prune_nulls(value: Value) -> Value {
 }
 
 fn state_digest_plain(values: BTreeMap<String, Value>) -> String {
-    let mut raw = String::new();
+    let mut writer = Sha1Writer::default();
     for (id, value) in values {
-        raw.push_str(&serde_json::to_string(&id).expect("string is JSON serializable"));
-        raw.push(':');
-        raw.push_str(&canonical_value(&value));
-        raw.push('\n');
+        serde_json::to_writer(&mut writer, &id).expect("hash writer cannot fail");
+        writer.update(b":");
+        write_canonical_value(&mut writer, &value);
+        writer.update(b"\n");
     }
-    let digest = Sha1::digest(raw.as_bytes());
-    format!("{digest:x}")[..16].to_owned()
+    writer.finish_short_hex()
 }
 
-fn digest_canonical_values(values: impl IntoIterator<Item = Value>) -> String {
-    let mut raw = String::new();
-    for value in values {
-        raw.push_str(&canonical_value(&value));
-        raw.push('\n');
+#[derive(Default)]
+struct Sha1Writer(Sha1);
+
+impl Sha1Writer {
+    fn update(&mut self, bytes: &[u8]) {
+        Sha1Digest::update(&mut self.0, bytes);
     }
-    let digest = Sha1::digest(raw.as_bytes());
-    format!("{digest:x}")[..16].to_owned()
+
+    fn finish_short_hex(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = self.0.finalize();
+        let mut encoded = [0_u8; 16];
+        for (index, byte) in digest[..8].iter().copied().enumerate() {
+            encoded[index * 2] = HEX[(byte >> 4) as usize];
+            encoded[index * 2 + 1] = HEX[(byte & 0x0f) as usize];
+        }
+        String::from_utf8(encoded.to_vec()).expect("hex is valid UTF-8")
+    }
 }
 
-fn canonical_value(value: &Value) -> String {
+impl std::io::Write for Sha1Writer {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn write_canonical_value(writer: &mut Sha1Writer, value: &Value) {
     match value {
-        Value::Null => "null".to_owned(),
-        Value::Bool(value) => value.to_string(),
+        Value::Null => writer.update(b"null"),
+        Value::Bool(true) => writer.update(b"true"),
+        Value::Bool(false) => writer.update(b"false"),
         Value::Number(value) => {
             if let Some(value) = value.as_i64() {
-                value.to_string()
+                serde_json::to_writer(writer, &value).expect("hash writer cannot fail");
             } else if let Some(value) = value.as_u64() {
-                value.to_string()
+                serde_json::to_writer(writer, &value).expect("hash writer cannot fail");
             } else {
-                canonical_number(value.as_f64().unwrap_or(f64::NAN))
+                writer.update(canonical_number(value.as_f64().unwrap_or(f64::NAN)).as_bytes());
             }
         }
-        Value::String(value) => serde_json::to_string(value).expect("string is JSON serializable"),
-        Value::Array(values) => format!(
-            "[{}]",
-            values
-                .iter()
-                .map(canonical_value)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
+        Value::String(value) => {
+            serde_json::to_writer(writer, value).expect("hash writer cannot fail");
+        }
+        Value::Array(values) => {
+            writer.update(b"[");
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    writer.update(b",");
+                }
+                write_canonical_value(writer, value);
+            }
+            writer.update(b"]");
+        }
         Value::Object(values) => {
             let mut keys = values.keys().collect::<Vec<_>>();
             keys.sort();
-            let body = keys
-                .into_iter()
-                .map(|key| {
-                    format!(
-                        "{}:{}",
-                        serde_json::to_string(key).expect("key is JSON serializable"),
-                        canonical_value(&values[key])
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{{{body}}}")
+            writer.update(b"{");
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    writer.update(b",");
+                }
+                serde_json::to_writer(&mut *writer, key).expect("hash writer cannot fail");
+                writer.update(b":");
+                write_canonical_value(writer, &values[key]);
+            }
+            writer.update(b"}");
         }
     }
 }
@@ -3264,6 +4313,62 @@ mod tests {
         }
     }
 
+    fn reference_battle_digest(
+        entries: &[BattleChunkEntry],
+        contract: BattleChunkDigestContract,
+        include_mode: bool,
+    ) -> String {
+        match contract {
+            BattleChunkDigestContract::LegacyKeyed => {
+                let values = entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let reference = entry.r#ref.as_ref()?;
+                        let coord = reference.coord.as_ref()?;
+                        let mut value = battle_digest_data_json(entry.data.as_ref()?, include_mode);
+                        let object = value.as_object_mut()?;
+                        object.insert(
+                            "dimension".to_owned(),
+                            Value::String(reference.dimension.trim().to_owned()),
+                        );
+                        object.insert("chunkX".to_owned(), Value::from(coord.chunk_x));
+                        object.insert("chunkZ".to_owned(), Value::from(coord.chunk_z));
+                        Some((battle_ref_key(reference)?, value))
+                    })
+                    .collect();
+                state_digest_plain(values)
+            }
+            BattleChunkDigestContract::StructuredV2 => {
+                let mut values = entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let reference = entry.r#ref.as_ref()?;
+                        let coord = reference.coord.as_ref()?;
+                        let dimension = reference.dimension.trim();
+                        Some((
+                            (dimension.to_owned(), coord.chunk_x, coord.chunk_z),
+                            json!({
+                                "ref": {
+                                    "dimension": dimension,
+                                    "chunkX": coord.chunk_x,
+                                    "chunkZ": coord.chunk_z,
+                                },
+                                "data": battle_digest_data_json(entry.data.as_ref()?, include_mode),
+                            }),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                values.sort_by(|left, right| left.0.cmp(&right.0));
+                let mut writer = Sha1Writer::default();
+                for (_, value) in values {
+                    write_canonical_value(&mut writer, &value);
+                    writer.update(b"\n");
+                }
+                writer.finish_short_hex()
+            }
+        }
+    }
+
     fn add_test_connection(relay: &mut Relay, id: &str, kind: ConnectionKind) {
         let (control, _) = mpsc::channel(1);
         let (state, _) = watch::channel(None);
@@ -3281,12 +4386,11 @@ mod tests {
                 control,
                 state,
                 delivered_revision: 0,
-                queued_revision: 0,
                 delivered_snapshot: None,
-                queued_snapshot: None,
+                delivered_battle_revision: 0,
+                next_digest_at: Instant::now(),
                 force_full: true,
                 tab_history_subscribed: false,
-                last_digest_sent: None,
             },
         );
     }
@@ -3340,6 +4444,94 @@ mod tests {
     }
 
     #[test]
+    fn delivered_event_carries_the_exact_written_snapshot() {
+        let config = Arc::new(RuntimeConfig::load());
+        let mut relay = Relay::new(config, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        add_test_connection(&mut relay, "player", ConnectionKind::Player);
+        let written = Arc::new(SnapshotFull {
+            server_time: Some(2.0),
+            ..Default::default()
+        });
+
+        relay.handle_event(RelayEvent::Delivered {
+            id: "player".to_owned(),
+            revision: 2,
+            snapshot: written.clone(),
+            battle_revision: 7,
+        });
+
+        let connection = relay.connections.get("player").expect("connection");
+        assert_eq!(connection.delivered_revision, 2);
+        assert_eq!(connection.delivered_battle_revision, 7);
+        assert!(Arc::ptr_eq(
+            connection.delivered_snapshot.as_ref().expect("snapshot"),
+            &written
+        ));
+
+        relay.handle_event(RelayEvent::Delivered {
+            id: "player".to_owned(),
+            revision: 1,
+            snapshot: Arc::new(SnapshotFull {
+                server_time: Some(1.0),
+                ..Default::default()
+            }),
+            battle_revision: 3,
+        });
+        let connection = relay.connections.get("player").expect("connection");
+        assert_eq!(connection.delivered_revision, 2);
+        assert!(Arc::ptr_eq(
+            connection.delivered_snapshot.as_ref().expect("snapshot"),
+            &written
+        ));
+    }
+
+    #[test]
+    fn broadcast_reuses_payload_digest_and_snapshot_for_equivalent_recipients() {
+        let config = Arc::new(RuntimeConfig::load());
+        let mut relay = Relay::new(config, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        add_test_connection(&mut relay, "first", ConnectionKind::Player);
+        add_test_connection(&mut relay, "second", ConnectionKind::Player);
+
+        relay.broadcast(Instant::now(), true);
+
+        let first = relay
+            .connections
+            .get("first")
+            .expect("first connection")
+            .state
+            .subscribe()
+            .borrow_and_update()
+            .clone()
+            .expect("first frame");
+        let second = relay
+            .connections
+            .get("second")
+            .expect("second connection")
+            .state
+            .subscribe()
+            .borrow_and_update()
+            .clone()
+            .expect("second frame");
+
+        assert!(Arc::ptr_eq(
+            first.bytes.as_ref().expect("first payload"),
+            second.bytes.as_ref().expect("second payload")
+        ));
+        assert!(Arc::ptr_eq(
+            first.digest.as_ref().expect("first digest"),
+            second.digest.as_ref().expect("second digest")
+        ));
+        assert!(Arc::ptr_eq(&first.snapshot, &second.snapshot));
+        #[cfg(feature = "memory-debug")]
+        {
+            assert_eq!(relay.debug_counters.payload_builds_total, 1);
+            assert_eq!(relay.debug_counters.payload_cache_hits, 1);
+            assert_eq!(relay.debug_counters.digests_total, 1);
+            assert_eq!(relay.debug_counters.digest_cache_hits, 1);
+        }
+    }
+
+    #[test]
     fn canonical_digest_matches_protocol_contract() {
         let values = BTreeMap::from([("<id>&".to_owned(), json!({"name":"<A&B>", "x":1.2345645}))]);
         assert_eq!(canonical_number(1.2345645), "1.234565");
@@ -3371,6 +4563,26 @@ mod tests {
             battle_digest_data_json(entry.data.as_ref().expect("data"), true),
         )]);
         assert_eq!(state_digest_plain(buggy_projection), "9cecf13aa4592a1c");
+
+        let mut rich = entry;
+        let value = rich.data.as_mut().expect("data");
+        value.symbol = Some("<A&B>".to_owned());
+        value.marker_type = Some("war_core".to_owned());
+        value.color_note = Some("note".to_owned());
+        value.color_semantic_key = Some("enemy".to_owned());
+        value.observed_at = Some(123);
+        value.position_sampled_at = Some(122);
+        value.alignment_source = Some("history_primary".to_owned());
+        value.reporter_id = Some("reporter".to_owned());
+        for contract in [
+            BattleChunkDigestContract::LegacyKeyed,
+            BattleChunkDigestContract::StructuredV2,
+        ] {
+            assert_eq!(
+                battle_chunk_digest(std::slice::from_ref(&rich), contract, true),
+                reference_battle_digest(std::slice::from_ref(&rich), contract, true),
+            );
+        }
     }
 
     #[test]
@@ -3420,6 +4632,183 @@ mod tests {
                 false,
             )
         );
+    }
+
+    #[test]
+    fn battle_cache_is_bounded_and_losslessly_interns_values() {
+        let now = Instant::now();
+        let mut cache = BattleRoomCache::default();
+        let entries = (0..3)
+            .map(|chunk_x| battle_chunk_fixture("minecraft:overworld", chunk_x, 0))
+            .collect();
+
+        assert!(cache.upsert(entries, now, 2));
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.values.len(), 1);
+        let expanded = cache.full_entries(true);
+        assert_eq!(
+            expanded
+                .iter()
+                .filter_map(battle_entry_key)
+                .collect::<Vec<_>>(),
+            vec![
+                "minecraft:overworld|1|0".to_owned(),
+                "minecraft:overworld|2|0".to_owned(),
+            ]
+        );
+        assert!(
+            expanded
+                .iter()
+                .all(|entry| entry.data.as_ref().expect("data").color_raw == "#112233")
+        );
+        for contract in [
+            BattleChunkDigestContract::LegacyKeyed,
+            BattleChunkDigestContract::StructuredV2,
+        ] {
+            assert_eq!(
+                cache.digest(contract, true),
+                battle_chunk_digest(&expanded, contract, true),
+            );
+        }
+    }
+
+    #[test]
+    fn battle_cache_expiry_does_not_remove_a_newer_overwrite() {
+        let now = Instant::now();
+        let mut cache = BattleRoomCache::default();
+        let first = battle_chunk_fixture("minecraft:overworld", 1, 2);
+        cache.upsert(vec![first], now, 10);
+        let mut second = battle_chunk_fixture("minecraft:overworld", 1, 2);
+        second.data.as_mut().expect("data").color_raw = "#abcdef".to_owned();
+        cache.upsert(vec![second], now + Duration::from_secs(10), 10);
+
+        cache.cleanup(now + Duration::from_secs(121), Duration::from_secs(120), 10);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(
+            cache
+                .full_entries(true)
+                .pop()
+                .expect("entry")
+                .data
+                .expect("data")
+                .color_raw,
+            "#abcdef"
+        );
+
+        cache.cleanup(now + Duration::from_secs(131), Duration::from_secs(120), 10);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn battle_payload_uses_delta_after_the_initial_snapshot() {
+        let mut cache = BattleRoomCache::default();
+        cache.upsert(
+            vec![battle_chunk_fixture("minecraft:overworld", 1, 2)],
+            Instant::now(),
+            10,
+        );
+        let delivered = SnapshotFull::default();
+        let target = SnapshotFull::default();
+        let profile = protocol_profile("0.7.1");
+
+        let payload = state_payload_for_profile_with_battle(
+            profile,
+            false,
+            Some(&delivered),
+            0,
+            &target,
+            Some(&cache),
+        )
+        .expect("battle patch");
+        let wire_envelope::Payload::Patch(patch) = payload else {
+            panic!("expected patch");
+        };
+        assert_eq!(patch.battle_chunks.expect("battle scope").upsert.len(), 1);
+
+        assert!(
+            state_payload_for_profile_with_battle(
+                profile,
+                false,
+                Some(&delivered),
+                cache.revision,
+                &target,
+                Some(&cache),
+            )
+            .is_none()
+        );
+
+        let legacy_profile = protocol_profile("0.6.4");
+        assert!(matches!(
+            state_payload_for_profile_with_battle(
+                legacy_profile,
+                false,
+                Some(&delivered),
+                0,
+                &target,
+                Some(&cache),
+            ),
+            Some(wire_envelope::Payload::Patch(_))
+        ));
+
+        let delivered_revision = cache.revision;
+        let mut cleared = battle_chunk_fixture("minecraft:overworld", 1, 2);
+        cleared.data.as_mut().expect("data").mode = None;
+        cache.upsert(vec![cleared], Instant::now(), 10);
+        assert!(matches!(
+            state_payload_for_profile_with_battle(
+                legacy_profile,
+                false,
+                Some(&delivered),
+                delivered_revision,
+                &target,
+                Some(&cache),
+            ),
+            Some(wire_envelope::Payload::SnapshotFull(_))
+        ));
+    }
+
+    #[test]
+    fn player_patch_does_not_expand_a_full_battle_cache() {
+        let mut cache = BattleRoomCache::default();
+        let now = Instant::now();
+        for start in (0..65_536).step_by(256) {
+            cache.upsert(
+                (start..start + 256)
+                    .map(|chunk_x| battle_chunk_fixture("minecraft:overworld", chunk_x, 0))
+                    .collect(),
+                now,
+                65_536,
+            );
+        }
+        assert_eq!(cache.entries.len(), 65_536);
+        assert_eq!(cache.values.len(), 1);
+
+        let mut delivered = SnapshotFull::default();
+        delivered
+            .players
+            .insert("player".to_owned(), PlayerData::default());
+        let mut target = delivered.clone();
+        target.players.get_mut("player").expect("player").x = 1.0;
+        let expansions = cache.full_expansions_total.get();
+        let payload = state_payload_for_profile_with_battle(
+            protocol_profile("0.7.1"),
+            false,
+            Some(&delivered),
+            cache.revision,
+            &target,
+            Some(&cache),
+        );
+
+        let Some(wire_envelope::Payload::Patch(patch)) = payload else {
+            panic!("expected player patch");
+        };
+        assert!(patch.battle_chunks.is_none());
+        assert_eq!(cache.full_expansions_total.get(), expansions);
+        assert_ne!(
+            cache.digest(BattleChunkDigestContract::StructuredV2, true),
+            "da39a3ee5e6b4b0d"
+        );
+        assert_eq!(cache.full_expansions_total.get(), expansions);
     }
 
     #[test]

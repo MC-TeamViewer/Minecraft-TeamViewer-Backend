@@ -70,10 +70,40 @@ docker build -t teamviewrelay-backend:local .
 已发布镜像：
 
 ```text
-professornuo/teamviewrelay-rust:v1.1.0-proto0.8.0
+professornuo/teamviewrelay-rust:v1.1.2-proto0.8.0
 ```
 
 `docker-compose.yml` 默认使用该版本，并将 SQLite 数据目录挂载到宿主机的 `./data-rust`。
+
+### 内存与 CPU Debug 镜像
+
+Debug 监控只在 `memory-debug` Cargo feature 中存在，普通 release 不包含 profiler、采样任务或 Debug API。使用独立 compose overlay 构建并部署：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.memory-debug.yml up -d --build
+docker compose logs -f backend
+```
+
+它对应镜像 tag `v1.1.2-memory-debug-proto0.8.0`，每 10 秒把资源快照写入
+`./data-rust/memory-debug/samples-YYYY-MM-DD.jsonl`，heap 原始 dump、pprof、手动 CPU pprof 和 SVG
+火焰图写入 `./data-rust/memory-debug/profiles/`。首次 heap profile 默认在启动 2 分钟后生成；内存相对
+上次 profile 增长 8 MiB 时会自动追加抓取。heap 的符号解析由一次性子进程完成，解析缓存不会进入
+服务进程 RSS。采样文件持续记录进程、线程和 cgroup CPU，默认不会自动启动进程内 CPU profiler。
+
+登录管理页后可使用以下鉴权接口：
+
+- `GET /admin/api/debug/resources/current`：最近一次资源快照与 profiler 状态。
+- `GET /admin/api/debug/resources/profiles`：可下载的 profile 列表。
+- `POST /admin/api/debug/resources/profiles/cpu`：手动抓取 30 秒 CPU profile。
+- `POST /admin/api/debug/resources/profiles/heap`：手动抓取 heap profile。
+- `GET /admin/api/debug/resources/profiles/{filename}`：下载 profile。
+
+本机直接构建等价二进制时使用：
+
+```bash
+RUSTFLAGS="-C force-frame-pointers=yes" \
+  cargo build --profile memory-debug --features memory-debug
+```
 
 常用环境变量：
 
@@ -88,6 +118,16 @@ professornuo/teamviewrelay-rust:v1.1.0-proto0.8.0
 | `TEAMVIEWER_TRUSTED_PROXY_CIDRS` | 本机与 Docker 私网段 | 可被信任的直连反代地址段 |
 | `RUST_LOG` | `info` | Rust 日志过滤规则 |
 | `TZ` | 系统时区 | 管理统计使用的时区 |
+
+Debug overlay 还支持 `TEAMVIEWER_DEBUG_SAMPLE_INTERVAL_SEC`、`TEAMVIEWER_DEBUG_AUTO_CPU_PROFILE`、
+`TEAMVIEWER_DEBUG_CPU_TRIGGER_PERCENT`、`TEAMVIEWER_DEBUG_CPU_PROFILE_SEC`、`TEAMVIEWER_DEBUG_MEMORY_GROWTH_MIB`、
+`TEAMVIEWER_DEBUG_STARTUP_PROFILE_DELAY_SEC`、
+`TEAMVIEWER_DEBUG_PERIODIC_PROFILE_SEC`、`TEAMVIEWER_DEBUG_PROFILE_COOLDOWN_SEC`、
+`TEAMVIEWER_DEBUG_RETENTION_DAYS`、`TEAMVIEWER_DEBUG_MAX_PROFILES` 和
+`TEAMVIEWER_DEBUG_MAX_DISK_MIB`。默认保留 7 天采样、48 组 profile，并限制 profile 总量为 512 MiB。
+设置 `TEAMVIEWER_DEBUG_AUTO_CPU_PROFILE=true` 才会恢复启动、高 CPU 和周期 CPU profile。进程内 CPU
+profile 会显著增加常驻符号缓存并短暂干扰业务吞吐；诊断长期内存增长时应保持默认关闭，只在内存样本
+收集完成后手动触发。
 
 ## 反向代理与真实 IP
 
@@ -159,7 +199,7 @@ uv run python scripts/load_test_live.py \
   --stage-duration 300 \
   --report-hz 10 \
   --allow-remote \
-  --expected-build team-view-relay-rust-v1.1.0-proto0.8.0
+  --expected-build team-view-relay-rust-v1.1.2-proto0.8.0
 ```
 
 `--expected-build` 必须与目标 `/health` 返回的 `buildVersion` 完全一致，而不是 Docker tag。可先检查：
@@ -179,6 +219,9 @@ config/server_state_config.toml
 ```
 
 该文件通过 `include_str!` 编译进二进制，修改后需要重新构建后端。
+
+战区历史默认保留 7,200 秒，并通过 `battleChunkCacheMaxEntries = 65536` 限制每个房间的最大
+区块数。缓存使用无损值共享；达到时间或数量任一上限时淘汰最老区块。
 
 ## 项目结构
 

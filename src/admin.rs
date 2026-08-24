@@ -157,6 +157,104 @@ pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Resp
     }
 }
 
+#[cfg(feature = "memory-debug")]
+pub async fn debug_resources_current(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if authenticate(&state, &headers).await.is_none() {
+        return unauthorized();
+    }
+    let Some(debug) = &state.resource_debug else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"detail": "resource_debug_unavailable"})),
+        )
+            .into_response();
+    };
+    Json(debug.current().await).into_response()
+}
+
+#[cfg(feature = "memory-debug")]
+pub async fn debug_resource_profiles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if authenticate(&state, &headers).await.is_none() {
+        return unauthorized();
+    }
+    let Some(debug) = &state.resource_debug else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match debug.profiles().await {
+        Ok(profiles) => Json(json!({"items": profiles})).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"detail": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(feature = "memory-debug")]
+pub async fn trigger_debug_resource_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if authenticate(&state, &headers).await.is_none() {
+        return unauthorized();
+    }
+    let Some(debug) = &state.resource_debug else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(kind) = crate::resource_debug::ProfileKind::parse(&name) else {
+        return invalid_parameter("invalid_profile_kind");
+    };
+    if debug.request_profile(kind, "manual") {
+        (
+            StatusCode::ACCEPTED,
+            Json(json!({"accepted": true, "kind": name})),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({"accepted": false, "detail": "profile_already_pending"})),
+        )
+            .into_response()
+    }
+}
+
+#[cfg(feature = "memory-debug")]
+pub async fn download_debug_resource_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if authenticate(&state, &headers).await.is_none() {
+        return unauthorized();
+    }
+    let Some(debug) = &state.resource_debug else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match debug.read_profile(&name).await {
+        Ok((bytes, content_type)) => {
+            let disposition = HeaderValue::from_str(&format!("attachment; filename=\"{name}\""))
+                .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
+            (
+                [
+                    (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+                    (header::CONTENT_DISPOSITION, disposition),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 #[derive(Clone, Default)]
 struct EventFilters {
     daily: DailyMetricsQuery,
@@ -1901,6 +1999,8 @@ mod tests {
             config,
             metrics: Arc::new(Metrics::default()),
             maintenance_rooms: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
+            #[cfg(feature = "memory-debug")]
+            resource_debug: None,
         };
 
         for (player_id, room) in [

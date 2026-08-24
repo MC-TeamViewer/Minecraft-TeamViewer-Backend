@@ -4,6 +4,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(feature = "memory-debug")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde_json::{Value, json};
 
 const WINDOW_SECONDS: i64 = 10;
@@ -67,9 +70,81 @@ pub struct TrafficIncrement {
 #[derive(Default)]
 pub struct Metrics {
     state: Mutex<MetricsState>,
+    #[cfg(feature = "memory-debug")]
+    writer_send_count: AtomicU64,
+    #[cfg(feature = "memory-debug")]
+    writer_send_nanoseconds: AtomicU64,
+    #[cfg(feature = "memory-debug")]
+    writer_send_failures: AtomicU64,
+}
+
+#[cfg(feature = "memory-debug")]
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsDebugStats {
+    pub connections: usize,
+    pub pending_buckets: usize,
+    pub live_application_bytes: [u64; 4],
+    pub live_wire_bytes: [u64; 4],
+    pub protobuf_messages_total: u64,
+    pub protobuf_bytes_total: u64,
+    pub protobuf_by_type: BTreeMap<String, [u64; 2]>,
+    pub writer_send_count: u64,
+    pub writer_send_nanoseconds: u64,
+    pub writer_send_failures: u64,
 }
 
 impl Metrics {
+    #[cfg(feature = "memory-debug")]
+    pub fn record_writer_send(&self, elapsed: std::time::Duration, success: bool) {
+        self.writer_send_count.fetch_add(1, Ordering::Relaxed);
+        self.writer_send_nanoseconds.fetch_add(
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if !success {
+            self.writer_send_failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "memory-debug")]
+    pub fn debug_stats(&self) -> MetricsDebugStats {
+        let now = unix_seconds() as i64;
+        let mut state = self.state.lock().expect("metrics lock poisoned");
+        prune(&mut state, now);
+        let mut application = [0_u64; 4];
+        let mut wire = [0_u64; 4];
+        for bucket in state
+            .buckets
+            .iter()
+            .filter(|bucket| bucket.second > now - WINDOW_SECONDS)
+        {
+            for index in 0..4 {
+                application[index] = application[index].saturating_add(bucket.application[index]);
+                wire[index] = wire[index].saturating_add(bucket.wire[index]);
+            }
+        }
+        let protobuf_messages_total = state.by_type.values().map(|totals| totals.messages).sum();
+        let protobuf_bytes_total = state.by_type.values().map(|totals| totals.bytes).sum();
+        let protobuf_by_type = state
+            .by_type
+            .iter()
+            .map(|(name, totals)| (name.clone(), [totals.messages, totals.bytes]))
+            .collect();
+        MetricsDebugStats {
+            connections: state.connections.len(),
+            pending_buckets: state.pending.len(),
+            live_application_bytes: application,
+            live_wire_bytes: wire,
+            protobuf_messages_total,
+            protobuf_bytes_total,
+            protobuf_by_type,
+            writer_send_count: self.writer_send_count.load(Ordering::Relaxed),
+            writer_send_nanoseconds: self.writer_send_nanoseconds.load(Ordering::Relaxed),
+            writer_send_failures: self.writer_send_failures.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn register(&self, id: &str, channel: TrafficChannel) {
         self.state
             .lock()

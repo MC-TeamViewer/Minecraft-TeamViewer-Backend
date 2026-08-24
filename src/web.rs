@@ -16,7 +16,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use rust_embed::RustEmbed;
 use serde::Deserialize;
@@ -69,6 +69,8 @@ pub struct AppState {
     pub config: Arc<RuntimeConfig>,
     pub metrics: Arc<Metrics>,
     pub maintenance_rooms: Arc<RwLock<HashSet<String>>>,
+    #[cfg(feature = "memory-debug")]
+    pub resource_debug: Option<crate::resource_debug::ResourceDebugHandle>,
 }
 
 #[derive(RustEmbed)]
@@ -76,7 +78,7 @@ pub struct AppState {
 struct AdminAssets;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/snapshot", get(snapshot))
         .route("/mc-client", get(player_ws))
@@ -117,9 +119,22 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/admin/api/history/tab", get(admin::tab_history))
         .route("/admin/api/history/tab", delete(admin::delete_tab_history))
-        .route("/admin/api/runtime/{kind}", get(admin::runtime_state))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .route("/admin/api/runtime/{kind}", get(admin::runtime_state));
+    #[cfg(feature = "memory-debug")]
+    let router = router
+        .route(
+            "/admin/api/debug/resources/current",
+            get(admin::debug_resources_current),
+        )
+        .route(
+            "/admin/api/debug/resources/profiles",
+            get(admin::debug_resource_profiles),
+        )
+        .route(
+            "/admin/api/debug/resources/profiles/{name}",
+            post(admin::trigger_debug_resource_profile).get(admin::download_debug_resource_profile),
+        );
+    router.layer(TraceLayer::new_for_http()).with_state(state)
 }
 
 async fn health() -> impl IntoResponse {
@@ -455,16 +470,17 @@ async fn serve_socket(
 
     let (sink, stream) = socket.split();
     let event_tx = state.relay.sender();
-    let writer_id = id.clone();
     let writer_events = event_tx.clone();
     let mut writer = tokio::spawn(writer_loop(
-        writer_id,
         sink,
         control_rx,
         state_rx,
-        writer_events,
-        state.metrics.clone(),
-        traffic_channel,
+        WriterContext {
+            id: id.clone(),
+            events: writer_events,
+            metrics: state.metrics.clone(),
+            traffic_channel,
+        },
     ));
     let reader_id = id.clone();
     let mut reader = tokio::spawn(reader_loop(
@@ -549,55 +565,129 @@ async fn sample_wire_traffic(
     }
 }
 
-async fn writer_loop(
+enum WriterAction {
+    State(StateFrame),
+    Control(Arc<[u8]>),
+}
+
+struct WriterContext {
     id: String,
-    mut sink: futures_util::stream::SplitSink<HttpWebSocket, Frame>,
-    mut control: mpsc::Receiver<Arc<[u8]>>,
-    mut state: watch::Receiver<Option<StateFrame>>,
     events: mpsc::Sender<RelayEvent>,
     metrics: Arc<Metrics>,
     traffic_channel: TrafficChannel,
-) {
+}
+
+async fn writer_loop<S, E>(
+    mut sink: S,
+    mut control: mpsc::Receiver<Arc<[u8]>>,
+    mut state: watch::Receiver<Option<StateFrame>>,
+    context: WriterContext,
+) where
+    S: Sink<Frame, Error = E> + Unpin,
+{
     loop {
-        let frame = tokio::select! {
+        let action = tokio::select! {
             biased;
-            value = control.recv() => value.map(|bytes| (bytes, None)),
             changed = state.changed() => {
                 if changed.is_err() { None } else {
-                    state.borrow_and_update().clone().map(|frame| (frame.bytes, Some(frame.revision)))
+                    state.borrow_and_update().clone().map(WriterAction::State)
                 }
             }
+            value = control.recv() => value.map(WriterAction::Control),
         };
-        let Some((bytes, revision)) = frame else {
+        let Some(action) = action else {
             break;
         };
-        let byte_count = bytes.len();
-        let message_type = protobuf_message_type(&bytes);
-        let sent = tokio::time::timeout(
-            Duration::from_secs(2),
-            sink.send(Frame::binary(Bytes::from_owner(bytes))),
-        )
-        .await;
-        if !matches!(sent, Ok(Ok(()))) {
-            warn!(connection_id = %id, "slow or failed websocket writer disconnected");
-            break;
-        }
-        metrics.record(
-            Layer::Application,
-            traffic_channel,
-            Direction::Egress,
-            byte_count,
-        );
-        metrics.record_protobuf(&id, message_type, byte_count);
-        if let Some(revision) = revision {
-            let _ = events
-                .send(RelayEvent::Delivered {
-                    id: id.clone(),
-                    revision,
-                })
-                .await;
+
+        match action {
+            WriterAction::State(frame) => {
+                if let Some(bytes) = frame.bytes
+                    && !send_writer_payload(
+                        &context.id,
+                        &mut sink,
+                        bytes,
+                        &context.metrics,
+                        context.traffic_channel,
+                    )
+                    .await
+                {
+                    break;
+                }
+
+                if let Some(digest) = frame.digest
+                    && !send_writer_payload(
+                        &context.id,
+                        &mut sink,
+                        digest,
+                        &context.metrics,
+                        context.traffic_channel,
+                    )
+                    .await
+                {
+                    break;
+                }
+
+                let _ = context
+                    .events
+                    .send(RelayEvent::Delivered {
+                        id: context.id.clone(),
+                        revision: frame.revision,
+                        snapshot: frame.snapshot,
+                        battle_revision: frame.battle_revision,
+                    })
+                    .await;
+            }
+            WriterAction::Control(bytes) => {
+                if !send_writer_payload(
+                    &context.id,
+                    &mut sink,
+                    bytes,
+                    &context.metrics,
+                    context.traffic_channel,
+                )
+                .await
+                {
+                    break;
+                }
+            }
         }
     }
+}
+
+async fn send_writer_payload<S, E>(
+    id: &str,
+    sink: &mut S,
+    bytes: Arc<[u8]>,
+    metrics: &Metrics,
+    traffic_channel: TrafficChannel,
+) -> bool
+where
+    S: Sink<Frame, Error = E> + Unpin,
+{
+    let byte_count = bytes.len();
+    let message_type = protobuf_message_type(&bytes);
+    #[cfg(feature = "memory-debug")]
+    let send_started = std::time::Instant::now();
+    let sent = tokio::time::timeout(
+        Duration::from_secs(2),
+        sink.send(Frame::binary(Bytes::from_owner(bytes))),
+    )
+    .await;
+    let succeeded = matches!(sent, Ok(Ok(())));
+    #[cfg(feature = "memory-debug")]
+    metrics.record_writer_send(send_started.elapsed(), succeeded);
+    if !succeeded {
+        warn!(connection_id = %id, "slow or failed websocket writer disconnected");
+        return false;
+    }
+    metrics.record(
+        Layer::Application,
+        traffic_channel,
+        Direction::Egress,
+        byte_count,
+    );
+    metrics.record_protobuf(id, message_type, byte_count);
+    true
 }
 
 struct ReaderContext {
@@ -1423,4 +1513,115 @@ async fn record_connection_audit(
     .bind(detail.to_string())
     .execute(db)
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        convert::Infallible,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use super::*;
+    use crate::proto::teamviewer::v1::SnapshotFull;
+
+    struct RecordingSink {
+        frames: mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    impl Sink<Frame> for RecordingSink {
+        type Error = Infallible;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, frame: Frame) -> Result<(), Self::Error> {
+            let _ = self.frames.send(frame.into_payload().to_vec());
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_orders_each_state_before_its_matching_digest() {
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel();
+        let sink = RecordingSink { frames: frames_tx };
+        let (control_tx, control_rx) = mpsc::channel(4);
+        let (state_tx, state_rx) = watch::channel(None::<StateFrame>);
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+
+        control_tx
+            .send(Arc::from(&b"control"[..]))
+            .await
+            .expect("control channel");
+        let first_snapshot = Arc::new(SnapshotFull {
+            server_time: Some(1.0),
+            ..Default::default()
+        });
+        state_tx.send_replace(Some(StateFrame {
+            revision: 1,
+            bytes: Some(Arc::from(&b"state-1"[..])),
+            digest: Some(Arc::from(&b"digest-1"[..])),
+            snapshot: first_snapshot.clone(),
+            battle_revision: 1,
+        }));
+
+        let writer = tokio::spawn(writer_loop(
+            sink,
+            control_rx,
+            state_rx,
+            WriterContext {
+                id: "test".to_owned(),
+                events: events_tx,
+                metrics: Arc::new(Metrics::default()),
+                traffic_channel: TrafficChannel::Player,
+            },
+        ));
+
+        assert_eq!(frames_rx.recv().await.as_deref(), Some(&b"state-1"[..]));
+        assert_eq!(frames_rx.recv().await.as_deref(), Some(&b"digest-1"[..]));
+        assert_eq!(frames_rx.recv().await.as_deref(), Some(&b"control"[..]));
+
+        let RelayEvent::Delivered {
+            revision, snapshot, ..
+        } = events_rx.recv().await.expect("delivered event")
+        else {
+            panic!("expected delivered event");
+        };
+        assert_eq!(revision, 1);
+        assert!(Arc::ptr_eq(&snapshot, &first_snapshot));
+
+        state_tx.send_replace(Some(StateFrame {
+            revision: 2,
+            bytes: Some(Arc::from(&b"state-2"[..])),
+            digest: Some(Arc::from(&b"digest-2"[..])),
+            snapshot: Arc::new(SnapshotFull {
+                server_time: Some(2.0),
+                ..Default::default()
+            }),
+            battle_revision: 2,
+        }));
+        assert_eq!(frames_rx.recv().await.as_deref(), Some(&b"state-2"[..]));
+        assert_eq!(frames_rx.recv().await.as_deref(), Some(&b"digest-2"[..]));
+
+        writer.abort();
+    }
 }
