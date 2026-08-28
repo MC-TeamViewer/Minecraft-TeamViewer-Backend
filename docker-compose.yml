@@ -1,6 +1,6 @@
 services:
   backend:
-    image: ${TEAMVIEWER_IMAGE:-professornuo/teamviewrelay-rust:v1.1.2-proto0.8.0}
+    image: ${TEAMVIEWER_IMAGE:-professornuo/teamviewrelay-rust:v1.1.3-proto0.8.0}
     build:
       context: .
     container_name: teamviewer-backend

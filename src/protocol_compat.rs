@@ -1,6 +1,6 @@
 use std::{fmt, str::FromStr, sync::Arc};
 
-use crate::proto::teamviewer::v1::{PlayerReportBundle, SnapshotFull};
+use crate::proto::teamviewer::v1::{Patch, PlayerReportBundle, SnapshotFull};
 use serde_json::{Map, Value, json};
 
 pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 8, 0);
@@ -161,7 +161,7 @@ impl CompatibilityRuleId {
             Self::DefaultPlayerRole => "按普通玩家处理不支持角色协商的客户端",
             Self::OmitLastSeenPlayers => "不收发或摘要离线玩家最后位置",
             Self::OmitPlayerSourceMetadata => "移除玩家位置来源元数据",
-            Self::FullSnapshotForClearFields => "字段删除时回退完整快照",
+            Self::FullSnapshotForClearFields => "字段删除时重建受影响对象",
             Self::DisableTabHistory => "不声明、接收或持久化 Tab 历史能力",
             Self::LegacyBattleChunkDigest => "使用旧版 keyed 战区摘要合同",
         }
@@ -357,6 +357,76 @@ pub fn sanitize_player_report(profile: ProtocolProfile, report: &mut PlayerRepor
     }
 }
 
+pub fn adapt_outbound_patch(profile: ProtocolProfile, mut patch: Patch) -> Patch {
+    if profile.supports_clear_fields() {
+        return patch;
+    }
+
+    if let Some(scope) = &mut patch.players {
+        for upsert in &mut scope.upsert {
+            if !upsert.clear_fields.is_empty() {
+                if !scope.delete.contains(&upsert.id) {
+                    scope.delete.push(upsert.id.clone());
+                }
+                upsert.clear_fields.clear();
+            }
+        }
+    }
+    if let Some(scope) = &mut patch.entities {
+        for upsert in &mut scope.upsert {
+            if !upsert.clear_fields.is_empty() {
+                if !scope.delete.contains(&upsert.id) {
+                    scope.delete.push(upsert.id.clone());
+                }
+                upsert.clear_fields.clear();
+            }
+        }
+    }
+    if let Some(scope) = &mut patch.waypoints {
+        for upsert in &mut scope.upsert {
+            if !upsert.clear_fields.is_empty() {
+                if !scope.delete.contains(&upsert.id) {
+                    scope.delete.push(upsert.id.clone());
+                }
+                upsert.clear_fields.clear();
+            }
+        }
+    }
+    if let Some(scope) = &mut patch.battle_chunks {
+        for upsert in &mut scope.upsert {
+            if !upsert.clear_fields.is_empty() {
+                if let Some(reference) = &upsert.r#ref
+                    && !scope.delete.contains(reference)
+                {
+                    scope.delete.push(reference.clone());
+                }
+                upsert.clear_fields.clear();
+            }
+        }
+    }
+    if let Some(scope) = &mut patch.last_seen_players {
+        for upsert in &mut scope.upsert {
+            if !upsert.clear_fields.is_empty() {
+                if !scope.delete.contains(&upsert.id) {
+                    scope.delete.push(upsert.id.clone());
+                }
+                upsert.clear_fields.clear();
+            }
+        }
+    }
+    if let Some(scope) = &mut patch.player_marks {
+        for upsert in &mut scope.upsert {
+            if !upsert.clear_fields.is_empty() {
+                if !scope.delete.contains(&upsert.id) {
+                    scope.delete.push(upsert.id.clone());
+                }
+                upsert.clear_fields.clear();
+            }
+        }
+    }
+    patch
+}
+
 pub struct CompatibilityOverview {
     pub connection_details: Value,
     pub summary: Value,
@@ -478,8 +548,12 @@ fn insert_profile_fields(
 mod tests {
     use super::*;
     use crate::proto::teamviewer::v1::{
-        BattleChunkEntry, BattleChunkValue, BattleMapObservation, ExternalSourceStatus,
-        LastSeenPlayersReplace, PlayerData, TabPlayerEntry, TabPlayerReport, WebMapTabState,
+        BattleChunkEntry, BattleChunkPatchScope, BattleChunkRef, BattleChunkUpsert,
+        BattleChunkValue, BattleMapObservation, EntityPatchScope, EntityUpsert,
+        ExternalSourceStatus, LastSeenPlayerPatchScope, LastSeenPlayerUpsert,
+        LastSeenPlayersReplace, PlayerData, PlayerMarkPatchScope, PlayerMarkUpsert,
+        PlayerPatchScope, PlayerUpsert, TabPlayerEntry, TabPlayerReport, WaypointPatchScope,
+        WaypointUpsert, WebMapTabState,
     };
     use std::collections::HashMap;
 
@@ -624,5 +698,87 @@ mod tests {
         assert!(report.battle_map_observation.unwrap().mode.is_none());
         assert!(report.external_source_status.is_none());
         assert!(report.last_seen_players_replace.is_none());
+    }
+
+    #[test]
+    fn legacy_patch_rebuilds_only_objects_that_clear_fields() {
+        let mut patch = Patch {
+            players: Some(PlayerPatchScope {
+                upsert: vec![PlayerUpsert {
+                    id: "player".to_owned(),
+                    clear_fields: vec!["health".to_owned()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            entities: Some(EntityPatchScope {
+                upsert: vec![EntityUpsert {
+                    id: "entity".to_owned(),
+                    clear_fields: vec!["entityName".to_owned()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            waypoints: Some(WaypointPatchScope {
+                upsert: vec![WaypointUpsert {
+                    id: "waypoint".to_owned(),
+                    clear_fields: vec!["symbol".to_owned()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            battle_chunks: Some(BattleChunkPatchScope {
+                upsert: vec![BattleChunkUpsert {
+                    r#ref: Some(BattleChunkRef {
+                        dimension: "minecraft:overworld".to_owned(),
+                        ..Default::default()
+                    }),
+                    clear_fields: vec!["mode".to_owned()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            last_seen_players: Some(LastSeenPlayerPatchScope {
+                upsert: vec![LastSeenPlayerUpsert {
+                    id: "last-seen".to_owned(),
+                    clear_fields: vec!["playerName".to_owned()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            player_marks: Some(PlayerMarkPatchScope {
+                upsert: vec![PlayerMarkUpsert {
+                    id: "mark".to_owned(),
+                    clear_fields: vec!["label".to_owned()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        patch.players.as_mut().unwrap().upsert.push(PlayerUpsert {
+            id: "ordinary-update".to_owned(),
+            ..Default::default()
+        });
+
+        let adapted = adapt_outbound_patch(
+            ProtocolProfile::negotiate("0.6.4", "0.6.1").expect("supported"),
+            patch,
+        );
+
+        let players = adapted.players.unwrap();
+        assert_eq!(players.delete, ["player"]);
+        assert!(
+            players
+                .upsert
+                .iter()
+                .all(|value| value.clear_fields.is_empty())
+        );
+        assert!(!players.delete.contains(&"ordinary-update".to_owned()));
+        assert_eq!(adapted.entities.unwrap().delete, ["entity"]);
+        assert_eq!(adapted.waypoints.unwrap().delete, ["waypoint"]);
+        assert_eq!(adapted.battle_chunks.unwrap().delete.len(), 1);
+        assert_eq!(adapted.last_seen_players.unwrap().delete, ["last-seen"]);
+        assert_eq!(adapted.player_marks.unwrap().delete, ["mark"]);
     }
 }

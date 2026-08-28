@@ -16,6 +16,11 @@ TeamViewRelay 的 Rust 后端服务。它接收 Minecraft 客户端上报的数�
 - [Minecraft_TeamViewer](https://github.com/MC-TeamViewer/Minecraft_TeamViewer)：Minecraft 客户端 Mod
 - [Minecraft-TeamViewer-Web-Script](https://github.com/MC-TeamViewer/Minecraft-TeamViewer-Web-Script)：网页地图投影脚本
 
+项目文档：
+
+- [更新日志](CHANGELOG.md)
+- [战区区块状态协议 vNext 设计方向](docs/battle-chunk-state-protocol-vnext.md)
+
 ## 快速启动
 
 推荐直接使用 Docker Compose：
@@ -70,7 +75,7 @@ docker build -t teamviewrelay-backend:local .
 已发布镜像：
 
 ```text
-professornuo/teamviewrelay-rust:v1.1.2-proto0.8.0
+professornuo/teamviewrelay-rust:v1.1.3-proto0.8.0
 ```
 
 `docker-compose.yml` 默认使用该版本，并将 SQLite 数据目录挂载到宿主机的 `./data-rust`。
@@ -84,7 +89,7 @@ docker compose -f docker-compose.yml -f docker-compose.memory-debug.yml up -d --
 docker compose logs -f backend
 ```
 
-它对应镜像 tag `v1.1.2-memory-debug-proto0.8.0`，每 10 秒把资源快照写入
+它对应镜像 tag `v1.1.3-memory-debug-proto0.8.0`，每 10 秒把资源快照写入
 `./data-rust/memory-debug/samples-YYYY-MM-DD.jsonl`，heap 原始 dump、pprof、手动 CPU pprof 和 SVG
 火焰图写入 `./data-rust/memory-debug/profiles/`。首次 heap profile 默认在启动 2 分钟后生成；内存相对
 上次 profile 增长 8 MiB 时会自动追加抓取。heap 的符号解析由一次性子进程完成，解析缓存不会进入
@@ -199,7 +204,7 @@ uv run python scripts/load_test_live.py \
   --stage-duration 300 \
   --report-hz 10 \
   --allow-remote \
-  --expected-build team-view-relay-rust-v1.1.2-proto0.8.0
+  --expected-build team-view-relay-rust-v1.1.3-proto0.8.0
 ```
 
 `--expected-build` 必须与目标 `/health` 返回的 `buildVersion` 完全一致，而不是 Docker tag。可先检查：
@@ -232,6 +237,7 @@ config/server_state_config.toml
 ├── config/                      服务端状态配置
 ├── admin-ui/                    Vue 管理页面及 Vitest 测试
 ├── deploy/                      反向代理配置示例
+├── docs/                        设计与演进文档
 ├── scripts/                     独立黑盒压测工具
 ├── third_party/
 │   └── TeamViewRelay-Protocol/  commit 锁定的共享协议 submodule

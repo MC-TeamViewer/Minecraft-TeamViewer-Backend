@@ -27,7 +27,9 @@ use crate::proto::teamviewer::v1::{
     WebMapTacticalWaypointAckDetail, WebMapWaypointsDeleteAckDetail, WireChannel, WireEnvelope,
     web_map_ack, web_map_command, wire_envelope,
 };
-use crate::protocol_compat::{ProtocolEpoch, ProtocolProfile, project_snapshot};
+use crate::protocol_compat::{
+    ProtocolEpoch, ProtocolProfile, adapt_outbound_patch, project_snapshot,
+};
 
 pub const EVENT_CAPACITY: usize = 2_048;
 pub const CONTROL_CAPACITY: usize = 32;
@@ -373,7 +375,6 @@ struct BattleExpiryBatch {
 struct BattleChangeBatch {
     revision: u64,
     keys: Vec<BattleCacheKey>,
-    requires_clear: bool,
 }
 
 #[derive(Default)]
@@ -405,7 +406,6 @@ impl BattleRoomCache {
         let generation = self.next_generation;
         let mut expiry_keys = Vec::with_capacity(entries.len());
         let mut changed = BTreeSet::new();
-        let mut requires_clear = false;
 
         for entry in entries {
             let Some(reference) = entry.r#ref.as_ref() else {
@@ -426,9 +426,6 @@ impl BattleRoomCache {
             let previous = self.entries.get(&key);
             let visible_changed =
                 previous.is_none_or(|current| current.value.as_ref() != value.as_ref());
-            requires_clear |= previous.is_some_and(|current| {
-                !battle_cleared_fields(current.value.as_ref(), value.as_ref()).is_empty()
-            });
             self.entries
                 .insert(key.clone(), CachedBattleChunk { value, generation });
             expiry_keys.push(key.clone());
@@ -445,7 +442,7 @@ impl BattleRoomCache {
             });
         }
         self.evict_to_limit(max_entries, &mut changed);
-        let changed = self.record_changes(changed, requires_clear);
+        let changed = self.record_changes(changed);
         if generation.is_multiple_of(64) {
             self.prune_stale_indexes();
         }
@@ -462,7 +459,7 @@ impl BattleRoomCache {
             self.pop_expiry_batch(&mut changed);
         }
         self.evict_to_limit(max_entries, &mut changed);
-        let changed = self.record_changes(changed, false);
+        let changed = self.record_changes(changed);
         if changed {
             self.prune_interners();
         }
@@ -530,26 +527,6 @@ impl BattleRoomCache {
         self.patch_builds_total
             .set(self.patch_builds_total.get().saturating_add(1));
         Some(Some(BattleChunkPatchScope { upsert, delete }))
-    }
-
-    fn requires_clear_since(&self, delivered_revision: u64) -> Option<bool> {
-        if delivered_revision == self.revision {
-            return Some(false);
-        }
-        if delivered_revision > self.revision
-            || self
-                .changes
-                .front()
-                .is_none_or(|batch| batch.revision > delivered_revision.saturating_add(1))
-        {
-            return None;
-        }
-        Some(
-            self.changes
-                .iter()
-                .filter(|batch| batch.revision > delivered_revision)
-                .any(|batch| batch.requires_clear),
-        )
     }
 
     fn meta_entries(&self, requested: &HashSet<String>) -> Vec<BattleChunkMetaEntry> {
@@ -651,7 +628,7 @@ impl BattleRoomCache {
         }
     }
 
-    fn record_changes(&mut self, changed: BTreeSet<BattleCacheKey>, requires_clear: bool) -> bool {
+    fn record_changes(&mut self, changed: BTreeSet<BattleCacheKey>) -> bool {
         if changed.is_empty() {
             return false;
         }
@@ -661,7 +638,6 @@ impl BattleRoomCache {
         self.changes.push_back(BattleChangeBatch {
             revision: self.revision,
             keys,
-            requires_clear,
         });
         while self.changes.len() > Self::MAX_CHANGE_BATCHES
             || self.change_operations > Self::MAX_CHANGE_OPERATIONS
@@ -698,7 +674,7 @@ struct RoomFrame {
     revision: u64,
     snapshot: SnapshotFull,
     web_snapshot: SnapshotFull,
-    selected_players: HashMap<String, String>,
+    selected_players: PlayerSourceSelections,
     selected_entities: HashMap<String, String>,
     selected_waypoints: HashMap<String, String>,
     selected_battle_chunks: HashMap<String, String>,
@@ -707,11 +683,17 @@ struct RoomFrame {
 
 #[derive(Default, Clone)]
 struct ScopeSelections {
-    players: HashMap<String, String>,
+    players: PlayerSourceSelections,
     entities: HashMap<String, String>,
     waypoints: HashMap<String, String>,
     battle_chunks: HashMap<String, String>,
     last_seen_players: HashMap<String, String>,
+}
+
+#[derive(Default, Clone)]
+struct PlayerSourceSelections {
+    selected_sources: HashMap<String, String>,
+    game_seen_since: HashMap<String, HashMap<String, Instant>>,
 }
 
 #[derive(Default)]
@@ -1584,21 +1566,21 @@ impl Relay {
             collect_candidates(&self.sources, room, allowed_sources, false, |source| {
                 &source.players
             });
-        let players = resolve_candidates(
+        let players = resolve_player_candidates(
             player_candidates,
             &mut selected_players,
+            Instant::now(),
             |object_id, source_id| {
                 if object_id.eq_ignore_ascii_case(source_id) {
                     2
-                } else if self
-                    .connections
-                    .get(source_id)
-                    .is_some_and(|connection| connection.kind == ConnectionKind::ExternalSource)
-                {
-                    0
                 } else {
                     1
                 }
+            },
+            |source_id| {
+                self.connections
+                    .get(source_id)
+                    .is_some_and(|connection| connection.kind == ConnectionKind::ExternalSource)
             },
         );
         for (player_id, (source_id, reported)) in players {
@@ -2551,7 +2533,7 @@ impl Relay {
             .map(|(id, data)| {
                 json!({
                     "id":id,
-                    "sourceId":selected_source(&selections.players, id),
+                    "sourceId":selected_source(&selections.players.selected_sources, id),
                     "reportedAtUtcMs":Value::Null,
                     "data":player_json(data),
                 })
@@ -2732,7 +2714,7 @@ fn snapshot_object_count(snapshot: &SnapshotFull) -> usize {
 
 #[cfg(feature = "memory-debug")]
 fn scope_selection_count(selections: &ScopeSelections) -> usize {
-    selections.players.len()
+    selections.players.selected_sources.len()
         + selections.entities.len()
         + selections.waypoints.len()
         + selections.battle_chunks.len()
@@ -2838,6 +2820,118 @@ fn resolve_candidates<T: Clone>(
         );
     }
     *selected_sources = next_selected;
+    resolved
+}
+
+fn resolve_player_candidates<T: Clone>(
+    candidates: HashMap<String, Vec<(&str, &Timed<T>)>>,
+    selections: &mut PlayerSourceSelections,
+    now: Instant,
+    priority: impl Fn(&str, &str) -> i32,
+    is_external: impl Fn(&str) -> bool,
+) -> HashMap<String, (String, T)> {
+    const GAME_TAKEOVER_DELAY: Duration = Duration::from_millis(500);
+    let mut resolved = HashMap::new();
+    let mut next_selected = HashMap::new();
+
+    for (object_id, bucket) in candidates {
+        let external_candidates = bucket
+            .iter()
+            .copied()
+            .filter(|(source_id, _)| is_external(source_id))
+            .collect::<Vec<_>>();
+        let game_candidates = bucket
+            .iter()
+            .copied()
+            .filter(|(source_id, _)| !is_external(source_id))
+            .collect::<Vec<_>>();
+
+        let active_game_sources = game_candidates
+            .iter()
+            .map(|(source_id, _)| (*source_id).to_owned())
+            .collect::<HashSet<_>>();
+        let seen_since = selections
+            .game_seen_since
+            .entry(object_id.clone())
+            .or_default();
+        seen_since.retain(|source_id, _| active_game_sources.contains(source_id));
+        for source_id in &active_game_sources {
+            seen_since.entry(source_id.clone()).or_insert(now);
+        }
+
+        let selected_source = selections.selected_sources.get(&object_id);
+        let best_external = selected_source
+            .filter(|source_id| is_external(source_id))
+            .and_then(|selected_source| {
+                external_candidates
+                    .iter()
+                    .copied()
+                    .find(|(source_id, _)| source_id == selected_source)
+            })
+            .or_else(|| {
+                external_candidates.iter().copied().max_by(
+                    |(left_source, left_value), (right_source, right_value)| {
+                        left_value
+                            .received_at
+                            .cmp(&right_value.received_at)
+                            .then_with(|| right_source.cmp(left_source))
+                    },
+                )
+            });
+        let best_game = game_candidates.iter().copied().max_by(
+            |(left_source, left_value), (right_source, right_value)| {
+                priority(&object_id, left_source)
+                    .cmp(&priority(&object_id, right_source))
+                    .then_with(|| left_value.received_at.cmp(&right_value.received_at))
+                    .then_with(|| right_source.cmp(left_source))
+            },
+        );
+        let current_game = selected_source
+            .filter(|source_id| !is_external(source_id))
+            .and_then(|selected_source| {
+                game_candidates
+                    .iter()
+                    .copied()
+                    .find(|(source_id, _)| source_id == selected_source)
+            });
+
+        let chosen = match (best_external, best_game, current_game) {
+            (Some(_), Some(best_game), Some(current_game)) => {
+                if priority(&object_id, best_game.0) > priority(&object_id, current_game.0) {
+                    best_game
+                } else {
+                    current_game
+                }
+            }
+            (Some(external), Some(best_game), None) => {
+                if seen_since.get(best_game.0).is_some_and(|first_seen| {
+                    now.saturating_duration_since(*first_seen) >= GAME_TAKEOVER_DELAY
+                }) {
+                    best_game
+                } else {
+                    external
+                }
+            }
+            (Some(external), None, _) => external,
+            (None, Some(best_game), Some(current_game)) => {
+                if priority(&object_id, best_game.0) > priority(&object_id, current_game.0) {
+                    best_game
+                } else {
+                    current_game
+                }
+            }
+            (None, Some(best_game), _) => best_game,
+            (None, None, _) => continue,
+        };
+
+        next_selected.insert(object_id.clone(), chosen.0.to_owned());
+        resolved.insert(object_id, (chosen.0.to_owned(), chosen.1.data.clone()));
+    }
+
+    selections.selected_sources = next_selected;
+    selections.game_seen_since.retain(|object_id, sources| {
+        selections.selected_sources.contains_key(object_id) && !sources.is_empty()
+    });
     resolved
 }
 
@@ -2955,11 +3049,9 @@ fn state_payload_for_profile(
         return Some(wire_envelope::Payload::SnapshotFull(target.clone()));
     }
     let patch = build_patch(delivered_snapshot.expect("checked"), target)?;
-    if !profile.supports_clear_fields() && patch_requires_clear_fields(&patch) {
-        Some(wire_envelope::Payload::SnapshotFull(target.clone()))
-    } else {
-        Some(wire_envelope::Payload::Patch(patch))
-    }
+    Some(wire_envelope::Payload::Patch(adapt_outbound_patch(
+        profile, patch,
+    )))
 }
 
 fn state_payload_for_profile_with_battle(
@@ -2977,18 +3069,13 @@ fn state_payload_for_profile_with_battle(
             cache.patch_since(
                 delivered_battle_revision,
                 profile.supports_battle_chunk_mode(),
-                profile.supports_clear_fields(),
+                true,
             )
         })
     } else {
         Some(None)
     };
-    let requires_full_battle = battle_changed
-        && (battle_patch.is_none()
-            || (!profile.supports_clear_fields()
-                && battle_cache
-                    .and_then(|cache| cache.requires_clear_since(delivered_battle_revision))
-                    .unwrap_or(true)));
+    let requires_full_battle = battle_changed && battle_patch.is_none();
 
     if force_full || delivered_snapshot.is_none() || requires_full_battle {
         let mut full = target.clone();
@@ -3003,15 +3090,9 @@ fn state_payload_for_profile_with_battle(
         patch.get_or_insert_with(Patch::default).battle_chunks = Some(battle_chunks);
     }
     let patch = patch?;
-    if !profile.supports_clear_fields() && patch_requires_clear_fields(&patch) {
-        let mut full = target.clone();
-        full.battle_chunks = battle_cache.map_or_else(Vec::new, |cache| {
-            cache.full_entries(profile.supports_battle_chunk_mode())
-        });
-        Some(wire_envelope::Payload::SnapshotFull(full))
-    } else {
-        Some(wire_envelope::Payload::Patch(patch))
-    }
+    Some(wire_envelope::Payload::Patch(adapt_outbound_patch(
+        profile, patch,
+    )))
 }
 
 fn battle_missing_fields(value: &BattleChunkValue, include_mode: bool) -> Vec<String> {
@@ -3028,40 +3109,6 @@ fn battle_missing_fields(value: &BattleChunkValue, include_mode: bool) -> Vec<St
     .filter(|(_, missing)| *missing)
     .map(|(field, _)| field.to_owned())
     .collect()
-}
-
-fn patch_requires_clear_fields(patch: &Patch) -> bool {
-    patch.players.as_ref().is_some_and(|scope| {
-        scope
-            .upsert
-            .iter()
-            .any(|value| !value.clear_fields.is_empty())
-    }) || patch.entities.as_ref().is_some_and(|scope| {
-        scope
-            .upsert
-            .iter()
-            .any(|value| !value.clear_fields.is_empty())
-    }) || patch.waypoints.as_ref().is_some_and(|scope| {
-        scope
-            .upsert
-            .iter()
-            .any(|value| !value.clear_fields.is_empty())
-    }) || patch.battle_chunks.as_ref().is_some_and(|scope| {
-        scope
-            .upsert
-            .iter()
-            .any(|value| !value.clear_fields.is_empty())
-    }) || patch.last_seen_players.as_ref().is_some_and(|scope| {
-        scope
-            .upsert
-            .iter()
-            .any(|value| !value.clear_fields.is_empty())
-    }) || patch.player_marks.as_ref().is_some_and(|scope| {
-        scope
-            .upsert
-            .iter()
-            .any(|value| !value.clear_fields.is_empty())
-    })
 }
 
 fn build_tab_state_patch(
@@ -4421,7 +4468,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_fields_fall_back_only_before_protocol_0_6_5() {
+    fn legacy_clear_fields_rebuild_only_the_changed_object() {
         let mut old = SnapshotFull::default();
         old.players.insert(
             "player".into(),
@@ -4433,10 +4480,14 @@ mod tests {
         let mut new = old.clone();
         new.players.get_mut("player").expect("player").player_name = None;
 
-        assert!(matches!(
-            state_payload_for_profile(protocol_profile("0.6.4"), false, Some(&old), &new,),
-            Some(wire_envelope::Payload::SnapshotFull(_))
-        ));
+        let Some(wire_envelope::Payload::Patch(legacy)) =
+            state_payload_for_profile(protocol_profile("0.6.4"), false, Some(&old), &new)
+        else {
+            panic!("expected legacy object rebuild patch");
+        };
+        let legacy_players = legacy.players.expect("players");
+        assert_eq!(legacy_players.delete, ["player"]);
+        assert!(legacy_players.upsert[0].clear_fields.is_empty());
         assert!(matches!(
             state_payload_for_profile(protocol_profile("0.6.5"), false, Some(&old), &new,),
             Some(wire_envelope::Payload::Patch(_))
@@ -4754,7 +4805,7 @@ mod tests {
         let mut cleared = battle_chunk_fixture("minecraft:overworld", 1, 2);
         cleared.data.as_mut().expect("data").mode = None;
         cache.upsert(vec![cleared], Instant::now(), 10);
-        assert!(matches!(
+        let Some(wire_envelope::Payload::Patch(legacy_patch)) =
             state_payload_for_profile_with_battle(
                 legacy_profile,
                 false,
@@ -4762,9 +4813,13 @@ mod tests {
                 delivered_revision,
                 &target,
                 Some(&cache),
-            ),
-            Some(wire_envelope::Payload::SnapshotFull(_))
-        ));
+            )
+        else {
+            panic!("expected legacy battle object rebuild patch");
+        };
+        let battle_scope = legacy_patch.battle_chunks.expect("battle scope");
+        assert_eq!(battle_scope.delete.len(), 1);
+        assert!(battle_scope.upsert[0].clear_fields.is_empty());
     }
 
     #[test]
@@ -4784,11 +4839,17 @@ mod tests {
         assert_eq!(cache.values.len(), 1);
 
         let mut delivered = SnapshotFull::default();
-        delivered
-            .players
-            .insert("player".to_owned(), PlayerData::default());
+        delivered.players.insert(
+            "player".to_owned(),
+            PlayerData {
+                player_name: Some("Alice".to_owned()),
+                ..Default::default()
+            },
+        );
         let mut target = delivered.clone();
-        target.players.get_mut("player").expect("player").x = 1.0;
+        let target_player = target.players.get_mut("player").expect("player");
+        target_player.x = 1.0;
+        target_player.player_name = None;
         let expansions = cache.full_expansions_total.get();
         let payload = state_payload_for_profile_with_battle(
             protocol_profile("0.7.1"),
@@ -4803,6 +4864,22 @@ mod tests {
             panic!("expected player patch");
         };
         assert!(patch.battle_chunks.is_none());
+        assert_eq!(cache.full_expansions_total.get(), expansions);
+
+        let Some(wire_envelope::Payload::Patch(legacy_patch)) =
+            state_payload_for_profile_with_battle(
+                protocol_profile("0.6.4"),
+                false,
+                Some(&delivered),
+                cache.revision,
+                &target,
+                Some(&cache),
+            )
+        else {
+            panic!("expected legacy object rebuild patch");
+        };
+        assert!(legacy_patch.battle_chunks.is_none());
+        assert_eq!(legacy_patch.players.expect("players").delete, ["player"]);
         assert_eq!(cache.full_expansions_total.get(), expansions);
         assert_ne!(
             cache.digest(BattleChunkDigestContract::StructuredV2, true),
@@ -5064,6 +5141,101 @@ mod tests {
             |_, _| 0,
         );
         assert_eq!(switched["target"].0, "source-a");
+    }
+
+    #[test]
+    fn player_source_uses_external_baseline_then_stable_game_and_immediate_fallback() {
+        let base = Instant::now();
+        let mut sources = HashMap::new();
+        for (source_id, x) in [("external", 1.0), ("game", 2.0)] {
+            let mut source = SourceState {
+                room: "room".to_owned(),
+                ..Default::default()
+            };
+            source.players.insert(
+                "target".to_owned(),
+                Timed::new(
+                    PlayerData {
+                        x,
+                        ..Default::default()
+                    },
+                    base,
+                ),
+            );
+            sources.insert(source_id.to_owned(), source);
+        }
+        let mut selections = PlayerSourceSelections::default();
+        let resolve = |sources: &HashMap<String, SourceState>,
+                       selections: &mut PlayerSourceSelections,
+                       now| {
+            resolve_player_candidates(
+                collect_candidates(sources, "room", None, false, |source| &source.players),
+                selections,
+                now,
+                |_, _| 1,
+                |source_id| source_id == "external",
+            )
+        };
+
+        let initial = resolve(&sources, &mut selections, base);
+        assert_eq!(initial["target"].0, "external");
+        let pending = resolve(&sources, &mut selections, base + Duration::from_millis(499));
+        assert_eq!(pending["target"].0, "external");
+        let taken_over = resolve(&sources, &mut selections, base + Duration::from_millis(500));
+        assert_eq!(taken_over["target"].0, "game");
+
+        sources.remove("game");
+        let fallback = resolve(&sources, &mut selections, base + Duration::from_millis(501));
+        assert_eq!(fallback["target"].0, "external");
+        assert!(fallback.contains_key("target"));
+    }
+
+    #[test]
+    fn player_source_without_external_is_immediate_and_same_priority_is_sticky() {
+        let base = Instant::now();
+        let mut sources = HashMap::new();
+        for (source_id, x, offset_ms) in [("source-a", 1.0, 0), ("source-b", 2.0, 100)] {
+            let mut source = SourceState {
+                room: "room".to_owned(),
+                ..Default::default()
+            };
+            source.players.insert(
+                "target".to_owned(),
+                Timed::new(
+                    PlayerData {
+                        x,
+                        ..Default::default()
+                    },
+                    base + Duration::from_millis(offset_ms),
+                ),
+            );
+            sources.insert(source_id.to_owned(), source);
+        }
+        let mut selections = PlayerSourceSelections::default();
+        let initial = resolve_player_candidates(
+            collect_candidates(&sources, "room", None, false, |source| &source.players),
+            &mut selections,
+            base,
+            |_, _| 1,
+            |_| false,
+        );
+        assert_eq!(initial["target"].0, "source-b");
+
+        sources
+            .get_mut("source-a")
+            .unwrap()
+            .players
+            .get_mut("target")
+            .unwrap()
+            .received_at = base + Duration::from_secs(1);
+        let sticky = resolve_player_candidates(
+            collect_candidates(&sources, "room", None, false, |source| &source.players),
+            &mut selections,
+            base + Duration::from_secs(1),
+            |_, _| 1,
+            |_| false,
+        );
+        assert_eq!(sticky["target"].0, "source-b");
     }
 
     #[test]
