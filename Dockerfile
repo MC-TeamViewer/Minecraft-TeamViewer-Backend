@@ -30,7 +30,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-EXPOSE 8765
+EXPOSE 8765/tcp
+EXPOSE 8766/udp
 CMD ["/app/teamviewrelay-rust"]
 
 FROM runtime-base AS memory-debug

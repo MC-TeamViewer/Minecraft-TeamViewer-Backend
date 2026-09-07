@@ -75,7 +75,7 @@ docker build -t teamviewrelay-backend:local .
 已发布镜像：
 
 ```text
-professornuo/teamviewrelay-rust:v1.1.3-proto0.8.0
+professornuo/teamviewrelay-rust:v1.2.0-alpha.1-proto0.8.0
 ```
 
 `docker-compose.yml` 默认使用该版本，并将 SQLite 数据目录挂载到宿主机的 `./data-rust`。
@@ -89,7 +89,7 @@ docker compose -f docker-compose.yml -f docker-compose.memory-debug.yml up -d --
 docker compose logs -f backend
 ```
 
-它对应镜像 tag `v1.1.3-memory-debug-proto0.8.0`，每 10 秒把资源快照写入
+它对应镜像 tag `v1.2.0-alpha.1-memory-debug-proto0.8.0`，每 10 秒把资源快照写入
 `./data-rust/memory-debug/samples-YYYY-MM-DD.jsonl`，heap 原始 dump、pprof、手动 CPU pprof 和 SVG
 火焰图写入 `./data-rust/memory-debug/profiles/`。首次 heap profile 默认在启动 2 分钟后生成；内存相对
 上次 profile 增长 8 MiB 时会自动追加抓取。heap 的符号解析由一次性子进程完成，解析缓存不会进入
@@ -119,6 +119,12 @@ RUSTFLAGS="-C force-frame-pointers=yes" \
 | `TEAMVIEWER_ADMIN_USERNAME` | `admin` | 管理员用户名 |
 | `TEAMVIEWER_ADMIN_PASSWORD` | `admin` | 管理员密码，生产环境必须覆盖 |
 | `TEAMVIEWER_ADMIN_SESSION_TTL_SEC` | `43200` | 管理会话有效期 |
+| `TEAMVIEWER_WT_ENABLED` | `false` | 是否启用 WebTransport/QUIC；启用需显式配置证书 |
+| `TEAMVIEWER_WT_BIND` | `0.0.0.0:8766` | QUIC UDP 监听地址 |
+| `TEAMVIEWER_WT_CERT_PATH` | 空 | PEM fullchain 路径；生产使用 Let’s Encrypt fullchain.pem |
+| `TEAMVIEWER_WT_KEY_PATH` | 空 | PEM private key 路径；生产使用 Let’s Encrypt privkey.pem |
+| `TEAMVIEWER_WT_POLL_INTERVAL_SEC` | `300` | 证书文件检查间隔，范围 30–86400 |
+| `TEAMVIEWER_WT_RENEW_WINDOW_SEC` | `604800` | 到期提前拒绝窗口，范围 1–30 天 |
 | `TEAMVIEWER_TRUST_PROXY_HEADERS` | `false` | 是否读取可信反代转发的真实 IP |
 | `TEAMVIEWER_TRUSTED_PROXY_CIDRS` | 本机与 Docker 私网段 | 可被信任的直连反代地址段 |
 | `RUST_LOG` | `info` | Rust 日志过滤规则 |
@@ -151,6 +157,22 @@ docker compose up -d
 ```
 
 OpenResty / Nginx 示例位于 `deploy/openresty-teamviewer.conf.example`。
+
+### WebTransport 与 QUIC
+
+WebTransport 默认关闭。启用时必须提供 PEM 证书和私钥，后端只热检测并替换证书，不内嵌
+ACME。UDP 端口必须直连或在容器/防火墙上显式映射；Nginx 与 OpenResty 不能按普通 HTTP 反代
+WebTransport。
+
+```bash
+export TEAMVIEWER_WT_ENABLED=true
+export TEAMVIEWER_WT_BIND=0.0.0.0:8766
+export TEAMVIEWER_WT_CERT_PATH=/app/certs/fullchain.pem
+export TEAMVIEWER_WT_KEY_PATH=/app/certs/privkey.pem
+```
+
+浏览器入口为 `https://host:8766/web-map/wt`。WS 路径保持不变；Java mod 第一版继续使用
+WebSocket。证书更新成功只影响新 QUIC 连接，已有连接保留旧 TLS 配置并按客户端重连收敛。
 
 ## 源码开发
 
@@ -204,7 +226,7 @@ uv run python scripts/load_test_live.py \
   --stage-duration 300 \
   --report-hz 10 \
   --allow-remote \
-  --expected-build team-view-relay-rust-v1.1.3-proto0.8.0
+  --expected-build team-view-relay-rust-v1.2.0-alpha.1-proto0.8.0
 ```
 
 `--expected-build` 必须与目标 `/health` 返回的 `buildVersion` 完全一致，而不是 Docker tag。可先检查：

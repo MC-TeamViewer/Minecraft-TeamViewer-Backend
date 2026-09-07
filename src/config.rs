@@ -1,4 +1,6 @@
 use serde::Deserialize;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
 const STATE_CONFIG: &str = include_str!("../config/server_state_config.toml");
 
@@ -27,6 +29,7 @@ pub struct RuntimeConfig {
     pub tab_history_max_chunk_bytes: usize,
     pub tab_history_max_lookup_selectors: usize,
     pub tab_history_observation_update_interval_sec: u64,
+    pub web_transport: WebTransportConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -39,6 +42,63 @@ struct FileConfig {
     features: FeatureConfig,
     #[serde(rename = "tabHistory")]
     tab_history: TabHistoryConfig,
+    #[serde(rename = "webTransport")]
+    web_transport: WebTransportFileConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+struct WebTransportFileConfig {
+    enabled: bool,
+    #[serde(rename = "bindAddress")]
+    bind_address: String,
+    #[serde(rename = "certPath")]
+    cert_path: String,
+    #[serde(rename = "keyPath")]
+    key_path: String,
+    #[serde(rename = "pollIntervalSec")]
+    poll_interval_sec: u64,
+    #[serde(rename = "renewWindowSec")]
+    renew_window_sec: u64,
+}
+
+impl Default for WebTransportFileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: "0.0.0.0:8766".to_owned(),
+            cert_path: String::new(),
+            key_path: String::new(),
+            poll_interval_sec: 300,
+            renew_window_sec: 7 * 24 * 60 * 60,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WebTransportConfig {
+    pub enabled: bool,
+    pub bind_address: SocketAddr,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    pub poll_interval_sec: u64,
+    pub renew_window_sec: u64,
+}
+
+fn env_string(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    env_string(name).map(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +232,20 @@ impl RuntimeConfig {
             congestion_levels = ProtocolConfig::default().congestion_levels;
         }
         let max_chunks = parsed.tab_history.max_chunk_entries.clamp(1, 512);
+        let web_transport = WebTransportFileConfig {
+            enabled: env_bool("TEAMVIEWER_WT_ENABLED").unwrap_or(parsed.web_transport.enabled),
+            bind_address: env_string("TEAMVIEWER_WT_BIND")
+                .unwrap_or(parsed.web_transport.bind_address),
+            cert_path: env_string("TEAMVIEWER_WT_CERT_PATH")
+                .unwrap_or(parsed.web_transport.cert_path),
+            key_path: env_string("TEAMVIEWER_WT_KEY_PATH").unwrap_or(parsed.web_transport.key_path),
+            poll_interval_sec: parsed.web_transport.poll_interval_sec,
+            renew_window_sec: parsed.web_transport.renew_window_sec,
+        };
+        let bind_address = web_transport
+            .bind_address
+            .parse()
+            .unwrap_or(SocketAddr::from(([0, 0, 0, 0], 8766)));
         Self {
             player_timeout_sec: parsed.timeouts.player_timeout_sec.clamp(1, 3_600),
             entity_timeout_sec: parsed.timeouts.entity_timeout_sec.clamp(1, 3_600),
@@ -211,6 +285,14 @@ impl RuntimeConfig {
                 .tab_history
                 .observation_update_interval_sec
                 .clamp(1, 86_400),
+            web_transport: WebTransportConfig {
+                enabled: web_transport.enabled,
+                bind_address,
+                cert_path: PathBuf::from(web_transport.cert_path),
+                key_path: PathBuf::from(web_transport.key_path),
+                poll_interval_sec: web_transport.poll_interval_sec.clamp(30, 86_400),
+                renew_window_sec: web_transport.renew_window_sec.clamp(1, 30 * 24 * 60 * 60),
+            },
         }
     }
 

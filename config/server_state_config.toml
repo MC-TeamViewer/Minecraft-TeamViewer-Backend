@@ -58,3 +58,12 @@ maxChunkBytes = 262144
 maxLookupSelectors = 128
 # 标签不变时，最多每隔多久刷新一次 lastObserved，避免高频 Tab 报告制造无意义增量。
 observationUpdateIntervalSec = 300
+
+[webTransport]
+# WebTransport/QUIC 默认关闭；启用必须显式配置证书，失败不会影响 WebSocket 服务。
+enabled = false
+bindAddress = "0.0.0.0:8766"
+# certPath = "/etc/letsencrypt/live/example.com/fullchain.pem"
+# keyPath = "/etc/letsencrypt/live/example.com/privkey.pem"
+pollIntervalSec = 300
+renewWindowSec = 604800

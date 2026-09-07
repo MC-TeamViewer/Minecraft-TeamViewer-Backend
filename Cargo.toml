@@ -1,6 +1,6 @@
 [package]
 name = "teamviewrelay-rust"
-version = "1.1.3"
+version = "1.2.0-alpha.1"
 edition = "2024"
 publish = false
 
@@ -50,6 +50,9 @@ uuid = { version = "1.18", features = ["v4"] }
 unicode-normalization = "0.1"
 url = "2.5"
 yawc = { version = "0.3.4", default-features = false, features = ["axum"] }
+wtransport = "0.7.2"
+rustls-pemfile = "2.2.0"
+x509-parser = "0.18.1"
 
 [build-dependencies]
 prost-build = "0.14"
@@ -62,3 +65,7 @@ proptest = "1.7"
 inherits = "release"
 debug = 1
 strip = "none"
+
+[[example]]
+name = "gencert-wt"
+path = "examples/gencert_wt.rs"

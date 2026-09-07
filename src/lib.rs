@@ -11,6 +11,7 @@ pub mod resource_debug;
 pub mod tab_history;
 pub mod transport;
 pub mod web;
+pub mod web_transport;
 
 #[cfg(feature = "memory-debug")]
 #[global_allocator]

@@ -10,6 +10,7 @@ use teamviewrelay_rust::{
     tab_history::TabHistoryStore,
     transport::{CountingListener, TransportConnectInfo},
     web::{AppState, router},
+    web_transport,
 };
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -72,6 +73,17 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "memory-debug")]
         resource_debug,
     };
+    if state.config.web_transport.enabled {
+        let web_transport_config = state.config.web_transport.clone();
+        let web_transport_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                web_transport::serve(web_transport_config, web_transport_state).await
+            {
+                tracing::error!(%error, "WebTransport endpoint failed");
+            }
+        });
+    }
     let port = env::var("TEAMVIEWER_PORT")
         .ok()
         .and_then(|value| value.parse().ok())

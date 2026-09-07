@@ -1,9 +1,12 @@
 use std::{
     collections::HashSet,
+    io,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -16,7 +19,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use bytes::Bytes;
-use futures_util::{Sink, SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use prost::Message as ProstMessage;
 use rust_embed::RustEmbed;
 use serde::Deserialize;
@@ -53,6 +56,31 @@ use crate::{
     },
     transport::TransportConnectInfo,
 };
+
+type WebMapIncoming = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
+
+pub struct WebMapFrameStream {
+    stream: WebMapIncoming,
+}
+
+impl WebMapFrameStream {
+    pub fn new<S>(stream: S) -> Self
+    where
+        S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
+    {
+        Self {
+            stream: Box::pin(stream),
+        }
+    }
+}
+
+impl Stream for WebMapFrameStream {
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().stream.as_mut().poll_next(cx)
+    }
+}
 
 const PROGRAM_VERSION: &str = concat!(
     "team-view-relay-rust-v",
@@ -231,6 +259,237 @@ fn websocket_options() -> Options {
         .with_balanced_compression()
         .with_limits(16 * 1024 * 1024, 32 * 1024 * 1024)
         .with_backpressure_boundary(32 * 1024 * 1024)
+}
+
+pub async fn serve_web_map_session<Si>(
+    mut socket: WebMapFrameStream,
+    mut writer_sink: Si,
+    state: AppState,
+    remote_addr: String,
+) where
+    Si: Sink<Bytes, Error = io::Error> + Unpin + Send + 'static,
+{
+    let first = match tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
+        Ok(Some(Ok(frame))) if !frame.is_empty() => frame,
+        _ => {
+            return;
+        }
+    };
+    let envelope = match WireEnvelope::decode(first.clone()) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            warn!(%error, "invalid protobuf handshake");
+            return;
+        }
+    };
+
+    let (
+        id,
+        room,
+        profile,
+        kind,
+        channel,
+        display_name,
+        position_resolution,
+        program_version,
+        complete_online_roster,
+    ) = match (ConnectionKind::WebMap, envelope.payload) {
+        (
+            ConnectionKind::WebMap,
+            Some(wire_envelope::Payload::WebMapHandshakeRequest(handshake)),
+        ) => {
+            let profile = match ProtocolProfile::negotiate(
+                &handshake.network_protocol_version,
+                &handshake.minimum_compatible_network_protocol_version,
+            ) {
+                Ok(profile) => profile,
+                Err(_error) => return,
+            };
+            (
+                format!("web-map-{}", Uuid::new_v4()),
+                normalize_room(handshake.room_code.as_deref()),
+                profile,
+                ConnectionKind::WebMap,
+                WireChannel::WebMap,
+                Some("Web Map".to_owned()),
+                None,
+                handshake.local_program_version,
+                false,
+            )
+        }
+        _ => {
+            return;
+        }
+    };
+
+    let maintenance_guard = state.maintenance_rooms.clone().read_owned().await;
+    if maintenance_guard.contains(&room) {
+        return;
+    }
+    let traffic_channel = TrafficChannel::WebMap;
+    state.metrics.register(&id, traffic_channel);
+    let ack = HandshakeAck {
+        ready: true,
+        network_protocol_version: CURRENT_PROTOCOL_VERSION.to_string(),
+        minimum_compatible_network_protocol_version: MINIMUM_PROTOCOL_VERSION.to_string(),
+        local_program_version: PROGRAM_VERSION.to_owned(),
+        room_code: room.clone(),
+        delta_enabled: true,
+        digest_interval_sec: Some(state.config.digest_interval_sec as i32),
+        broadcast_hz: Some(
+            state
+                .config
+                .broadcast_hz(state.relay.player_connection_count()),
+        ),
+        report_interval_ticks: Some(
+            state.config.report_interval_ticks(
+                state
+                    .config
+                    .broadcast_hz(state.relay.player_connection_count()),
+            ),
+        ),
+        player_timeout_sec: Some(state.config.player_timeout_sec as i32),
+        entity_timeout_sec: Some(state.config.entity_timeout_sec as i32),
+        battle_chunk_timeout_sec: Some(state.config.battle_chunk_timeout_sec as i32),
+        accepted_client_role: profile
+            .supports_external_source_role()
+            .then_some(ClientRole::Player as i32),
+        tab_history: profile
+            .supports_tab_history()
+            .then(|| tab_capabilities(&state.config)),
+        relationship_query: profile.supports_relationships().then_some(
+            RelationshipQueryCapabilities {
+                supported: true,
+                max_selectors: 256,
+                default_chunk_entries: 256,
+                max_chunk_entries: 256,
+                max_chunk_bytes: 256 * 1024,
+                relation_kinds: vec![1, 2, 3, 4, 5],
+            },
+        ),
+        report_policy: profile
+            .supports_relationships()
+            .then(|| report_policy(false)),
+        ..Default::default()
+    };
+    let ack = encode_payload(channel, wire_envelope::Payload::HandshakeAck(ack));
+    let ack_len = ack.len();
+    if tokio::time::timeout(
+        Duration::from_secs(2),
+        writer_sink.send(Bytes::from_owner(ack)),
+    )
+    .await
+    .is_err()
+    {
+        state.metrics.unregister(&id);
+        return;
+    }
+    state.metrics.record(
+        Layer::Application,
+        traffic_channel,
+        Direction::Egress,
+        ack_len,
+    );
+    state.metrics.record_protobuf(&id, "handshake_ack", ack_len);
+
+    let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
+    let (state_tx, state_rx) = watch::channel(None::<StateFrame>);
+    if state
+        .relay
+        .send(RelayEvent::Register(RegisterConnection {
+            id: id.clone(),
+            room: room.clone(),
+            protocol: profile,
+            kind,
+            display_name,
+            position_resolution,
+            program_version,
+            remote_addr: remote_addr.clone(),
+            control: control_tx.clone(),
+            state: state_tx,
+        }))
+        .await
+        .is_err()
+    {
+        state.metrics.unregister(&id);
+        return;
+    }
+    drop(maintenance_guard);
+    record_connection_started(&state.db, &id, &room, kind, &remote_addr).await;
+    info!(connection_id = %id, %room, ?kind, protocol = %profile.peer_current(), %remote_addr, "web map connected");
+
+    let event_tx = state.relay.sender();
+    let writer_events = event_tx.clone();
+    let mut writer = tokio::spawn(wt_writer_loop(
+        writer_sink,
+        control_rx,
+        state_rx,
+        WriterContext {
+            id: id.clone(),
+            events: writer_events,
+            metrics: state.metrics.clone(),
+            traffic_channel,
+        },
+    ));
+    let reader_id = id.clone();
+    let mut reader = tokio::spawn(wt_reader_loop(
+        first,
+        socket,
+        ReaderContext {
+            id: reader_id,
+            room: room.clone(),
+            control: control_tx,
+            events: event_tx.clone(),
+            channel,
+            kind,
+            tab_history: state.tab_history.clone(),
+            relationships: state.relationships.clone(),
+            metrics: state.metrics.clone(),
+            traffic_channel,
+            profile,
+            complete_online_roster,
+        },
+    ));
+
+    tokio::select! {
+        _ = &mut writer => reader.abort(),
+        _ = &mut reader => writer.abort(),
+    }
+    let _ = event_tx
+        .send(RelayEvent::Disconnect { id: id.clone() })
+        .await;
+    record_connection_ended(&state.db, &id, &room, kind, &remote_addr).await;
+    state.metrics.unregister(&id);
+    info!(connection_id = %id, "web map disconnected");
+}
+
+async fn sample_wire_traffic(
+    wire: Arc<crate::transport::WireCounter>,
+    metrics: Arc<Metrics>,
+    channel: TrafficChannel,
+    last_ingress: Arc<AtomicU64>,
+    last_egress: Arc<AtomicU64>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let (ingress, egress) = wire.totals();
+        let previous_ingress = last_ingress.swap(ingress, Ordering::Relaxed);
+        let previous_egress = last_egress.swap(egress, Ordering::Relaxed);
+        metrics.record(
+            Layer::Wire,
+            channel,
+            Direction::Ingress,
+            ingress.saturating_sub(previous_ingress) as usize,
+        );
+        metrics.record(
+            Layer::Wire,
+            channel,
+            Direction::Egress,
+            egress.saturating_sub(previous_egress) as usize,
+        );
+    }
 }
 
 async fn serve_socket(
@@ -536,35 +795,6 @@ async fn serve_socket(
     info!(connection_id = %id, "websocket disconnected");
 }
 
-async fn sample_wire_traffic(
-    wire: Arc<crate::transport::WireCounter>,
-    metrics: Arc<Metrics>,
-    channel: TrafficChannel,
-    last_ingress: Arc<AtomicU64>,
-    last_egress: Arc<AtomicU64>,
-) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
-    interval.tick().await;
-    loop {
-        interval.tick().await;
-        let (ingress, egress) = wire.totals();
-        let previous_ingress = last_ingress.swap(ingress, Ordering::Relaxed);
-        let previous_egress = last_egress.swap(egress, Ordering::Relaxed);
-        metrics.record(
-            Layer::Wire,
-            channel,
-            Direction::Ingress,
-            ingress.saturating_sub(previous_ingress) as usize,
-        );
-        metrics.record(
-            Layer::Wire,
-            channel,
-            Direction::Egress,
-            egress.saturating_sub(previous_egress) as usize,
-        );
-    }
-}
-
 enum WriterAction {
     State(StateFrame),
     Control(Arc<[u8]>),
@@ -688,6 +918,205 @@ where
     );
     metrics.record_protobuf(id, message_type, byte_count);
     true
+}
+
+async fn wt_writer_loop<Si>(
+    mut sink: Si,
+    mut control: mpsc::Receiver<Arc<[u8]>>,
+    mut state: watch::Receiver<Option<StateFrame>>,
+    context: WriterContext,
+) where
+    Si: Sink<Bytes, Error = io::Error> + Unpin + Send,
+{
+    loop {
+        let action = tokio::select! {
+            biased;
+            changed = state.changed() => { if changed.is_err() { None } else { state.borrow_and_update().clone().map(WriterAction::State) } }
+            value = control.recv() => value.map(WriterAction::Control),
+        };
+        let Some(action) = action else { break };
+        let (payloads, state_frame): (Vec<Arc<[u8]>>, Option<StateFrame>) = match action {
+            WriterAction::State(frame) => {
+                let mut payloads = Vec::new();
+                if let Some(bytes) = frame.bytes.clone() {
+                    payloads.push(bytes);
+                }
+                if let Some(digest) = frame.digest.clone() {
+                    payloads.push(digest);
+                }
+                (payloads, Some(frame))
+            }
+            WriterAction::Control(bytes) => (vec![bytes], None),
+        };
+        let mut failed = false;
+        for payload in payloads {
+            let byte_count = payload.len();
+            let message_type = protobuf_message_type(&payload);
+            let sent = tokio::time::timeout(
+                Duration::from_secs(2),
+                sink.send(Bytes::from_owner(payload)),
+            )
+            .await;
+            if !matches!(sent, Ok(Ok(()))) {
+                failed = true;
+                break;
+            }
+            context.metrics.record(
+                Layer::Application,
+                context.traffic_channel,
+                Direction::Egress,
+                byte_count,
+            );
+            context
+                .metrics
+                .record_protobuf(&context.id, message_type, byte_count);
+        }
+        if failed {
+            break;
+        }
+        if let Some(frame) = state_frame {
+            let _ = context
+                .events
+                .send(RelayEvent::Delivered {
+                    id: context.id.clone(),
+                    revision: frame.revision,
+                    snapshot: frame.snapshot,
+                    battle_revision: frame.battle_revision,
+                })
+                .await;
+        }
+    }
+}
+
+async fn wt_reader_loop(first_frame: Bytes, mut stream: WebMapFrameStream, context: ReaderContext) {
+    let ReaderContext {
+        id,
+        room,
+        control,
+        events,
+        channel,
+        kind,
+        tab_history,
+        relationships,
+        metrics,
+        traffic_channel,
+        profile,
+        complete_online_roster,
+    } = context;
+    let first = futures_util::stream::iter(vec![Ok(first_frame)]);
+    let mut frames = Box::pin(first.chain(&mut stream));
+    while let Some(item) = frames.next().await {
+        let Ok(frame) = item else { break };
+        metrics.record(
+            Layer::Application,
+            traffic_channel,
+            Direction::Ingress,
+            frame.len(),
+        );
+        let Ok(envelope) = WireEnvelope::decode(frame.clone()) else {
+            continue;
+        };
+        let mut ctx = ReaderContext {
+            id: id.clone(),
+            room: room.clone(),
+            control: control.clone(),
+            events: events.clone(),
+            channel,
+            kind,
+            tab_history: tab_history.clone(),
+            relationships: relationships.clone(),
+            metrics: metrics.clone(),
+            traffic_channel,
+            profile,
+            complete_online_roster,
+        };
+        if !wt_handle_envelope(envelope, &mut ctx).await {
+            break;
+        }
+    }
+}
+
+async fn wt_handle_envelope(envelope: WireEnvelope, context: &mut ReaderContext) -> bool {
+    match envelope.payload {
+        Some(wire_envelope::Payload::ResyncRequest(_)) => context
+            .events
+            .send(RelayEvent::Resync {
+                id: context.id.clone(),
+            })
+            .await
+            .is_ok(),
+        Some(wire_envelope::Payload::WebMapCommand(command))
+            if context.channel == WireChannel::WebMap =>
+        {
+            context
+                .events
+                .send(RelayEvent::WebMapCommand {
+                    id: context.id.clone(),
+                    command,
+                })
+                .await
+                .is_ok()
+        }
+        Some(wire_envelope::Payload::BattleChunkMetaRequest(request)) => context
+            .events
+            .send(RelayEvent::BattleChunkMeta {
+                id: context.id.clone(),
+                battle_chunks: request.battle_chunks.into_iter().take(256).collect(),
+            })
+            .await
+            .is_ok(),
+        Some(wire_envelope::Payload::TabHistorySubscribeRequest(request)) => {
+            if !context.profile.supports_tab_history() {
+                return true;
+            }
+            context
+                .events
+                .send(RelayEvent::TabHistorySubscription {
+                    id: context.id.clone(),
+                    enabled: request.enabled,
+                })
+                .await
+                .is_ok()
+        }
+        Some(wire_envelope::Payload::TabHistorySyncRequest(request)) => {
+            if !context.profile.supports_tab_history() {
+                return true;
+            }
+            send_tab_sync(
+                &context.tab_history,
+                &context.control,
+                context.channel,
+                &context.room,
+                request,
+            )
+            .await
+            .is_ok()
+        }
+        Some(wire_envelope::Payload::TabHistoryLookupRequest(request)) => {
+            if !context.profile.supports_tab_history() {
+                return true;
+            }
+            send_tab_lookup(
+                &context.tab_history,
+                &context.control,
+                context.channel,
+                &context.room,
+                request,
+            )
+            .await
+            .is_ok()
+        }
+        Some(wire_envelope::Payload::Ping(_)) => {
+            let pong = encode_payload(
+                context.channel,
+                wire_envelope::Payload::Pong(Pong {
+                    server_time: unix_seconds(),
+                }),
+            );
+            context.control.send(pong).await.is_ok()
+        }
+        _ => true,
+    }
 }
 
 struct ReaderContext {
