@@ -39,10 +39,12 @@ use crate::{
         ClientRole, ExternalDatasetPublishAck, HandshakeAck, PlayerDirectoryLookupChunk,
         PlayerDirectoryLookupResult, PlayerRelationQueryChunk, Pong, RelationshipQueryCapabilities,
         TabHistoryCapabilities, TabHistoryDigest, TabHistoryErrorCode, TabHistoryLookupChunk,
-        TabHistorySyncChunk, TabHistorySyncMode, WireChannel, WireEnvelope, wire_envelope,
+        TabHistorySyncChunk, TabHistorySyncMode, UnreliableChannel, WireChannel, WireEnvelope,
+        wire_envelope,
     },
     protocol_compat::{
-        CURRENT_PROTOCOL_VERSION, MINIMUM_PROTOCOL_VERSION, ProtocolProfile, sanitize_player_report,
+        CURRENT_PROTOCOL_VERSION, MINIMUM_PROTOCOL_VERSION, ProtocolProfile,
+        accepts_unreliable_channels, sanitize_player_report,
     },
     proxy_ip::effective_remote_addr,
     relationship_store::RelationshipStore,
@@ -85,7 +87,7 @@ impl Stream for WebMapFrameStream {
 const PROGRAM_VERSION: &str = concat!(
     "team-view-relay-rust-v",
     env!("CARGO_PKG_VERSION"),
-    "-proto0.8.1"
+    "-proto0.9.0"
 );
 
 #[derive(Clone)]
@@ -308,6 +310,11 @@ pub async fn serve_web_map_session<Si>(
                 Ok(profile) => profile,
                 Err(_error) => return,
             };
+            // 客户端声明可消费 movement datagram(0.9.0 列表或 0.8.1 布尔映射)
+            // 且 本连接 datagram 预算装得下 movement 块
+            let unreliable_positions = accepts_unreliable_channels(&handshake)
+                .contains(&UnreliableChannel::Movement)
+                && datagram_capable;
             (
                 format!("web-map-{}", Uuid::new_v4()),
                 normalize_room(handshake.room_code.as_deref()),
@@ -318,8 +325,7 @@ pub async fn serve_web_map_session<Si>(
                 None,
                 handshake.local_program_version,
                 false,
-                // 客户端声明可消费 datagram 位置 且 本连接 datagram 预算装得下 movement 块
-                handshake.accepts_unreliable_positions.unwrap_or(false) && datagram_capable,
+                unreliable_positions,
             )
         }
         _ => {
@@ -710,7 +716,7 @@ async fn serve_socket(
 
     let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
     let (state_tx, state_rx) = watch::channel(None::<StateFrame>);
-    // WS 没有 datagram 通道:即便客户端声明 accepts_unreliable_positions 也不启用分流
+    // WS 没有 datagram 通道:即便客户端声明可消费 movement datagram 也不启用分流
     let (movement_tx, _movement_rx) = watch::channel(None);
     if state
         .relay

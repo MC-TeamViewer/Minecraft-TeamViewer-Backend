@@ -1,10 +1,31 @@
 use std::{fmt, str::FromStr, sync::Arc};
 
-use crate::proto::teamviewer::v1::{Patch, PlayerReportBundle, SnapshotFull};
+use crate::proto::teamviewer::v1::{
+    Patch, PlayerReportBundle, SnapshotFull, UnreliableChannel, WebMapHandshakeRequest,
+};
 use serde_json::{Map, Value, json};
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 8, 1);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 9, 0);
 pub const MINIMUM_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 6, 1);
+
+/// 客户端声明可消费的不可靠 datagram 通道集合(按协议版本归一):
+/// 0.9.0+ 客户端经 `accepts_channels` 列表声明;0.8.1 客户端以
+/// `accepts_unreliable_positions` 布尔单选声明,等价于 MOVEMENT 单通道。
+/// 未知枚举值已由 proto3 保留为 unknown fields,不会出现在解析结果里。
+#[allow(deprecated)] // 读取 0.8.1 的 deprecated 字段正是本函数的职责
+pub fn accepts_unreliable_channels(handshake: &WebMapHandshakeRequest) -> Vec<UnreliableChannel> {
+    let mut channels: Vec<UnreliableChannel> = handshake
+        .accepts_channels
+        .iter()
+        .filter_map(|value| UnreliableChannel::try_from(*value).ok())
+        .collect();
+    if handshake.accepts_unreliable_positions.unwrap_or(false) {
+        channels.push(UnreliableChannel::Movement);
+    }
+    channels.sort_unstable();
+    channels.dedup();
+    channels
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProtocolVersion {
@@ -555,8 +576,8 @@ mod tests {
         BattleChunkValue, BattleMapObservation, EntityPatchScope, EntityUpsert,
         ExternalSourceStatus, LastSeenPlayerPatchScope, LastSeenPlayerUpsert,
         LastSeenPlayersReplace, PlayerData, PlayerMarkPatchScope, PlayerMarkUpsert,
-        PlayerPatchScope, PlayerUpsert, TabPlayerEntry, TabPlayerReport, WaypointPatchScope,
-        WaypointUpsert, WebMapTabState,
+        PlayerPatchScope, PlayerUpsert, TabPlayerEntry, TabPlayerReport, UnreliableChannel,
+        WaypointPatchScope, WaypointUpsert, WebMapHandshakeRequest, WebMapTabState,
     };
     use std::collections::HashMap;
 
@@ -571,19 +592,60 @@ mod tests {
 
     #[test]
     fn negotiates_both_ends_of_the_compatibility_interval() {
-        let future = ProtocolProfile::negotiate("0.9.0", "0.7.1").expect("overlap");
+        let future = ProtocolProfile::negotiate("0.10.0", "0.7.1").expect("overlap");
         assert_eq!(future.negotiated(), CURRENT_PROTOCOL_VERSION);
         assert_eq!(
             ProtocolProfile::negotiate("0.6.0", "0.6.0"),
             Err(NegotiationError::ClientProtocolTooOld)
         );
         assert_eq!(
-            ProtocolProfile::negotiate("0.9.0", "0.9.0"),
+            ProtocolProfile::negotiate("0.10.0", "0.10.0"),
             Err(NegotiationError::ServerProtocolTooOld)
         );
         assert_eq!(
             ProtocolProfile::negotiate("0.7.0", "0.7.1"),
             Err(NegotiationError::InvalidProtocolVersion)
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)] // 构造 0.8.1 客户端的握手形态
+    fn unreliable_channel_declarations_map_across_protocol_versions() {
+        // 0.8.1 客户端:布尔单选 → MOVEMENT
+        let legacy = WebMapHandshakeRequest {
+            accepts_unreliable_positions: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            accepts_unreliable_channels(&legacy),
+            vec![UnreliableChannel::Movement]
+        );
+        // 0.9.0+ 客户端:通道列表
+        let modern = WebMapHandshakeRequest {
+            accepts_channels: vec![UnreliableChannel::Movement as i32],
+            ..Default::default()
+        };
+        assert_eq!(
+            accepts_unreliable_channels(&modern),
+            vec![UnreliableChannel::Movement]
+        );
+        // 未声明任何通道
+        assert!(accepts_unreliable_channels(&WebMapHandshakeRequest::default()).is_empty());
+        // 未知枚举值(正常由 proto3 unknown fields 吸收,此处防御性过滤)
+        let unknown = WebMapHandshakeRequest {
+            accepts_channels: vec![99],
+            ..Default::default()
+        };
+        assert!(accepts_unreliable_channels(&unknown).is_empty());
+        // 布尔与列表并存时按通道去重
+        let both = WebMapHandshakeRequest {
+            accepts_unreliable_positions: Some(true),
+            accepts_channels: vec![UnreliableChannel::Movement as i32],
+            ..Default::default()
+        };
+        assert_eq!(
+            accepts_unreliable_channels(&both),
+            vec![UnreliableChannel::Movement]
         );
     }
 
@@ -599,6 +661,9 @@ mod tests {
             ("0.7.1", ProtocolEpoch::V0_7_1, 0),
             ("0.8.0", ProtocolEpoch::V0_8_0, 0),
             ("0.8.1", ProtocolEpoch::V0_8_1, 0),
+            // 0.9.0 纯增量(仅握手能力位),尚无投影规则;未设独立 epoch,
+            // 投影层面按 0.8.1 处理
+            ("0.9.0", ProtocolEpoch::V0_8_1, 0),
         ] {
             let profile = ProtocolProfile::negotiate(version, "0.6.1").expect("supported");
             assert_eq!(profile.epoch(), epoch);

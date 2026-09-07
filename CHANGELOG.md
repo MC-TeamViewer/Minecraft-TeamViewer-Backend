@@ -5,7 +5,14 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。Backend 版本与网络协议版本分别演进；版本标题中的
 `protoX.Y.Z` 表示该 Backend 发布时使用的协议版本，而不是 Backend 版本的一部分。
 
-## [1.2.0-alpha.5-proto0.8.1] - 2026-09-08
+## [1.2.0-alpha.5-proto0.9.0] - 2026-09-08
+
+### 协议（proto/v0.9.0-alpha.1）
+
+- `WebMapHandshakeRequest.accepts_unreliable_positions`（0.8.1 布尔声明）泛化为
+  `accepts_channels`（`repeated UnreliableChannel` 列表，MOVEMENT 起）；旧字段标记 deprecated，
+  服务端将 `true` 映射为 `[MOVEMENT]`，0.8.1 客户端行为不变。详见协议仓库 README
+  "传输门约定"：varint 流分帧、datagram 无前缀、10s 首帧握手、压缩协商命名表与 door-control 流不变式。
 
 ### 变更（不兼容）
 
