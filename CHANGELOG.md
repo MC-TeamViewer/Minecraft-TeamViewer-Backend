@@ -5,6 +5,26 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。Backend 版本与网络协议版本分别演进；版本标题中的
 `protoX.Y.Z` 表示该 Backend 发布时使用的协议版本，而不是 Backend 版本的一部分。
 
+## [1.2.0-alpha.5-proto0.8.1] - 2026-09-08
+
+### 变更（不兼容）
+
+- 可靠流分帧由 4 字节大端长度前缀改为 varint LEB128 前缀（`[varint 长度][payload]`，上限 8 MiB，
+  头部最长 4 字节）；典型帧省 2 字节。帧头非法即显式断开连接（修复旧实现对超限帧静默缓冲增长的问题）。
+- QUIC datagram 全版本统一去除 4 字节长度前缀：datagram 自带报文边界，plain 版为裸 protobuf
+  envelope。`1.2.0-alpha.4` 的 `[4B+envelope]` datagram 格式废弃，旧客户端不兼容（alpha 期允许 break）。
+
+### 新增
+
+- 新增裸 QUIC 门 `src/quic_transport.rs`：quinn endpoint 监听独立端口（默认 `8767/udp`，
+  默认关闭），ALPN `teamviewrelay/v1`，供 Java mod 直连（浏览器 WebTransport 仍走 WT 门）。
+  两门共享同一 relay 核心、会话处理器与证书运行时（`CertRuntime` 抽出为门无关模块，多证书
+  SNI 选择与热轮换行为一致）；流约定与 WT 门一致（客户端 1 条双向流上行 + 服务端 1 条单向流
+  下行 + varint 分帧），movement 位置批走 QUIC datagram。
+- 配置新增 `[quicTransport]` 段与 `TEAMVIEWER_QUIC_*` 环境变量（`ENABLED`/`BIND`/`CERT_PATH`/
+  `KEY_PATH`/`IDENTITIES`/`POLL_INTERVAL_SEC`/`RENEW_WINDOW_SEC`），证书结构、优先级与热轮换
+  与 WT 门完全同构；Docker 镜像 `EXPOSE 8767/udp`，compose 默认映射。
+
 ## [1.2.0-alpha.4-proto0.8.1] - 2026-09-07
 
 ### 新增

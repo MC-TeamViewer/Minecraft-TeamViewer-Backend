@@ -32,6 +32,7 @@ RUN apt-get update \
 WORKDIR /app
 EXPOSE 8765/tcp
 EXPOSE 8766/udp
+EXPOSE 8767/udp
 CMD ["/app/teamviewrelay-rust"]
 
 FROM runtime-base AS memory-debug

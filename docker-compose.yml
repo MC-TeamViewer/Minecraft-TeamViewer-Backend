@@ -1,6 +1,6 @@
 services:
   backend:
-    image: ${TEAMVIEWER_IMAGE:-professornuo/teamviewrelay-rust:v1.2.0-alpha.3-proto0.8.0}
+    image: ${TEAMVIEWER_IMAGE:-professornuo/teamviewrelay-rust:v1.2.0-alpha.5-proto0.8.1}
     build:
       context: .
     container_name: teamviewer-backend
@@ -8,6 +8,7 @@ services:
     ports:
       - "${TEAMVIEWER_PORT:-8765}:8765/tcp"
       - "${TEAMVIEWER_WT_PORT:-8766}:8766/udp"
+      - "${TEAMVIEWER_QUIC_PORT:-8767}:8767/udp"
     environment:
       RUST_LOG: ${TEAMVIEWER_LOG_LEVEL:-info}
       TEAMVIEWER_ADMIN_USERNAME: ${TEAMVIEWER_ADMIN_USERNAME:-admin}
@@ -23,6 +24,13 @@ services:
       TEAMVIEWER_WT_IDENTITIES: "${TEAMVIEWER_WT_IDENTITIES:-}"
       TEAMVIEWER_WT_POLL_INTERVAL_SEC: "${TEAMVIEWER_WT_POLL_INTERVAL_SEC:-}"
       TEAMVIEWER_WT_RENEW_WINDOW_SEC: "${TEAMVIEWER_WT_RENEW_WINDOW_SEC:-}"
+      TEAMVIEWER_QUIC_ENABLED: "${TEAMVIEWER_QUIC_ENABLED:-false}"
+      TEAMVIEWER_QUIC_BIND: "${TEAMVIEWER_QUIC_BIND:-0.0.0.0:8767}"
+      TEAMVIEWER_QUIC_CERT_PATH: "${TEAMVIEWER_QUIC_CERT_PATH:-}"
+      TEAMVIEWER_QUIC_KEY_PATH: "${TEAMVIEWER_QUIC_KEY_PATH:-}"
+      TEAMVIEWER_QUIC_IDENTITIES: "${TEAMVIEWER_QUIC_IDENTITIES:-}"
+      TEAMVIEWER_QUIC_POLL_INTERVAL_SEC: "${TEAMVIEWER_QUIC_POLL_INTERVAL_SEC:-}"
+      TEAMVIEWER_QUIC_RENEW_WINDOW_SEC: "${TEAMVIEWER_QUIC_RENEW_WINDOW_SEC:-}"
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - ./data-rust:/app/data

@@ -126,6 +126,13 @@ RUSTFLAGS="-C force-frame-pointers=yes" \
 | `TEAMVIEWER_WT_IDENTITIES` | 空 | 多证书 JSON 数组，设置后整体覆盖 CERT_PATH/KEY_PATH 与 TOML 证书配置 |
 | `TEAMVIEWER_WT_POLL_INTERVAL_SEC` | `300` | 证书文件检查间隔，范围 30–86400 |
 | `TEAMVIEWER_WT_RENEW_WINDOW_SEC` | `604800` | 到期提前拒绝窗口，范围 1–30 天 |
+| `TEAMVIEWER_QUIC_ENABLED` | `false` | 是否启用裸 QUIC 门（Java mod 直连）；默认关闭 |
+| `TEAMVIEWER_QUIC_BIND` | `0.0.0.0:8767` | 裸 QUIC UDP 监听地址 |
+| `TEAMVIEWER_QUIC_CERT_PATH` | 空 | 与 WT 门同款证书配置，可共享同一张证书 |
+| `TEAMVIEWER_QUIC_KEY_PATH` | 空 | 与 WT 门同款证书配置 |
+| `TEAMVIEWER_QUIC_IDENTITIES` | 空 | 与 WT 门同款多证书 JSON 数组 |
+| `TEAMVIEWER_QUIC_POLL_INTERVAL_SEC` | `300` | 证书文件检查间隔 |
+| `TEAMVIEWER_QUIC_RENEW_WINDOW_SEC` | `604800` | 到期提前拒绝窗口 |
 | `TEAMVIEWER_TRUST_PROXY_HEADERS` | `false` | 是否读取可信反代转发的真实 IP |
 | `TEAMVIEWER_TRUSTED_PROXY_CIDRS` | 本机与 Docker 私网段 | 可被信任的直连反代地址段 |
 | `RUST_LOG` | `info` | Rust 日志过滤规则 |
@@ -203,6 +210,21 @@ SNI 未命中任意证书时回退到默认证书并记录 warn 日志。
 
 浏览器入口为 `https://host:8766/web-map/wt`。WS 路径保持不变；Java mod 第一版继续使用
 WebSocket。证书更新成功只影响新 QUIC 连接，已有连接保留旧 TLS 配置并按客户端重连收敛。
+
+### 裸 QUIC 门（Java mod 直连）
+
+`[quicTransport]`（默认关闭）在独立端口（默认 `8767/udp`）提供裸 QUIC 门，供 Java mod 客户端
+直连——浏览器 WebTransport 需要 HTTP/3 + extended CONNECT 封装，裸 QUIC 没有 H3 层，两者
+线路互不兼容，因此是并行监听的两扇门。两门共享同一个 relay 核心与同一套 WireEnvelope
+应用层语义；裸 QUIC 无 URL path，会话类型由首个握手消息的通道字段自识别。
+
+- ALPN 固定为 `teamviewrelay/v1`（未知 ALPN 的握手直接拒绝）。
+- 证书配置与 `[webTransport]` 完全同构（TOML `identities` 数组、`certPath`/`keyPath`、
+  环境变量 `TEAMVIEWER_QUIC_IDENTITIES`/`CERT_PATH`/`KEY_PATH`），可与 WT 门共享同一张
+  证书；SNI 选择与热轮换逻辑也完全一致。
+- 流约定与 WT 门一致：客户端开 1 条双向流上行、服务端开 1 条单向流下行，分帧
+  `[varint 长度][payload]`；movement 位置批走 QUIC datagram（RFC 9221）。
+- Docker 镜像已 `EXPOSE 8767/udp`，compose 默认映射 `${TEAMVIEWER_QUIC_PORT:-8767}`。
 
 ## 源码开发
 

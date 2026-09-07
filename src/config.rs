@@ -31,6 +31,7 @@ pub struct RuntimeConfig {
     pub tab_history_max_lookup_selectors: usize,
     pub tab_history_observation_update_interval_sec: u64,
     pub web_transport: WebTransportConfig,
+    pub quic_transport: WebTransportConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -45,6 +46,16 @@ struct FileConfig {
     tab_history: TabHistoryConfig,
     #[serde(rename = "webTransport")]
     web_transport: WebTransportFileConfig,
+    #[serde(rename = "quicTransport", default = "default_quic_transport")]
+    quic_transport: WebTransportFileConfig,
+}
+
+/// 裸 QUIC 门的默认配置:复用 WT 的文件配置结构,仅监听端口不同(8767/udp)。
+fn default_quic_transport() -> WebTransportFileConfig {
+    WebTransportFileConfig {
+        bind_address: "0.0.0.0:8767".to_owned(),
+        ..WebTransportFileConfig::default()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -380,6 +391,27 @@ impl RuntimeConfig {
             env_string("TEAMVIEWER_WT_CERT_PATH"),
             env_string("TEAMVIEWER_WT_KEY_PATH"),
         );
+        let mut quic_transport_file = parsed.quic_transport;
+        quic_transport_file.enabled =
+            env_bool("TEAMVIEWER_QUIC_ENABLED").unwrap_or(quic_transport_file.enabled);
+        quic_transport_file.bind_address =
+            env_string("TEAMVIEWER_QUIC_BIND").unwrap_or(quic_transport_file.bind_address);
+        if let Some(value) =
+            env_string("TEAMVIEWER_QUIC_POLL_INTERVAL_SEC").and_then(|value| value.parse().ok())
+        {
+            quic_transport_file.poll_interval_sec = value;
+        }
+        if let Some(value) =
+            env_string("TEAMVIEWER_QUIC_RENEW_WINDOW_SEC").and_then(|value| value.parse().ok())
+        {
+            quic_transport_file.renew_window_sec = value;
+        }
+        let quic_transport = resolve_web_transport(
+            quic_transport_file,
+            env_identities("TEAMVIEWER_QUIC_IDENTITIES"),
+            env_string("TEAMVIEWER_QUIC_CERT_PATH"),
+            env_string("TEAMVIEWER_QUIC_KEY_PATH"),
+        );
         Self {
             player_timeout_sec: parsed.timeouts.player_timeout_sec.clamp(1, 3_600),
             entity_timeout_sec: parsed.timeouts.entity_timeout_sec.clamp(1, 3_600),
@@ -424,6 +456,7 @@ impl RuntimeConfig {
                 .observation_update_interval_sec
                 .clamp(1, 86_400),
             web_transport,
+            quic_transport,
         }
     }
 
@@ -451,8 +484,8 @@ impl RuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        CertIdentityFileConfig, MAX_WT_IDENTITIES, RuntimeConfig, WebTransportFileConfig,
-        parse_identities_json, resolve_web_transport,
+        CertIdentityFileConfig, FileConfig, MAX_WT_IDENTITIES, RuntimeConfig,
+        WebTransportFileConfig, parse_identities_json, resolve_web_transport,
     };
 
     #[test]
@@ -465,6 +498,22 @@ mod tests {
         assert_eq!(config.report_interval_ticks(2.0), 10);
         assert_eq!(config.battle_chunk_cache_retention_sec, 7_200);
         assert_eq!(config.battle_chunk_cache_max_entries, 65_536);
+        // 内置配置里 QUIC 门默认关闭,监听端口与 WT 门错开
+        assert!(!config.quic_transport.enabled);
+        assert_eq!(
+            config.quic_transport.bind_address.to_string(),
+            "0.0.0.0:8767"
+        );
+    }
+
+    #[test]
+    fn missing_quic_toml_section_falls_back_to_quic_defaults() {
+        // FileConfig 的 quicTransport 段带独立 serde 默认:缺段时端口 8767 而非 8766
+        let parsed: FileConfig = toml::from_str("").expect("empty config parses");
+        assert!(!parsed.quic_transport.enabled);
+        assert_eq!(parsed.quic_transport.bind_address, "0.0.0.0:8767");
+        let resolved = resolve_web_transport(parsed.quic_transport, None, None, None);
+        assert_eq!(resolved.bind_address.to_string(), "0.0.0.0:8767");
     }
 
     fn file_config(

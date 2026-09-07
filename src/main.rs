@@ -5,6 +5,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use teamviewrelay_rust::{
     config::RuntimeConfig,
     metrics::{Direction, Layer, Metrics, TrafficChannel, TrafficIncrement},
+    quic_transport,
     relationship_store::RelationshipStore,
     relay::RelayHandle,
     tab_history::TabHistoryStore,
@@ -81,6 +82,17 @@ async fn main() -> anyhow::Result<()> {
                 web_transport::serve(web_transport_config, web_transport_state).await
             {
                 tracing::error!(%error, "WebTransport endpoint failed");
+            }
+        });
+    }
+    if state.config.quic_transport.enabled {
+        let quic_transport_config = state.config.quic_transport.clone();
+        let quic_transport_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                quic_transport::serve(quic_transport_config, quic_transport_state).await
+            {
+                tracing::error!(%error, "QUIC endpoint failed");
             }
         });
     }

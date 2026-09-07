@@ -80,3 +80,14 @@ bindAddress = "0.0.0.0:8766"
 # keyPath = "/etc/letsencrypt/live/example.com/privkey.pem"
 pollIntervalSec = 300
 renewWindowSec = 604800
+
+[quicTransport]
+# 裸 QUIC 门（供 Java mod 客户端直连，非浏览器 WebTransport）；默认关闭。
+# 与 WebTransport 门共用同一套证书配置结构，两门可共享同一张证书。
+# ALPN：teamviewrelay/v1（压缩版本 alpha.6 起另有 +zstd / +zstd-dict）。
+enabled = false
+bindAddress = "0.0.0.0:8767"
+# 证书配置与 [webTransport] 完全一致（identities 数组或单证书 certPath/keyPath）。
+identities = []
+pollIntervalSec = 300
+renewWindowSec = 604800
