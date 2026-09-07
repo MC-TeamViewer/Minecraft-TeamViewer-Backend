@@ -1,10 +1,12 @@
 pub mod admin;
+pub mod cert;
 pub mod config;
 pub mod frame;
 pub mod metrics;
 pub mod proto;
 pub mod protocol_compat;
 pub mod proxy_ip;
+pub mod quic_transport;
 pub mod relationship_store;
 pub mod relay;
 #[cfg(feature = "memory-debug")]

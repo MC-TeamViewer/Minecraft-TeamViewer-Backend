@@ -3197,6 +3197,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protoc-bin-vendored",
+ "quinn",
  "rmp-serde",
  "rmpv",
  "rust-embed",
