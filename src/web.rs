@@ -298,11 +298,68 @@ pub async fn serve_web_map_session<Si>(
         program_version,
         complete_online_roster,
         unreliable_positions,
-    ) = match (ConnectionKind::WebMap, envelope.payload) {
-        (
-            ConnectionKind::WebMap,
-            Some(wire_envelope::Payload::WebMapHandshakeRequest(handshake)),
-        ) => {
+    ) = match envelope.payload {
+        // 无 path 的门(WT/QUIC)靠首个握手的载荷类型自识别 Player/WebMap 通道
+        Some(wire_envelope::Payload::PlayerHandshakeRequest(handshake)) => {
+            if handshake.submit_player_id.is_empty() {
+                door_reject(
+                    &mut writer_sink,
+                    WireChannel::Player,
+                    "invalid_submit_player_id",
+                )
+                .await;
+                return;
+            }
+            let profile = match ProtocolProfile::negotiate(
+                &handshake.network_protocol_version,
+                &handshake.minimum_compatible_network_protocol_version,
+            ) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    door_reject(&mut writer_sink, WireChannel::Player, error.reason()).await;
+                    return;
+                }
+            };
+            let role = if profile.supports_external_source_role()
+                && matches!(
+                    handshake
+                        .client_role
+                        .and_then(|value| ClientRole::try_from(value).ok()),
+                    Some(ClientRole::ExternalSource)
+                ) {
+                ConnectionKind::ExternalSource
+            } else {
+                ConnectionKind::Player
+            };
+            let complete_online_roster = role == ConnectionKind::ExternalSource
+                && handshake
+                    .external_source_capabilities
+                    .as_ref()
+                    .is_some_and(|caps| {
+                        caps.datasets.iter().any(|dataset| {
+                            dataset.coverage
+                                == crate::proto::teamviewer::v1::DatasetCoverage::Complete as i32
+                                && dataset.scopes.contains(
+                                    &(crate::proto::teamviewer::v1::ExternalDataScope::OnlineRoster
+                                        as i32),
+                                )
+                        })
+                    });
+            (
+                handshake.submit_player_id,
+                normalize_room(handshake.room_code.as_deref()),
+                profile,
+                role,
+                WireChannel::Player,
+                handshake.client_display_name,
+                handshake.position_resolution,
+                handshake.local_program_version,
+                complete_online_roster,
+                // 玩家连接是位置的产出方,不做 movement datagram 分流
+                false,
+            )
+        }
+        Some(wire_envelope::Payload::WebMapHandshakeRequest(handshake)) => {
             let profile = match ProtocolProfile::negotiate(
                 &handshake.network_protocol_version,
                 &handshake.minimum_compatible_network_protocol_version,
@@ -337,7 +394,14 @@ pub async fn serve_web_map_session<Si>(
     if maintenance_guard.contains(&room) {
         return;
     }
-    let traffic_channel = TrafficChannel::WebMap;
+    let traffic_channel = match channel {
+        WireChannel::WebMap => TrafficChannel::WebMap,
+        _ => TrafficChannel::Player,
+    };
+    let accepted_role = match kind {
+        ConnectionKind::ExternalSource => ClientRole::ExternalSource,
+        _ => ClientRole::Player,
+    };
     state.metrics.register(&id, traffic_channel);
     let ack = HandshakeAck {
         ready: true,
@@ -364,7 +428,7 @@ pub async fn serve_web_map_session<Si>(
         battle_chunk_timeout_sec: Some(state.config.battle_chunk_timeout_sec as i32),
         accepted_client_role: profile
             .supports_external_source_role()
-            .then_some(ClientRole::Player as i32),
+            .then_some(accepted_role as i32),
         tab_history: profile
             .supports_tab_history()
             .then(|| tab_capabilities(&state.config)),
@@ -429,7 +493,7 @@ pub async fn serve_web_map_session<Si>(
     }
     drop(maintenance_guard);
     record_connection_started(&state.db, &id, &room, kind, &remote_addr).await;
-    info!(connection_id = %id, %room, ?kind, protocol = %profile.peer_current(), %remote_addr, "web map connected");
+    info!(connection_id = %id, %room, ?kind, protocol = %profile.peer_current(), %remote_addr, "door session connected");
 
     let event_tx = state.relay.sender();
     let writer_events = event_tx.clone();
@@ -473,7 +537,7 @@ pub async fn serve_web_map_session<Si>(
         .await;
     record_connection_ended(&state.db, &id, &room, kind, &remote_addr).await;
     state.metrics.unregister(&id);
-    info!(connection_id = %id, "web map disconnected");
+    info!(connection_id = %id, "door session disconnected");
 }
 
 async fn sample_wire_traffic(
@@ -1778,6 +1842,25 @@ async fn reject(socket: &mut HttpWebSocket, channel: WireChannel, reason: &str) 
         .await;
 }
 
+/// 无 path 门(WT/QUIC)会话的握手拒绝:回一帧 ready=false 的握手应答后直接结束会话,
+/// 连接随会话帧流 drop 而关闭。
+async fn door_reject<Si>(writer_sink: &mut Si, channel: WireChannel, reason: &str)
+where
+    Si: Sink<Bytes, Error = io::Error> + Unpin + Send,
+{
+    let ack = HandshakeAck {
+        ready: false,
+        network_protocol_version: CURRENT_PROTOCOL_VERSION.to_string(),
+        minimum_compatible_network_protocol_version: MINIMUM_PROTOCOL_VERSION.to_string(),
+        local_program_version: PROGRAM_VERSION.to_owned(),
+        error: Some("version_incompatible".to_owned()),
+        reject_reason: Some(reason.to_owned()),
+        ..Default::default()
+    };
+    let bytes = encode_payload(channel, wire_envelope::Payload::HandshakeAck(ack));
+    let _ = writer_sink.send(Bytes::from_owner(bytes)).await;
+}
+
 fn truncate_close_reason(reason: &str) -> String {
     let mut end = reason.len().min(123);
     while !reason.is_char_boundary(end) {
@@ -2069,5 +2152,87 @@ mod tests {
         assert_eq!(frames_rx.recv().await.as_deref(), Some(&b"digest-2"[..]));
 
         writer.abort();
+    }
+
+    /// 无 path 门(WT/QUIC)会话接受 Player 握手:mod 经裸 QUIC 门以玩家身份连接的
+    /// 应用层合同——首帧 PlayerHandshakeRequest → 下行流 ready=true 的 HandshakeAck。
+    #[tokio::test]
+    async fn door_session_accepts_player_handshake_and_answers_ready_ack() {
+        use crate::proto::teamviewer::v1::{PlayerHandshakeRequest, wire_envelope};
+        use crate::web_transport::{MpscReceiver, MpscSink};
+
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        sqlx::migrate!().run(&db).await.expect("migrations");
+        let tab_history = Arc::new(TabHistoryStore::new(db.clone()));
+        tab_history.initialize().await.expect("tab history schema");
+        let relationships = Arc::new(RelationshipStore::new(db.clone()));
+        relationships
+            .initialize()
+            .await
+            .expect("relationship schema");
+        let config = Arc::new(RuntimeConfig::load());
+        let state = AppState {
+            relay: RelayHandle::spawn(config.clone()),
+            db,
+            tab_history,
+            relationships,
+            config,
+            metrics: Arc::new(Metrics::default()),
+            maintenance_rooms: Arc::new(RwLock::new(HashSet::new())),
+            #[cfg(feature = "memory-debug")]
+            resource_debug: None,
+        };
+
+        // 入站帧流与出站帧收集:门桥接层已消化 varint 分帧,一帧 = 裸 envelope
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(4);
+        let stream = WebMapFrameStream::new(MpscReceiver::new(inbound_rx));
+        let sink = MpscSink::new(outbound_tx);
+        let (movement_tx, _movement_rx) = watch::channel(None);
+
+        let session = tokio::spawn(serve_web_map_session(
+            stream,
+            sink,
+            state,
+            "test-remote".to_owned(),
+            movement_tx,
+            false,
+        ));
+
+        let handshake = PlayerHandshakeRequest {
+            submit_player_id: "door-player".to_owned(),
+            network_protocol_version: CURRENT_PROTOCOL_VERSION.to_string(),
+            minimum_compatible_network_protocol_version: MINIMUM_PROTOCOL_VERSION.to_string(),
+            room_code: Some("door-room".to_owned()),
+            ..Default::default()
+        };
+        let envelope = WireEnvelope {
+            channel: WireChannel::Player as i32,
+            payload: Some(wire_envelope::Payload::PlayerHandshakeRequest(handshake)),
+        };
+        inbound_tx
+            .send(Ok(Bytes::from(envelope.encode_to_vec())))
+            .await
+            .expect("inbound frame");
+
+        let ack_bytes = tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("ack timeout")
+            .expect("ack frame");
+        let ack_envelope = WireEnvelope::decode(ack_bytes).expect("ack envelope");
+        assert_eq!(ack_envelope.channel, WireChannel::Player as i32);
+        let Some(wire_envelope::Payload::HandshakeAck(ack)) = ack_envelope.payload else {
+            panic!("expected handshake ack");
+        };
+        assert!(ack.ready);
+        assert_eq!(ack.network_protocol_version, "0.9.0");
+        assert_eq!(ack.room_code, "door-room");
+        assert_eq!(ack.accepted_client_role, Some(ClientRole::Player as i32));
+
+        session.abort();
     }
 }
