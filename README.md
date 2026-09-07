@@ -244,7 +244,8 @@ WebSocket。证书更新成功只影响新 QUIC 连接，已有连接保留旧 T
   `teamviewrelay/v1+zstd-dict`，rustls 按客户端偏好序选择，未知 ALPN 拒绝握手；
 - **WS 门**（子协议）：`Sec-WebSocket-Protocol` 三套并列 `teamviewrelay.plain.v1`、
   `teamviewrelay.zstd.v1`、`teamviewrelay.zstd-dict.v1`，服务端按偏好序择一并在 101
-  响应回显（zstd-dict 在 WS 门下回显 zstd——无 datagram，两套流行为一致）。选定
+  响应原样回显（RFC 6455 要求回显取自客户端提供的列表；zstd-dict 在 WS 门下流行为
+  与 zstd 一致——无 datagram，客户端按收到 dict 回显即 zstd 流语义解释）。选定
   zstd 套时不协商 permessage-deflate（外层 deflate 对 zstd 输出零收益）；客户端未提供
   teamviewrelay 子协议则维持原 deflate 协商路径（旧客户端零变化）；
 - **WT 门**（extended CONNECT 的 `WT-Available-Protocols`/`WT-Protocol` 头，协议值与

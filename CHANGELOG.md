@@ -18,14 +18,16 @@
   的 context takeover），解压窗口上限 2^23（8 MiB），解压结果超过帧上限视为协议违规。
 - 下行压缩级别 3（服务端决策，zstd 帧自描述无需协商）；上行由客户端自选级别。
 - 压缩套协商落地 WS 门：`Sec-WebSocket-Protocol` 子协议 `teamviewrelay.{plain,zstd,zstd-dict}.v1`
-  三套并列，服务端按客户端偏好序择一并回显（101 响应确认，握手内 0 额外 RTT）。选定
-  zstd/zstd-dict 时关闭 permessage-deflate（zstd 输出近高熵，外层 deflate 纯烧 CPU）并启用
-  连续 zstd 分块流（每条 WS binary 消息 = 一个压缩块）；选定 plain 时完全关闭压缩。客户端未
-  提供任何 teamviewrelay 子协议则维持原 permessage-deflate 协商路径（旧客户端零变化）。
+  三套并列，服务端按客户端偏好序择一并原样回显（101 响应确认，握手内 0 额外 RTT；回显
+  必须取自客户端提供的列表，RFC 6455 硬性要求——zstd-dict 原样回显不折叠，WS 门无
+  datagram，其流行为与 zstd 一致）。选定 zstd/zstd-dict 时关闭 permessage-deflate
+  （zstd 输出近高熵，外层 deflate 纯烧 CPU）并启用连续 zstd 分块流（每条 WS binary
+  消息 = 一个压缩块）；选定 plain 时完全关闭压缩。客户端未提供任何 teamviewrelay
+  子协议则维持原 permessage-deflate 协商路径（旧客户端零变化）。
 - 压缩套协商落地 WT 门：extended CONNECT 请求头 `WT-Available-Protocols`（RFC 9651
   字符串 List，客户端偏好序）择一套并以 `WT-Protocol` 回显（必须取自客户端列表，
-  RFC 9651 字符串 Item 带引号；协议值与 WS 子协议同名，`zstd-dict` 在 WT 门保留
-  原值回显——WT 门有 datagram，两套语义有别）。当前浏览器尚未实现该头
+  RFC 9651 字符串 Item 带引号；协议值与 WS 子协议同名，`zstd-dict` 保留原值——
+  WT 门有 datagram，两套语义有别）。当前浏览器尚未实现该头
   （Chromium issue 435589295、Firefox bug 1981483），不发即 plain 行为，与
   `1.2.0-alpha.5` 完全一致；浏览器实现后自动激活，服务端无需再改动。
 - datagram 通道暂不参与流压缩（自包含单元，`+zstd-dict` 的字典模式由后续切片经

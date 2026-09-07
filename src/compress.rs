@@ -80,16 +80,6 @@ impl Suite {
         }
     }
 
-    /// 选定套回显给客户端的子协议值(zstd-dict 在 WS 门下回显 zstd:
-    /// 无 datagram,两套流行为一致)。
-    pub(crate) fn ws_subprotocol(self) -> &'static str {
-        match self {
-            Suite::ZstdDict => SUBPROTOCOL_ZSTD,
-            Suite::Zstd => SUBPROTOCOL_ZSTD,
-            Suite::Plain => SUBPROTOCOL_PLAIN,
-        }
-    }
-
     /// 服务端确认制:按客户端偏好序取第一个可识别的 teamviewrelay 子协议。
     /// 客户端未提供任何 teamviewrelay 子协议返回 None(旧客户端,走原路径)。
     pub(crate) fn select_ws_subprotocol<'a, I>(offered: I) -> Option<Suite>
@@ -99,9 +89,16 @@ impl Suite {
         offered.into_iter().find_map(Suite::from_subprotocol)
     }
 
-    /// 套的全名协议 token(zstd-dict 保留原名)。WT 门有 datagram,`ZstdDict`
-    /// 与 `Zstd` 语义有别,必须回显客户端所点的原值;WS 门无 datagram 才
-    /// 统一折叠为 zstd(见 ws_subprotocol)。
+    /// 选定套回显给 WS 客户端的子协议值。回显必须取自客户端实际提供的列表
+    /// (RFC 6455 硬性要求,严格客户端会拒绝列表外的回显),因此 zstd-dict
+    /// 原样回显、不折叠为 zstd——WS 门虽无 datagram,`ZstdDict` 的流行为与
+    /// `Zstd` 一致,客户端按"收到 dict 回显即 zstd 流语义"解释即可。
+    pub(crate) fn ws_subprotocol(self) -> &'static str {
+        self.protocol_name()
+    }
+
+    /// 套的全名协议 token(zstd-dict 保留原名)。WS 与 WT 两门的回显统一
+    /// 取原值(见 ws_subprotocol 的 RFC 6455 论据)。
     pub(crate) fn protocol_name(self) -> &'static str {
         match self {
             Suite::Plain => SUBPROTOCOL_PLAIN,
@@ -295,9 +292,11 @@ mod tests {
         // 旧客户端:无 teamviewrelay 子协议 → None(维持 permessage-deflate 路径)
         assert_eq!(Suite::select_ws_subprotocol(["chat", "game.v2"]), None);
         assert_eq!(Suite::select_ws_subprotocol([]), None);
-        // WS 门下 zstd-dict 回显为 zstd(行为一致)
-        assert_eq!(Suite::ZstdDict.ws_subprotocol(), SUBPROTOCOL_ZSTD);
+        // WS 门回显取原值:RFC 6455 要求回显 ∈ 客户端提供的列表,
+        // 严格客户端(websockets 库实测)会拒绝列表外的折叠回显
+        assert_eq!(Suite::ZstdDict.ws_subprotocol(), SUBPROTOCOL_ZSTD_DICT);
         assert_eq!(Suite::Plain.ws_subprotocol(), SUBPROTOCOL_PLAIN);
+        assert_eq!(Suite::Zstd.ws_subprotocol(), SUBPROTOCOL_ZSTD);
         assert_eq!(
             Suite::from_subprotocol("teamviewrelay.zstd.v1"),
             Some(Suite::Zstd)
