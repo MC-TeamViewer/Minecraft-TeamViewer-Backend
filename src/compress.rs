@@ -61,6 +61,45 @@ impl Suite {
     }
 }
 
+/// WS 门子协议(压缩套协商载体):`teamviewrelay.{plain,zstd,zstd-dict}.v1`。
+/// 客户端按偏好序放在 `Sec-WebSocket-Protocol`,服务端择一并回显(确认制,
+/// 0 额外 RTT);不回显即未选定,客户端按自身回退链降级(deflate/明文)。
+pub(crate) const SUBPROTOCOL_PLAIN: &str = "teamviewrelay.plain.v1";
+pub(crate) const SUBPROTOCOL_ZSTD: &str = "teamviewrelay.zstd.v1";
+pub(crate) const SUBPROTOCOL_ZSTD_DICT: &str = "teamviewrelay.zstd-dict.v1";
+
+impl Suite {
+    /// 按 WS 子协议识别套;非 teamviewrelay 子协议返回 None(维持既有
+    /// permessage-deflate 协商路径,不得误判)。
+    pub(crate) fn from_subprotocol(value: &str) -> Option<Suite> {
+        match value {
+            SUBPROTOCOL_PLAIN => Some(Suite::Plain),
+            SUBPROTOCOL_ZSTD => Some(Suite::Zstd),
+            SUBPROTOCOL_ZSTD_DICT => Some(Suite::ZstdDict),
+            _ => None,
+        }
+    }
+
+    /// 选定套回显给客户端的子协议值(zstd-dict 在 WS 门下回显 zstd:
+    /// 无 datagram,两套流行为一致)。
+    pub(crate) fn ws_subprotocol(self) -> &'static str {
+        match self {
+            Suite::ZstdDict => SUBPROTOCOL_ZSTD,
+            Suite::Zstd => SUBPROTOCOL_ZSTD,
+            Suite::Plain => SUBPROTOCOL_PLAIN,
+        }
+    }
+
+    /// 服务端确认制:按客户端偏好序取第一个可识别的 teamviewrelay 子协议。
+    /// 客户端未提供任何 teamviewrelay 子协议返回 None(旧客户端,走原路径)。
+    pub(crate) fn select_ws_subprotocol<'a, I>(offered: I) -> Option<Suite>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        offered.into_iter().find_map(Suite::from_subprotocol)
+    }
+}
+
 /// 下行(服务端→客户端)持久压缩器:逐 envelope flush 出自包含可即时解码
 /// 的压缩块。每连接实例,仅由单个写出任务使用。
 pub(crate) struct StreamEncoder {
@@ -113,12 +152,8 @@ impl StreamDecoder {
         loop {
             let mut in_buffer = zstd_safe::InBuffer::around(&chunk[input_pos..]);
             let mut out_buffer = zstd_safe::OutBuffer::around(&mut window);
-            zstd_safe::DCtx::decompress_stream(
-                &mut self.dctx,
-                &mut out_buffer,
-                &mut in_buffer,
-            )
-            .map_err(zstd_error)?;
+            zstd_safe::DCtx::decompress_stream(&mut self.dctx, &mut out_buffer, &mut in_buffer)
+                .map_err(zstd_error)?;
             input_pos += in_buffer.pos();
             let produced = out_buffer.as_slice().len();
             out.extend_from_slice(out_buffer.as_slice());
@@ -201,5 +236,33 @@ mod tests {
         assert_eq!(Suite::from_alpn("h3"), None);
         assert!(Suite::ZstdDict.stream_zstd() && Suite::Zstd.stream_zstd());
         assert!(!Suite::Plain.stream_zstd());
+    }
+
+    #[test]
+    fn ws_subprotocol_selection_follows_client_preference() {
+        // 按客户端偏好序取第一个可识别值
+        assert_eq!(
+            Suite::select_ws_subprotocol([SUBPROTOCOL_ZSTD, SUBPROTOCOL_PLAIN, "chat"]),
+            Some(Suite::Zstd)
+        );
+        assert_eq!(
+            Suite::select_ws_subprotocol([SUBPROTOCOL_PLAIN, SUBPROTOCOL_ZSTD]),
+            Some(Suite::Plain)
+        );
+        assert_eq!(
+            Suite::select_ws_subprotocol([SUBPROTOCOL_ZSTD_DICT]),
+            Some(Suite::ZstdDict)
+        );
+        // 旧客户端:无 teamviewrelay 子协议 → None(维持 permessage-deflate 路径)
+        assert_eq!(Suite::select_ws_subprotocol(["chat", "game.v2"]), None);
+        assert_eq!(Suite::select_ws_subprotocol([]), None);
+        // WS 门下 zstd-dict 回显为 zstd(行为一致)
+        assert_eq!(Suite::ZstdDict.ws_subprotocol(), SUBPROTOCOL_ZSTD);
+        assert_eq!(Suite::Plain.ws_subprotocol(), SUBPROTOCOL_PLAIN);
+        assert_eq!(
+            Suite::from_subprotocol("teamviewrelay.zstd.v1"),
+            Some(Suite::Zstd)
+        );
+        assert_eq!(Suite::from_subprotocol(""), None);
     }
 }

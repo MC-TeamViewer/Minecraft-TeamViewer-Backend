@@ -198,7 +198,15 @@ async fn player_ws(
     headers: HeaderMap,
 ) -> Response {
     let remote_addr = effective_remote_addr(&headers, &transport);
-    upgrade_websocket(ws, state, ConnectionKind::Player, transport, remote_addr)
+    upgrade_websocket(
+        ws,
+        state,
+        ConnectionKind::Player,
+        transport,
+        remote_addr,
+        &headers,
+    )
+    .await
 }
 
 async fn web_map_ws(
@@ -208,7 +216,15 @@ async fn web_map_ws(
     headers: HeaderMap,
 ) -> Response {
     let remote_addr = effective_remote_addr(&headers, &transport);
-    upgrade_websocket(ws, state, ConnectionKind::WebMap, transport, remote_addr)
+    upgrade_websocket(
+        ws,
+        state,
+        ConnectionKind::WebMap,
+        transport,
+        remote_addr,
+        &headers,
+    )
+    .await
 }
 
 async fn reserved_admin_ws(
@@ -233,27 +249,56 @@ async fn reserved_admin_ws(
     response.map(Body::new)
 }
 
-fn upgrade_websocket(
+async fn upgrade_websocket(
     ws: IncomingUpgrade,
     state: AppState,
     route_kind: ConnectionKind,
     transport: TransportConnectInfo,
     remote_addr: String,
+    headers: &HeaderMap,
 ) -> Response {
-    let Ok((response, upgraded)) = ws.upgrade(websocket_options()) else {
+    // 压缩套协商:客户端提供 teamviewrelay 子协议 → 择优回显(zstd 选中时
+    // 关闭 permessage-deflate,zstd 输出近高熵,叠加零收益纯烧 CPU);
+    // 旧客户端无该子协议 → 维持原 permessage-deflate 协商路径,行为不变。
+    let suite = ws_suite_from_headers(headers);
+    let options = match suite {
+        Some(_) => websocket_options().without_compression(),
+        None => websocket_options(),
+    };
+    let Ok((mut response, upgraded)) = ws.upgrade(options) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if let Some(suite) = suite
+        && let Ok(value) = header::HeaderValue::from_str(suite.ws_subprotocol())
+    {
+        response
+            .headers_mut()
+            .insert(header::SEC_WEBSOCKET_PROTOCOL, value);
+    }
     tokio::spawn(async move {
         match upgraded.await {
             Ok(socket) => {
                 transport.wire.activate();
-                serve_socket(socket, state, route_kind, &transport, remote_addr).await;
+                serve_socket(socket, state, route_kind, &transport, remote_addr, suite).await;
                 transport.wire.deactivate();
             }
             Err(error) => warn!(%error, "websocket upgrade failed"),
         }
     });
     response.map(Body::new)
+}
+
+/// `Sec-WebSocket-Protocol` → 压缩套。子协议可能跨多个头或单头逗号分隔;
+/// None 表示客户端未提供 teamviewrelay 子协议(旧客户端)。
+fn ws_suite_from_headers(headers: &HeaderMap) -> Option<crate::compress::Suite> {
+    let offered = headers
+        .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    crate::compress::Suite::select_ws_subprotocol(offered)
 }
 
 fn websocket_options() -> Options {
@@ -575,7 +620,29 @@ async fn serve_socket(
     route_kind: ConnectionKind,
     transport: &TransportConnectInfo,
     remote_addr: String,
+    suite: Option<crate::compress::Suite>,
 ) {
+    // 每连接一对持久 zstd 编解码器:消息级 flush 块,跨消息共享压缩上下文
+    let mut encoder = match suite.filter(|suite| suite.stream_zstd()) {
+        Some(_) => match crate::compress::StreamEncoder::new() {
+            Ok(encoder) => Some(encoder),
+            Err(error) => {
+                warn!(%error, "zstd encoder unavailable, closing connection");
+                return;
+            }
+        },
+        None => None,
+    };
+    let mut decoder = match suite.filter(|suite| suite.stream_zstd()) {
+        Some(_) => match crate::compress::StreamDecoder::new() {
+            Ok(decoder) => Some(decoder),
+            Err(error) => {
+                warn!(%error, "zstd decoder unavailable, closing connection");
+                return;
+            }
+        },
+        None => None,
+    };
     let first = match tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
         Ok(Some(frame)) if frame.opcode() == OpCode::Binary => frame.payload().clone(),
         _ => {
@@ -587,6 +654,22 @@ async fn serve_socket(
                 .await;
             return;
         }
+    };
+    let first = match decoder.as_mut() {
+        Some(decoder) => match decoder.decompress_chunk(&first) {
+            Ok(envelope) => Bytes::from(envelope),
+            Err(error) => {
+                warn!(%error, "handshake decompress failed");
+                let _ = socket
+                    .send(Frame::close(
+                        yawc::close::CloseCode::Policy,
+                        "invalid_payload",
+                    ))
+                    .await;
+                return;
+            }
+        },
+        None => first,
     };
     let envelope = match WireEnvelope::decode(first) {
         Ok(envelope) => envelope,
@@ -760,12 +843,20 @@ async fn serve_socket(
     };
     let ack = encode_payload(channel, wire_envelope::Payload::HandshakeAck(ack));
     let ack_len = ack.len();
-    if tokio::time::timeout(
-        Duration::from_secs(2),
-        socket.send(Frame::binary(Bytes::from_owner(ack))),
-    )
-    .await
-    .is_err()
+    let ack_wire = match encoder.as_mut() {
+        Some(encoder) => match encoder.compress_chunk(&ack) {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                warn!(%error, "ack compress failed");
+                state.metrics.unregister(&id);
+                return;
+            }
+        },
+        None => Bytes::from_owner(ack),
+    };
+    if tokio::time::timeout(Duration::from_secs(2), socket.send(Frame::binary(ack_wire)))
+        .await
+        .is_err()
     {
         state.metrics.unregister(&id);
         return;
@@ -821,6 +912,7 @@ async fn serve_socket(
             metrics: state.metrics.clone(),
             traffic_channel,
         },
+        encoder,
     ));
     let reader_id = id.clone();
     let mut reader = tokio::spawn(reader_loop(
@@ -839,6 +931,7 @@ async fn serve_socket(
             profile,
             complete_online_roster,
         },
+        decoder,
     ));
     let last_wire_ingress = Arc::new(AtomicU64::new(0));
     let last_wire_egress = Arc::new(AtomicU64::new(0));
@@ -893,6 +986,7 @@ async fn writer_loop<S, E>(
     mut control: mpsc::Receiver<Arc<[u8]>>,
     mut state: watch::Receiver<Option<StateFrame>>,
     context: WriterContext,
+    mut encoder: Option<crate::compress::StreamEncoder>,
 ) where
     S: Sink<Frame, Error = E> + Unpin,
 {
@@ -919,6 +1013,7 @@ async fn writer_loop<S, E>(
                         bytes,
                         &context.metrics,
                         context.traffic_channel,
+                        &mut encoder,
                     )
                     .await
                 {
@@ -932,6 +1027,7 @@ async fn writer_loop<S, E>(
                         digest,
                         &context.metrics,
                         context.traffic_channel,
+                        &mut encoder,
                     )
                     .await
                 {
@@ -955,6 +1051,7 @@ async fn writer_loop<S, E>(
                     bytes,
                     &context.metrics,
                     context.traffic_channel,
+                    &mut encoder,
                 )
                 .await
                 {
@@ -971,19 +1068,28 @@ async fn send_writer_payload<S, E>(
     bytes: Arc<[u8]>,
     metrics: &Metrics,
     traffic_channel: TrafficChannel,
+    encoder: &mut Option<crate::compress::StreamEncoder>,
 ) -> bool
 where
     S: Sink<Frame, Error = E> + Unpin,
 {
     let byte_count = bytes.len();
     let message_type = protobuf_message_type(&bytes);
+    // 计量按应用层 envelope 字节;压缩后实际线上字节由 Wire 层计数反映
+    let payload = match encoder.as_mut() {
+        Some(encoder) => match encoder.compress_chunk(&bytes) {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                warn!(connection_id = %id, %error, "egress compress failed");
+                return false;
+            }
+        },
+        None => Bytes::from_owner(bytes),
+    };
     #[cfg(feature = "memory-debug")]
     let send_started = std::time::Instant::now();
-    let sent = tokio::time::timeout(
-        Duration::from_secs(2),
-        sink.send(Frame::binary(Bytes::from_owner(bytes))),
-    )
-    .await;
+    let sent =
+        tokio::time::timeout(Duration::from_secs(2), sink.send(Frame::binary(payload))).await;
     let succeeded = matches!(sent, Ok(Ok(())));
     #[cfg(feature = "memory-debug")]
     metrics.record_writer_send(send_started.elapsed(), succeeded);
@@ -1218,6 +1324,7 @@ struct ReaderContext {
 async fn reader_loop(
     mut stream: futures_util::stream::SplitStream<HttpWebSocket>,
     context: ReaderContext,
+    mut decoder: Option<crate::compress::StreamDecoder>,
 ) {
     let ReaderContext {
         id,
@@ -1240,13 +1347,23 @@ async fn reader_loop(
             }
             continue;
         }
+        let payload = match decoder.as_mut() {
+            Some(decoder) => match decoder.decompress_chunk(frame.payload()) {
+                Ok(envelope) => Bytes::from(envelope),
+                Err(error) => {
+                    warn!(connection_id = %id, %error, "ingress decompress failed");
+                    break;
+                }
+            },
+            None => frame.payload().clone(),
+        };
         metrics.record(
             Layer::Application,
             traffic_channel,
             Direction::Ingress,
-            frame.payload().len(),
+            payload.len(),
         );
-        let Ok(envelope) = WireEnvelope::decode(frame.payload().clone()) else {
+        let Ok(envelope) = WireEnvelope::decode(payload) else {
             continue;
         };
         match envelope.payload {
@@ -2123,6 +2240,7 @@ mod tests {
                 metrics: Arc::new(Metrics::default()),
                 traffic_channel: TrafficChannel::Player,
             },
+            None,
         ));
 
         assert_eq!(frames_rx.recv().await.as_deref(), Some(&b"state-1"[..]));
@@ -2152,6 +2270,109 @@ mod tests {
         assert_eq!(frames_rx.recv().await.as_deref(), Some(&b"digest-2"[..]));
 
         writer.abort();
+    }
+
+    /// WS 门 +zstd 套:writer_loop 出站的每条消息必须是可独立解码的 zstd
+    /// 块(逐 envelope flush),按序还原出原 envelope。
+    #[tokio::test(start_paused = true)]
+    async fn writer_compresses_each_message_with_persistent_zstd_context() {
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel();
+        let sink = RecordingSink { frames: frames_tx };
+        let (control_tx, control_rx) = mpsc::channel(4);
+        let (state_tx, state_rx) = watch::channel(None::<StateFrame>);
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let metrics = Arc::new(Metrics::default());
+
+        let first_payload = vec![9u8; 4096];
+        let second_payload = b"control-frame".to_vec();
+        control_tx
+            .send(Arc::from(&second_payload[..]))
+            .await
+            .expect("control channel");
+        state_tx.send_replace(Some(StateFrame {
+            revision: 1,
+            bytes: Some(Arc::from(&first_payload[..])),
+            digest: None,
+            snapshot: Arc::new(SnapshotFull {
+                server_time: Some(1.0),
+                ..Default::default()
+            }),
+            battle_revision: 1,
+        }));
+
+        let encoder = crate::compress::StreamEncoder::new().expect("zstd encoder");
+        let writer = tokio::spawn(writer_loop(
+            sink,
+            control_rx,
+            state_rx,
+            WriterContext {
+                id: "test-zstd".to_owned(),
+                events: events_tx,
+                metrics: metrics.clone(),
+                traffic_channel: TrafficChannel::Player,
+            },
+            Some(encoder),
+        ));
+
+        let mut decoder = crate::compress::StreamDecoder::new().expect("zstd decoder");
+        for expected in [first_payload, second_payload] {
+            let chunk = frames_rx.recv().await.expect("compressed frame");
+            assert_ne!(chunk.as_slice(), &expected[..], "压缩块不应与原文字节相同");
+            // 逐 envelope flush:每块恰好解出本条 envelope
+            let decoded = decoder.decompress_chunk(&chunk).expect("decompress");
+            assert_eq!(decoded, expected);
+        }
+
+        let RelayEvent::Delivered { revision, .. } =
+            events_rx.recv().await.expect("delivered event")
+        else {
+            panic!("expected delivered event");
+        };
+        assert_eq!(revision, 1);
+        writer.abort();
+    }
+
+    /// WS 子协议 → 压缩套:多值/逗号合并头都按客户端偏好序解析,
+    /// 无 teamviewrelay 子协议返回 None(旧客户端维持 deflate 路径)。
+    #[test]
+    fn ws_suite_negotiation_parses_all_header_shapes() {
+        use axum::http::header::SEC_WEBSOCKET_PROTOCOL;
+
+        let mut headers = HeaderMap::new();
+        assert_eq!(ws_suite_from_headers(&headers), None);
+
+        headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            header::HeaderValue::from_static("chat.supergame, teamviewrelay.zstd.v1"),
+        );
+        assert_eq!(
+            ws_suite_from_headers(&headers),
+            Some(crate::compress::Suite::Zstd)
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.append(
+            SEC_WEBSOCKET_PROTOCOL,
+            header::HeaderValue::from_static("teamviewrelay.zstd.v1"),
+        );
+        headers.append(
+            SEC_WEBSOCKET_PROTOCOL,
+            header::HeaderValue::from_static("teamviewrelay.plain.v1"),
+        );
+        assert_eq!(
+            ws_suite_from_headers(&headers),
+            Some(crate::compress::Suite::Zstd)
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            header::HeaderValue::from_static("teamviewrelay.zstd-dict.v1"),
+        );
+        assert_eq!(
+            ws_suite_from_headers(&headers),
+            Some(crate::compress::Suite::ZstdDict)
+        );
     }
 
     /// 无 path 门(WT/QUIC)会话接受 Player 握手:mod 经裸 QUIC 门以玩家身份连接的

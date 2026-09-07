@@ -17,13 +17,20 @@
   与 envelope 一一对应但解码不依赖该假设，跨帧共享压缩上下文（等效 permessage-deflate
   的 context takeover），解压窗口上限 2^23（8 MiB），解压结果超过帧上限视为协议违规。
 - 下行压缩级别 3（服务端决策，zstd 帧自描述无需协商）；上行由客户端自选级别。
+- 压缩套协商落地 WS 门：`Sec-WebSocket-Protocol` 子协议 `teamviewrelay.{plain,zstd,zstd-dict}.v1`
+  三套并列，服务端按客户端偏好序择一并回显（101 响应确认，握手内 0 额外 RTT）。选定
+  zstd/zstd-dict 时关闭 permessage-deflate（zstd 输出近高熵，外层 deflate 纯烧 CPU）并启用
+  连续 zstd 分块流（每条 WS binary 消息 = 一个压缩块）；选定 plain 时完全关闭压缩。客户端未
+  提供任何 teamviewrelay 子协议则维持原 permessage-deflate 协商路径（旧客户端零变化）。
 - datagram 通道暂不参与流压缩（自包含单元，`+zstd-dict` 的字典模式由后续切片经
-  door-control 流接入）；WS 门与 WT 门的同套协商由后续切片接入。
+  door-control 流接入）；WT 门的同套协商由后续切片接入。
 
 ### 变更
 
 - QUIC 门在 `+zstd`/`+zstd-dict` 套下流链路（客户端 bi 上行、服务端 uni 下行）自动启用
   zstd；plain 套与 `1.2.0-alpha.5` 线路行为完全一致。
+- WS 门选定 zstd 套后不再协商 permessage-deflate 扩展；旧客户端（无 teamviewrelay 子协议）
+  的 deflate 协商行为与 `1.2.0-alpha.5` 完全一致。
 
 ## [1.2.0-alpha.5-proto0.9.0] - 2026-09-08
 

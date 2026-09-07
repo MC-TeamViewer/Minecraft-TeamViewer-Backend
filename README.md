@@ -238,12 +238,24 @@ WebSocket。证书更新成功只影响新 QUIC 连接，已有连接保留旧 T
 - `zstd-dict`：可靠流同 `zstd`，datagram 另有字典模式（经门专用 door-control 流下发，
   后续切片接入）。
 
+各门的协商载体与当前落地状态：
+
+- **QUIC 门**（ALPN）：`teamviewrelay/v1`（plain）、`teamviewrelay/v1+zstd`、
+  `teamviewrelay/v1+zstd-dict`，rustls 按客户端偏好序选择，未知 ALPN 拒绝握手；
+- **WS 门**（子协议）：`Sec-WebSocket-Protocol` 三套并列 `teamviewrelay.plain.v1`、
+  `teamviewrelay.zstd.v1`、`teamviewrelay.zstd-dict.v1`，服务端按偏好序择一并在 101
+  响应回显（zstd-dict 在 WS 门下回显 zstd——无 datagram，两套流行为一致）。选定
+  zstd 套时不协商 permessage-deflate（外层 deflate 对 zstd 输出零收益）；客户端未提供
+  teamviewrelay 子协议则维持原 deflate 协商路径（旧客户端零变化）；
+- **WT 门**（extended CONNECT 的 `WT-Available-Protocols`/`WT-Protocol` 头，协议值与
+  WS 子协议同名）：由后续切片接入。
+
 可靠流的 zstd 语义是一条**连续 zstd 流的分块切片**：发送端每连接一个持久 CCtx，逐
-envelope `write + flush` 保证即时可解码，压缩块作为一帧 payload 走 varint 分帧；接收端
-把逐帧压缩块持续喂进同一条持久 DCtx——压缩块边界与 envelope 一一对应，跨帧共享压缩
-上下文（等效 permessage-deflate 的 context takeover）。解压窗口上限 8 MiB。datagram
-不适用该模型（自包含单元，丢弃互不影响）；WS 门（子协议协商）与 WT 门（protocols 头
-协商）的同套行为由后续切片接入。
+envelope `write + flush` 保证即时可解码，压缩块作为一帧 payload 走 varint 分帧（WS 门
+的压缩块即整条 binary 消息，消息边界天然对齐）；接收端把逐帧压缩块持续喂进同一条持久
+DCtx——压缩块边界与 envelope 一一对应，跨帧共享压缩上下文（等效 permessage-deflate
+的 context takeover）。解压窗口上限 8 MiB。datagram 不适用该模型（自包含单元，丢弃互
+不影响）。
 
 ## 源码开发
 
