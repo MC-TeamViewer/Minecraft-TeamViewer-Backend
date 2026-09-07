@@ -248,7 +248,9 @@ WebSocket。证书更新成功只影响新 QUIC 连接，已有连接保留旧 T
   zstd 套时不协商 permessage-deflate（外层 deflate 对 zstd 输出零收益）；客户端未提供
   teamviewrelay 子协议则维持原 deflate 协商路径（旧客户端零变化）；
 - **WT 门**（extended CONNECT 的 `WT-Available-Protocols`/`WT-Protocol` 头，协议值与
-  WS 子协议同名）：由后续切片接入。
+  WS 子协议同名）：服务端按 RFC 9651 解析客户端 List、择一并回显带引号的字符串
+  Item；当前浏览器尚未实现该头（Chromium issue 435589295、Firefox bug 1981483），
+  不发即 plain 行为，浏览器实现后自动激活。
 
 可靠流的 zstd 语义是一条**连续 zstd 流的分块切片**：发送端每连接一个持久 CCtx，逐
 envelope `write + flush` 保证即时可解码，压缩块作为一帧 payload 走 varint 分帧（WS 门

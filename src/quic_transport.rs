@@ -92,10 +92,8 @@ async fn accept_connection(
     let connection = incoming.await.context("QUIC handshake failed")?;
     let remote_addr = connection.remote_address().to_string();
     let alpn = negotiated_alpn(&connection);
-    let suite =
-        crate::compress::Suite::from_alpn(alpn.as_deref().unwrap_or_default()).ok_or_else(|| {
-            anyhow::anyhow!("QUIC connection without a teamviewrelay ALPN")
-        })?;
+    let suite = crate::compress::Suite::from_alpn(alpn.as_deref().unwrap_or_default())
+        .ok_or_else(|| anyhow::anyhow!("QUIC connection without a teamviewrelay ALPN"))?;
     info!(
         %remote_addr,
         alpn = alpn.as_deref().unwrap_or(""),
@@ -293,12 +291,10 @@ fn stream_bridge(
                 },
                 None => payload,
             };
-            let result = tokio::time::timeout(
-                WRITE_TIMEOUT,
-                frame::write_frame(&mut state_stream, &wire),
-            )
-            .await
-            .unwrap_or(Err(io::Error::other("state stream write timeout")));
+            let result =
+                tokio::time::timeout(WRITE_TIMEOUT, frame::write_frame(&mut state_stream, &wire))
+                    .await
+                    .unwrap_or(Err(io::Error::other("state stream write timeout")));
             if let Err(error) = result {
                 debug!(%error, "QUIC state write failed");
                 break;
@@ -475,7 +471,8 @@ mod tests {
 
         // bridge 建立(镜像 accept_connection 装配,movement 关闭)
         let (_movement_tx, movement_rx) = watch::channel(None);
-        let (mut incoming_rx, outgoing_tx) = stream_bridge(server_conn, movement_rx, crate::compress::Suite::Plain);
+        let (mut incoming_rx, outgoing_tx) =
+            stream_bridge(server_conn, movement_rx, crate::compress::Suite::Plain);
 
         // 客户端打开控制流并发送一帧
         let (mut control_send, mut control_recv) = connection.open_bi().await.expect("open bi");
@@ -601,7 +598,8 @@ mod tests {
         let server_conn = server_rx.recv().await.expect("server accepted");
 
         let (movement_tx, movement_rx) = watch::channel(None);
-        let (_incoming_rx, _outgoing_tx) = stream_bridge(server_conn, movement_rx, crate::compress::Suite::Plain);
+        let (_incoming_rx, _outgoing_tx) =
+            stream_bridge(server_conn, movement_rx, crate::compress::Suite::Plain);
 
         let chunk_a: Arc<[u8]> = Bytes::from_static(b"abc").to_vec().into();
         let chunk_b: Arc<[u8]> = Bytes::from_static(b"xyz").to_vec().into();

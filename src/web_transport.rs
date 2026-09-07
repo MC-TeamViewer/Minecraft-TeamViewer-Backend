@@ -127,12 +127,25 @@ async fn accept_session(
         anyhow::bail!("unexpected WebTransport path: {path}");
     }
 
-    let connection = request.accept().await?;
+    // 压缩套协商搭 extended CONNECT 便车(0 额外 RTT):客户端在
+    // WT-Available-Protocols(RFC 9651 List)按偏好序携带协议值,服务端择一
+    // 并以 WT-Protocol 回显(必须取自客户端列表)。当前浏览器尚未实现该头,
+    // 不发即 None → plain 行为,与 alpha.5 完全一致;未来浏览器实现后自动激活。
+    let suite = wt_suite_from_headers(request.headers());
+    let connection = match suite {
+        Some(suite) => {
+            request
+                .accept_with_headers([("WT-Protocol", suite.wt_protocol_value())])
+                .await?
+        }
+        None => request.accept().await?,
+    };
     let remote_addr = remote_addr.to_string();
     info!(
         %remote_addr,
         path = %path,
         user_agent = user_agent.as_deref().unwrap_or("unknown"),
+        ?suite,
         "WebTransport session accepted"
     );
     // max_datagram_size 已扣除 WebTransport Datagram 头,返回值即应用层预算;
@@ -141,7 +154,8 @@ async fn accept_session(
         .max_datagram_size()
         .is_some_and(|size| size >= MOVEMENT_CHUNK_MAX_BYTES);
     let (movement_tx, movement_rx) = watch::channel(None::<Arc<MovementBatch>>);
-    let (control_rx, state_sink) = stream_bridge(connection, movement_rx);
+    let (control_rx, state_sink) =
+        stream_bridge(connection, movement_rx, suite.unwrap_or_default());
     web::serve_web_map_session(
         WebMapFrameStream::new(MpscReceiver::new(control_rx)),
         MpscSink::new(state_sink),
@@ -154,9 +168,23 @@ async fn accept_session(
     Ok(())
 }
 
+/// 从 extended CONNECT 请求头解析压缩套:`WT-Available-Protocols`(RFC 9651
+/// 字符串 List,逗号分隔,客户端偏好序)。h3 头名本应小写,这里仍大小写不敏感
+/// 查找以防客户端实现差异;无该头或无可识别值 → None(plain)。
+fn wt_suite_from_headers(
+    headers: &std::collections::HashMap<String, String>,
+) -> Option<crate::compress::Suite> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("wt-available-protocols"))
+        .map(|(_, value)| value)
+        .and_then(|value| crate::compress::select_wt_protocol(value.split(',')))
+}
+
 fn stream_bridge(
     connection: wtransport::Connection,
     mut movement_rx: watch::Receiver<Option<Arc<MovementBatch>>>,
+    suite: crate::compress::Suite,
 ) -> (
     mpsc::Receiver<Result<Bytes, io::Error>>,
     mpsc::Sender<Bytes>,
@@ -249,9 +277,45 @@ fn stream_bridge(
         };
 
         let reader = tokio::spawn(async move {
+            // 上行 zstd:压缩块 → 持久 DCtx → envelope;分块边界由对端
+            // flush 保证,但解码按流推进,不依赖该假设
+            let mut decoder = if suite.stream_zstd() {
+                match crate::compress::StreamDecoder::new() {
+                    Ok(decoder) => Some(decoder),
+                    Err(error) => {
+                        debug!(%error, "WebTransport uplink decoder unavailable");
+                        let _ = incoming_tx
+                            .clone()
+                            .send(Err(io::Error::other("uplink decoder unavailable")))
+                            .await;
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             if let Err(error) = frame::read_frames(&mut recv, |frame| {
                 let incoming_tx = incoming_tx.clone();
-                async move { incoming_tx.send(Ok(frame)).await.is_ok() }
+                // 解码在闭包体内同步完成;future 只做跨任务投递
+                let decoded = match decoder.as_mut() {
+                    Some(decoder) => decoder.decompress_chunk(&frame).map(Bytes::from),
+                    None => Ok(frame),
+                };
+                async move {
+                    match decoded {
+                        Ok(payload) => incoming_tx.send(Ok(payload)).await.is_ok(),
+                        // 解压失败属协议违规:显式断连
+                        Err(error) => {
+                            debug!(%error, "WebTransport uplink decompress failed");
+                            incoming_tx
+                                .send(Err(io::Error::other(format!(
+                                    "uplink decompress failed: {error}"
+                                ))))
+                                .await
+                                .is_ok()
+                        }
+                    }
+                }
             })
             .await
                 && incoming_tx
@@ -263,13 +327,36 @@ fn stream_bridge(
             {}
         });
 
+        // 下行 zstd:envelope → 持久 CCtx flush 出压缩块 → `[varint][块]`
+        let mut encoder = if suite.stream_zstd() {
+            match crate::compress::StreamEncoder::new() {
+                Ok(encoder) => Some(encoder),
+                Err(error) => {
+                    debug!(%error, "WebTransport downlink encoder unavailable");
+                    // 无下行通道即会话失效:结束写出循环,状态流关闭会
+                    // 触发会话拆除;读向由 reader 任务独立处理
+                    reader.abort();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         while let Some(payload) = outgoing_rx.recv().await {
-            let result = tokio::time::timeout(
-                WRITE_TIMEOUT,
-                frame::write_frame(&mut state_stream, &payload),
-            )
-            .await
-            .unwrap_or(Err(io::Error::other("state stream write timeout")));
+            let wire = match encoder.as_mut() {
+                Some(encoder) => match encoder.compress_chunk(&payload) {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        debug!(%error, "WebTransport downlink compress failed");
+                        break;
+                    }
+                },
+                None => payload,
+            };
+            let result =
+                tokio::time::timeout(WRITE_TIMEOUT, frame::write_frame(&mut state_stream, &wire))
+                    .await
+                    .unwrap_or(Err(io::Error::other("state stream write timeout")));
             if let Err(error) = result {
                 debug!(%error, "WebTransport state write failed");
                 break;
@@ -619,7 +706,7 @@ mod tests {
                 .expect("session request");
             let connection = request.accept().await.expect("session accepted");
             let (_movement_tx, movement_rx) = watch::channel(None);
-            let bridge = stream_bridge(connection, movement_rx);
+            let bridge = stream_bridge(connection, movement_rx, crate::compress::Suite::Plain);
             bridges_tx.send(bridge).await.ok();
         });
         let _ = runtime;
@@ -711,7 +798,7 @@ mod tests {
                 .expect("session request");
             let connection = request.accept().await.expect("session accepted");
             let (movement_tx, movement_rx) = watch::channel(None);
-            let bridge = stream_bridge(connection, movement_rx);
+            let bridge = stream_bridge(connection, movement_rx, crate::compress::Suite::Plain);
             sessions_tx
                 .send((bridge.0, bridge.1, movement_tx))
                 .await
@@ -759,5 +846,135 @@ mod tests {
         }
         assert_eq!(received[0], b"abc");
         assert_eq!(received[1], b"xyz");
+    }
+
+    #[test]
+    fn wt_suite_negotiation_parses_available_protocols_header() {
+        let mut headers = std::collections::HashMap::new();
+        // 无该头:当前浏览器均未实现 → plain 路径(alpha.5 行为)
+        assert_eq!(wt_suite_from_headers(&headers), None);
+        // 规范形态:RFC 9651 List,带引号字符串项,按客户端偏好序择一
+        headers.insert(
+            "wt-available-protocols".to_string(),
+            "\"teamviewrelay.zstd.v1\", \"teamviewrelay.plain.v1\"".to_string(),
+        );
+        assert_eq!(
+            wt_suite_from_headers(&headers),
+            Some(crate::compress::Suite::Zstd)
+        );
+        // 头名大小写不敏感兜底
+        let mut upper = std::collections::HashMap::new();
+        upper.insert(
+            "WT-Available-Protocols".to_string(),
+            "\"teamviewrelay.plain.v1\"".to_string(),
+        );
+        assert_eq!(
+            wt_suite_from_headers(&upper),
+            Some(crate::compress::Suite::Plain)
+        );
+        // 无可识别值 → None
+        let mut other = std::collections::HashMap::new();
+        other.insert(
+            "wt-available-protocols".to_string(),
+            "\"chat.v2\", \"other\"".to_string(),
+        );
+        assert_eq!(wt_suite_from_headers(&other), None);
+    }
+
+    /// zstd 套桥接双向压缩:上行 bi 流载压缩块(桥内持久 DCtx 解出 envelope),
+    /// 下行 uni 流由桥内持久 CCtx 逐 envelope flush 压缩;每方向发两个
+    /// envelope,第二个验证跨块上下文共享(重新初始化的压缩器不可能让第二
+    /// 块解出依赖首块窗口的字节)。
+    #[tokio::test]
+    async fn zstd_suite_compresses_both_bridge_directions() {
+        let dir = temp_dir("bridge-zstd");
+        let cert = write_test_cert(&dir, "a", &["a.example.com"]);
+        let config = wt_config(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            vec![cert_identity(&cert, true)],
+            7 * 24 * 60 * 60,
+        );
+        let (runtime, tls_config) = CertRuntime::load(&config).await.expect("load");
+        let server_config = ServerConfig::builder()
+            .with_bind_address(config.bind_address)
+            .with_custom_tls(tls_config)
+            .build();
+        let endpoint = Endpoint::server(server_config).expect("server endpoint");
+        let addr = endpoint.local_addr().expect("local addr");
+        let (bridges_tx, mut bridges_rx) = tokio::sync::mpsc::channel::<(
+            mpsc::Receiver<Result<Bytes, io::Error>>,
+            mpsc::Sender<Bytes>,
+        )>(1);
+        tokio::spawn(async move {
+            let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, endpoint.accept().await)
+                .await
+                .expect("incoming timeout")
+                .expect("session request");
+            let connection = request.accept().await.expect("session accepted");
+            let (_movement_tx, movement_rx) = watch::channel(None);
+            let bridge = stream_bridge(connection, movement_rx, crate::compress::Suite::Zstd);
+            bridges_tx.send(bridge).await.ok();
+        });
+        let _ = runtime;
+
+        let client_config = ClientConfig::builder()
+            .with_bind_default()
+            .with_server_certificate_hashes([cert.digest.clone()])
+            .dns_resolver(StaticDnsResolver)
+            .build();
+        let client = Endpoint::client(client_config).expect("client endpoint");
+        let url = format!("https://a.example.com:{}{WEB_TRANSPORT_PATH}", addr.port());
+        let session = client.connect(url).await.expect("connect");
+
+        // 客户端持久 CCtx 把两个 envelope 压成两个压缩块,写上控制流
+        let mut uplink = crate::compress::StreamEncoder::new().expect("uplink encoder");
+        let control = session.open_bi().await.expect("open bi");
+        let (mut control_send, _control_recv) = control.await.expect("bi stream");
+        let uplink_envelopes: [&[u8]; 2] = [b"first-uplink", b"second-uplink-payload-larger"];
+        for envelope in uplink_envelopes {
+            let chunk = uplink.compress_chunk(envelope).expect("compress");
+            frame::write_frame(&mut control_send, &chunk)
+                .await
+                .expect("control write");
+        }
+
+        // 服务端桥持久 DCtx 解出两个 envelope,顺序一致
+        let (mut incoming_rx, outgoing_tx) =
+            tokio::time::timeout(Duration::from_secs(5), bridges_rx.recv())
+                .await
+                .expect("bridge ready")
+                .expect("bridge channels");
+        for expected in uplink_envelopes {
+            let frame = tokio::time::timeout(Duration::from_secs(5), incoming_rx.recv())
+                .await
+                .expect("frame timeout")
+                .expect("frame")
+                .expect("frame ok");
+            assert_eq!(&frame[..], expected);
+        }
+
+        // 服务端出站:envelope 经桥内持久 CCtx 压缩后写 uni 流;
+        // 客户端读 varint 帧,喂进自己的持久 DCtx 逐块解出
+        let mut uni_recv = tokio::time::timeout(Duration::from_secs(5), session.accept_uni())
+            .await
+            .expect("uni timeout")
+            .expect("uni stream");
+        let mut downlink_decoder = crate::compress::StreamDecoder::new().expect("downlink decoder");
+        let downlink_envelopes: [&[u8]; 2] = [b"first-downlink", b"second-downlink-payload-larger"];
+        for envelope in downlink_envelopes {
+            outgoing_tx
+                .send(Bytes::from_static(envelope))
+                .await
+                .expect("outgoing send");
+            // 压缩块远小于 128 字节,varint 长度头为单字节
+            let mut header = [0u8; 1];
+            read_exact(&mut uni_recv, &mut header).await;
+            let mut payload = vec![0u8; header[0] as usize];
+            read_exact(&mut uni_recv, &mut payload).await;
+            let decoded = downlink_decoder
+                .decompress_chunk(&payload)
+                .expect("decompress");
+            assert_eq!(decoded, envelope);
+        }
     }
 }

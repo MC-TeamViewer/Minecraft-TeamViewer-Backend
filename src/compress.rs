@@ -8,8 +8,8 @@
 //! 各门协商载体(0 额外 RTT,服务端确认制):裸 QUIC 用 ALPN
 //! (`teamviewrelay/v1[+zstd[-dict]]`);WS 门用子协议
 //! (`teamviewrelay.{plain,zstd,zstd-dict}.v1`);WT 门用 extended CONNECT 的
-//! protocols 头并回显。同一套语义在三门等价;WS 门无 datagram,其下
-//! `ZstdDict` 与 `Zstd` 行为一致。
+//! `WT-Available-Protocols`/`WT-Protocol` 头(协议值与 WS 子协议同名)。
+//! 同一套语义在三门等价;WS 门无 datagram,其下 `ZstdDict` 与 `Zstd` 行为一致。
 //!
 //! **可靠流 zstd 语义 = 一条连续 zstd 流的分块切片**:发送端每连接一个持久
 //! CCtx,逐 envelope `write + flush`(ZSTD_e_flush 保证即时可解码),flush
@@ -98,6 +98,45 @@ impl Suite {
     {
         offered.into_iter().find_map(Suite::from_subprotocol)
     }
+
+    /// 套的全名协议 token(zstd-dict 保留原名)。WT 门有 datagram,`ZstdDict`
+    /// 与 `Zstd` 语义有别,必须回显客户端所点的原值;WS 门无 datagram 才
+    /// 统一折叠为 zstd(见 ws_subprotocol)。
+    pub(crate) fn protocol_name(self) -> &'static str {
+        match self {
+            Suite::Plain => SUBPROTOCOL_PLAIN,
+            Suite::Zstd => SUBPROTOCOL_ZSTD,
+            Suite::ZstdDict => SUBPROTOCOL_ZSTD_DICT,
+        }
+    }
+
+    /// 选定套回显给 WT 客户端的 `WT-Protocol` 头值:RFC 9651 字符串 Item,
+    /// 引号由这里带上(服务端直接写原始头值,Structured Fields 字符串必须
+    /// 带引号)。
+    pub(crate) fn wt_protocol_value(self) -> String {
+        format!("\"{}\"", self.protocol_name())
+    }
+}
+
+/// 按客户端偏好序取第一个可识别的 teamviewrelay 协议值;输入是
+/// `WT-Available-Protocols` 头值按逗号切开的片段(RFC 9651 List 的字符串项
+/// 带引号,这里宽容剥引号以兼容非浏览器客户端的裸 token)。无可识别值返回
+/// None(浏览器尚未实现该头——Chromium issue 435589295——回落 plain 行为)。
+pub(crate) fn select_wt_protocol<'a, I>(offered: I) -> Option<Suite>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    offered
+        .into_iter()
+        .filter_map(|value| {
+            let trimmed = value.trim();
+            let unquoted = trimmed
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+                .unwrap_or(trimmed);
+            (!unquoted.is_empty()).then_some(unquoted)
+        })
+        .find_map(Suite::from_subprotocol)
 }
 
 /// 下行(服务端→客户端)持久压缩器:逐 envelope flush 出自包含可即时解码
@@ -264,5 +303,42 @@ mod tests {
             Some(Suite::Zstd)
         );
         assert_eq!(Suite::from_subprotocol(""), None);
+    }
+
+    #[test]
+    fn wt_protocol_selection_strips_structured_field_quotes() {
+        // 浏览器规范形态:RFC 9651 List 字符串项带引号,逗号+空格分隔,
+        // 按客户端偏好序取第一个可识别值
+        assert_eq!(
+            select_wt_protocol([
+                "\"teamviewrelay.zstd.v1\"",
+                "\"teamviewrelay.plain.v1\"",
+                "\"chat.v2\""
+            ]),
+            Some(Suite::Zstd)
+        );
+        // 非浏览器客户端的裸 token 同样接受
+        assert_eq!(
+            select_wt_protocol(["teamviewrelay.plain.v1", SUBPROTOCOL_ZSTD]),
+            Some(Suite::Plain)
+        );
+        assert_eq!(
+            select_wt_protocol(["\"teamviewrelay.zstd-dict.v1\""]),
+            Some(Suite::ZstdDict)
+        );
+        // 无可识别值 → None(旧客户端不发该头,同样 None → plain 行为)
+        assert_eq!(select_wt_protocol(["\"chat\"", "other.v1"]), None);
+        assert_eq!(select_wt_protocol(std::iter::empty::<&str>()), None);
+        assert_eq!(select_wt_protocol(["   "]), None);
+        // WT 门有 datagram:zstd-dict 回显原值(RFC 9651 字符串 Item 带引号)
+        assert_eq!(
+            Suite::ZstdDict.wt_protocol_value(),
+            "\"teamviewrelay.zstd-dict.v1\""
+        );
+        assert_eq!(Suite::Zstd.wt_protocol_value(), "\"teamviewrelay.zstd.v1\"");
+        assert_eq!(
+            Suite::Plain.wt_protocol_value(),
+            "\"teamviewrelay.plain.v1\""
+        );
     }
 }

@@ -22,8 +22,14 @@
   zstd/zstd-dict 时关闭 permessage-deflate（zstd 输出近高熵，外层 deflate 纯烧 CPU）并启用
   连续 zstd 分块流（每条 WS binary 消息 = 一个压缩块）；选定 plain 时完全关闭压缩。客户端未
   提供任何 teamviewrelay 子协议则维持原 permessage-deflate 协商路径（旧客户端零变化）。
+- 压缩套协商落地 WT 门：extended CONNECT 请求头 `WT-Available-Protocols`（RFC 9651
+  字符串 List，客户端偏好序）择一套并以 `WT-Protocol` 回显（必须取自客户端列表，
+  RFC 9651 字符串 Item 带引号；协议值与 WS 子协议同名，`zstd-dict` 在 WT 门保留
+  原值回显——WT 门有 datagram，两套语义有别）。当前浏览器尚未实现该头
+  （Chromium issue 435589295、Firefox bug 1981483），不发即 plain 行为，与
+  `1.2.0-alpha.5` 完全一致；浏览器实现后自动激活，服务端无需再改动。
 - datagram 通道暂不参与流压缩（自包含单元，`+zstd-dict` 的字典模式由后续切片经
-  door-control 流接入）；WT 门的同套协商由后续切片接入。
+  door-control 流接入）。
 
 ### 变更
 
