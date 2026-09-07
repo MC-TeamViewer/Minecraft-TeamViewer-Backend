@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod cert;
+pub mod compress;
 pub mod config;
 pub mod frame;
 pub mod metrics;

@@ -218,13 +218,32 @@ WebSocket。证书更新成功只影响新 QUIC 连接，已有连接保留旧 T
 线路互不兼容，因此是并行监听的两扇门。两门共享同一个 relay 核心与同一套 WireEnvelope
 应用层语义；裸 QUIC 无 URL path，会话类型由首个握手消息的通道字段自识别。
 
-- ALPN 固定为 `teamviewrelay/v1`（未知 ALPN 的握手直接拒绝）。
+- ALPN 三套并列：`teamviewrelay/v1`（plain）、`teamviewrelay/v1+zstd`、
+  `teamviewrelay/v1+zstd-dict`（压缩套语义见下文"压缩"），rustls 按客户端偏好序选择，
+  未知 ALPN 的握手直接拒绝。
 - 证书配置与 `[webTransport]` 完全同构（TOML `identities` 数组、`certPath`/`keyPath`、
   环境变量 `TEAMVIEWER_QUIC_IDENTITIES`/`CERT_PATH`/`KEY_PATH`），可与 WT 门共享同一张
   证书；SNI 选择与热轮换逻辑也完全一致。
 - 流约定与 WT 门一致：客户端开 1 条双向流上行、服务端开 1 条单向流下行，分帧
   `[varint 长度][payload]`；movement 位置批走 QUIC datagram（RFC 9221）。
 - Docker 镜像已 `EXPOSE 8767/udp`，compose 默认映射 `${TEAMVIEWER_QUIC_PORT:-8767}`。
+
+### 压缩（zstd 压缩套，1.2.0-alpha.6 起）
+
+压缩以"套"为单位在**门原生协商载体**上商定（0 额外 RTT，服务端确认制），全部搭现有
+握手便车，不做应用层协商：
+
+- `plain`：流与 datagram 均不压缩；
+- `zstd`：可靠流走连续 zstd 分块流（见下），datagram 暂按独立单元处理；
+- `zstd-dict`：可靠流同 `zstd`，datagram 另有字典模式（经门专用 door-control 流下发，
+  后续切片接入）。
+
+可靠流的 zstd 语义是一条**连续 zstd 流的分块切片**：发送端每连接一个持久 CCtx，逐
+envelope `write + flush` 保证即时可解码，压缩块作为一帧 payload 走 varint 分帧；接收端
+把逐帧压缩块持续喂进同一条持久 DCtx——压缩块边界与 envelope 一一对应，跨帧共享压缩
+上下文（等效 permessage-deflate 的 context takeover）。解压窗口上限 8 MiB。datagram
+不适用该模型（自包含单元，丢弃互不影响）；WS 门（子协议协商）与 WT 门（protocols 头
+协商）的同套行为由后续切片接入。
 
 ## 源码开发
 

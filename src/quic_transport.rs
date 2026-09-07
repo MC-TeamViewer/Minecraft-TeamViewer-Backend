@@ -25,11 +25,10 @@ use crate::{
     web_transport::{MpscReceiver, MpscSink},
 };
 
-/// 协议版本线:plain 为基线;+zstd / +zstd-dict 在压缩阶段(alpha.6)对外提供。
+/// 协议版本线:ALPN 三套并列(alpha.6 压缩阶段启用),rustls 按客户端
+/// 偏好序选择;语义见 compress::Suite。
 pub(crate) const ALPN_PLAIN: &str = "teamviewrelay/v1";
-#[allow(dead_code)] // alpha.6 压缩阶段接入 ALPN 列表
 pub(crate) const ALPN_ZSTD: &str = "teamviewrelay/v1+zstd";
-#[allow(dead_code)] // alpha.6 压缩阶段接入 ALPN 列表
 pub(crate) const ALPN_ZSTD_DICT: &str = "teamviewrelay/v1+zstd-dict";
 
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -73,8 +72,12 @@ async fn build_server_endpoint(
 ) -> anyhow::Result<(CertRuntime, Endpoint)> {
     let (runtime, tls_config) = CertRuntime::load(config).await?;
     let mut tls_config = tls_config;
-    // 压缩阶段在此按配置追加 ALPN_ZSTD / ALPN_ZSTD_DICT
-    tls_config.alpn_protocols = vec![ALPN_PLAIN.as_bytes().to_vec()];
+    // 三套并列;rustls 按客户端偏好序选择,服务端列表即"全部接受"
+    tls_config.alpn_protocols = vec![
+        ALPN_ZSTD_DICT.as_bytes().to_vec(),
+        ALPN_ZSTD.as_bytes().to_vec(),
+        ALPN_PLAIN.as_bytes().to_vec(),
+    ];
     let quic_tls = QuicServerConfig::try_from(tls_config).context("rustls → QUIC TLS 适配失败")?;
     let server_config = ServerConfig::with_crypto(Arc::new(quic_tls));
     let endpoint = Endpoint::server(server_config, config.bind_address)
@@ -89,9 +92,14 @@ async fn accept_connection(
     let connection = incoming.await.context("QUIC handshake failed")?;
     let remote_addr = connection.remote_address().to_string();
     let alpn = negotiated_alpn(&connection);
+    let suite =
+        crate::compress::Suite::from_alpn(alpn.as_deref().unwrap_or_default()).ok_or_else(|| {
+            anyhow::anyhow!("QUIC connection without a teamviewrelay ALPN")
+        })?;
     info!(
         %remote_addr,
         alpn = alpn.as_deref().unwrap_or(""),
+        ?suite,
         "QUIC connection accepted"
     );
     // max_datagram_size 已扣除 QUIC 帧头开销;裸 QUIC 无 WT capsule 头,
@@ -100,7 +108,7 @@ async fn accept_connection(
         .max_datagram_size()
         .is_some_and(|size| size >= MOVEMENT_CHUNK_MAX_BYTES);
     let (movement_tx, movement_rx) = watch::channel(None::<Arc<MovementBatch>>);
-    let (control_rx, state_sink) = stream_bridge(connection, movement_rx);
+    let (control_rx, state_sink) = stream_bridge(connection, movement_rx, suite);
     web::serve_web_map_session(
         WebMapFrameStream::new(MpscReceiver::new(control_rx)),
         MpscSink::new(state_sink),
@@ -125,6 +133,7 @@ fn negotiated_alpn(connection: &Connection) -> Option<String> {
 fn stream_bridge(
     connection: Connection,
     mut movement_rx: watch::Receiver<Option<Arc<MovementBatch>>>,
+    suite: crate::compress::Suite,
 ) -> (
     mpsc::Receiver<Result<Bytes, io::Error>>,
     mpsc::Sender<Bytes>,
@@ -182,11 +191,13 @@ fn stream_bridge(
     tokio::spawn(async move {
         let control = tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_connection.accept_bi()).await;
         let Ok(Ok((send, mut recv))) = control else {
+            debug!("QUIC control stream missing (accept_bi timeout or failure)");
             let _ = incoming_tx
                 .send(Err(io::Error::other("QUIC control stream missing")))
                 .await;
             return;
         };
+        debug!("QUIC control stream accepted");
         // 控制流只承载 client→server;服务端→客户端的数据必须写服务端单向流,
         // mod 端只从 incoming unidirectional streams 读取
         drop(send);
@@ -194,30 +205,97 @@ fn stream_bridge(
             match tokio::time::timeout(WRITE_TIMEOUT, write_connection.open_uni()).await {
                 Ok(Ok(state_stream)) => state_stream,
                 _ => {
+                    debug!("QUIC state stream unavailable (open_uni timeout or failure)");
                     let _ = incoming_tx
                         .send(Err(io::Error::other("QUIC state stream unavailable")))
                         .await;
                     return;
                 }
             };
+        debug!("QUIC state stream opened");
 
         let reader = tokio::spawn(async move {
+            // 上行 zstd:压缩块 → 持久 DCtx → envelope;分块边界由对端
+            // flush 保证,但解码按流推进,不依赖该假设
+            let mut decoder = if suite.stream_zstd() {
+                match crate::compress::StreamDecoder::new() {
+                    Ok(decoder) => Some(decoder),
+                    Err(error) => {
+                        debug!(%error, "QUIC uplink decoder unavailable");
+                        let _ = incoming_tx
+                            .clone()
+                            .send(Err(io::Error::other("uplink decoder unavailable")))
+                            .await;
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             if let Err(error) = frame::read_frames(&mut recv, |frame| {
                 let incoming_tx = incoming_tx.clone();
-                async move { incoming_tx.send(Ok(frame)).await.is_ok() }
+                // 解码在闭包体内同步完成;future 只做跨任务投递
+                let decoded = match decoder.as_mut() {
+                    Some(decoder) => decoder.decompress_chunk(&frame).map(Bytes::from),
+                    None => Ok(frame),
+                };
+                async move {
+                    match decoded {
+                        Ok(payload) => {
+                            debug!(frame_len = payload.len(), "QUIC frame read");
+                            incoming_tx.send(Ok(payload)).await.is_ok()
+                        }
+                        // 解压失败属协议违规:显式断连
+                        Err(error) => {
+                            debug!(%error, "QUIC uplink decompress failed");
+                            incoming_tx
+                                .send(Err(io::Error::other(format!(
+                                    "uplink decompress failed: {error}"
+                                ))))
+                                .await
+                                .is_ok()
+                        }
+                    }
+                }
             })
             .await
-                && incoming_tx
+            {
+                debug!(%error, "QUIC read failed");
+                let _ = incoming_tx
                     .send(Err(io::Error::other(format!("QUIC read failed: {error}"))))
-                    .await
-                    .is_err()
-            {}
+                    .await;
+            }
         });
 
+        // 下行 zstd:envelope → 持久 CCtx flush 出压缩块 → `[varint][块]`
+        let mut encoder = if suite.stream_zstd() {
+            match crate::compress::StreamEncoder::new() {
+                Ok(encoder) => Some(encoder),
+                Err(error) => {
+                    debug!(%error, "QUIC downlink encoder unavailable");
+                    // 无下行通道即会话失效:结束写出循环,状态流关闭会
+                    // 触发会话拆除;读向由 reader 任务独立处理
+                    reader.abort();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         while let Some(payload) = outgoing_rx.recv().await {
+            let wire = match encoder.as_mut() {
+                Some(encoder) => match encoder.compress_chunk(&payload) {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        debug!(%error, "QUIC downlink compress failed");
+                        break;
+                    }
+                },
+                None => payload,
+            };
             let result = tokio::time::timeout(
                 WRITE_TIMEOUT,
-                frame::write_frame(&mut state_stream, &payload),
+                frame::write_frame(&mut state_stream, &wire),
             )
             .await
             .unwrap_or(Err(io::Error::other("state stream write timeout")));
@@ -397,7 +475,7 @@ mod tests {
 
         // bridge 建立(镜像 accept_connection 装配,movement 关闭)
         let (_movement_tx, movement_rx) = watch::channel(None);
-        let (mut incoming_rx, outgoing_tx) = stream_bridge(server_conn, movement_rx);
+        let (mut incoming_rx, outgoing_tx) = stream_bridge(server_conn, movement_rx, crate::compress::Suite::Plain);
 
         // 客户端打开控制流并发送一帧
         let (mut control_send, mut control_recv) = connection.open_bi().await.expect("open bi");
@@ -442,6 +520,79 @@ mod tests {
         );
     }
 
+    /// 集成测试:+zstd 套下 bridge 双向都必须走连续 zstd 分块流——
+    /// 上行压缩块解出 envelope 进 incoming,下行 envelope 压成块上 uni 流。
+    #[tokio::test]
+    async fn zstd_suite_compresses_both_bridge_directions() {
+        let (addr, leaf, mut server_rx) = start_endpoint(&[TEST_SNI]).await.expect("endpoint");
+        let connection = connect(addr, leaf, &[ALPN_ZSTD.as_bytes()]).await;
+        assert_eq!(
+            negotiated_alpn(&connection).as_deref(),
+            Some(ALPN_ZSTD),
+            "服务端应接受 +zstd ALPN"
+        );
+        let server_conn = server_rx.recv().await.expect("server accepted");
+
+        let (_movement_tx, movement_rx) = watch::channel(None);
+        let (mut incoming_rx, outgoing_tx) =
+            stream_bridge(server_conn, movement_rx, crate::compress::Suite::Zstd);
+
+        // 上行:测试侧持久压缩器逐 envelope flush 出压缩块,写控制流
+        let (mut control_send, _control_recv) = connection.open_bi().await.expect("open bi");
+        let mut uplink = crate::compress::StreamEncoder::new().expect("uplink encoder");
+        for envelope in [b"handshake".to_vec(), vec![7u8; 2048]] {
+            let chunk = uplink.compress_chunk(&envelope).expect("compress");
+            frame::write_frame(&mut control_send, &chunk)
+                .await
+                .expect("control write");
+        }
+        for envelope in [b"handshake".to_vec(), vec![7u8; 2048]] {
+            let frame = tokio::time::timeout(Duration::from_secs(5), incoming_rx.recv())
+                .await
+                .expect("frame timeout")
+                .expect("frame")
+                .expect("frame ok");
+            assert_eq!(&frame[..], &envelope[..], "上行解压须按序还原 envelope");
+        }
+
+        // 下行:bridge 压出的块上 uni 流,测试侧持久解压器逐块还原
+        outgoing_tx
+            .send(Bytes::from_static(b"state-payload"))
+            .await
+            .expect("outgoing send");
+        let mut uni_recv = tokio::time::timeout(Duration::from_secs(5), connection.accept_uni())
+            .await
+            .expect("uni timeout")
+            .expect("uni stream");
+        let wire = read_first_frame(&mut uni_recv).await;
+        let mut downlink = crate::compress::StreamDecoder::new().expect("downlink decoder");
+        let restored = downlink.decompress_chunk(&wire).expect("decompress");
+        assert_eq!(&restored, b"state-payload");
+    }
+
+    /// 测试辅助:从流上读第一条 varint 分帧(read_frames 捕获首帧即停)。
+    async fn read_first_frame<S>(stream: &mut S) -> Bytes
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(None::<Bytes>));
+        let captured = slot.clone();
+        frame::read_frames(stream, move |frame| {
+            let stop = {
+                let mut guard = captured.borrow_mut();
+                let fresh = guard.is_none();
+                if fresh {
+                    *guard = Some(frame);
+                }
+                !fresh
+            };
+            std::future::ready(stop)
+        })
+        .await
+        .expect("frame read");
+        slot.borrow().clone().expect("frame captured")
+    }
+
     /// 集成测试:relay 发布的 movement 批按裸块作为 datagram 到达客户端。
     #[tokio::test]
     async fn movement_batches_flow_as_datagrams() {
@@ -450,7 +601,7 @@ mod tests {
         let server_conn = server_rx.recv().await.expect("server accepted");
 
         let (movement_tx, movement_rx) = watch::channel(None);
-        let (_incoming_rx, _outgoing_tx) = stream_bridge(server_conn, movement_rx);
+        let (_incoming_rx, _outgoing_tx) = stream_bridge(server_conn, movement_rx, crate::compress::Suite::Plain);
 
         let chunk_a: Arc<[u8]> = Bytes::from_static(b"abc").to_vec().into();
         let chunk_b: Arc<[u8]> = Bytes::from_static(b"xyz").to_vec().into();

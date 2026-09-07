@@ -5,6 +5,26 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。Backend 版本与网络协议版本分别演进；版本标题中的
 `protoX.Y.Z` 表示该 Backend 发布时使用的协议版本，而不是 Backend 版本的一部分。
 
+## [1.2.0-alpha.6-proto0.9.0] - 2026-09-08
+
+### 新增
+
+- 压缩套（suite）协商落地 QUIC 门：ALPN 扩为三套并列 `teamviewrelay/v1`（plain）、
+  `teamviewrelay/v1+zstd`、`teamviewrelay/v1+zstd-dict`，rustls 按客户端偏好序选择，
+  握手内 0 额外 RTT 生效；未知 ALPN 拒绝连接。`src/compress.rs` 提供套定义与连续 zstd
+  分块流编解码器：发送端每连接持久 CCtx 逐 envelope `write + flush`（ZSTD_e_flush），
+  压缩块以 `[varint 长度][压缩块]` 走 varint 分帧；接收端持久 DCtx 连续喂入，压缩块边界
+  与 envelope 一一对应但解码不依赖该假设，跨帧共享压缩上下文（等效 permessage-deflate
+  的 context takeover），解压窗口上限 2^23（8 MiB），解压结果超过帧上限视为协议违规。
+- 下行压缩级别 3（服务端决策，zstd 帧自描述无需协商）；上行由客户端自选级别。
+- datagram 通道暂不参与流压缩（自包含单元，`+zstd-dict` 的字典模式由后续切片经
+  door-control 流接入）；WS 门与 WT 门的同套协商由后续切片接入。
+
+### 变更
+
+- QUIC 门在 `+zstd`/`+zstd-dict` 套下流链路（客户端 bi 上行、服务端 uni 下行）自动启用
+  zstd；plain 套与 `1.2.0-alpha.5` 线路行为完全一致。
+
 ## [1.2.0-alpha.5-proto0.9.0] - 2026-09-08
 
 ### 协议（proto/v0.9.0-alpha.1）
