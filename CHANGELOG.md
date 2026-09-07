@@ -5,7 +5,22 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。Backend 版本与网络协议版本分别演进；版本标题中的
 `protoX.Y.Z` 表示该 Backend 发布时使用的协议版本，而不是 Backend 版本的一部分。
 
-## [Unreleased]
+## [1.2.0-alpha.2-proto0.8.0] - 2026-09-07
+
+### 新增
+
+- WebTransport 支持多证书：TOML `identities` 数组或环境变量 `TEAMVIEWER_WT_IDENTITIES`（JSON）可配置最多 16 张证书（如域名证书 + IP 证书），TLS 握手按 SNI 精确/泛域名匹配选择，无 SNI（浏览器按 IP 直连）时使用 `default` 标记证书并依次回退到含 IP SAN 的证书；旧的单证书 `certPath`/`keyPath` 配置与 `TEAMVIEWER_WT_CERT_PATH`/`KEY_PATH` 环境变量保持兼容。
+- `TEAMVIEWER_WT_POLL_INTERVAL_SEC` 与 `TEAMVIEWER_WT_RENEW_WINDOW_SEC` 支持环境变量覆盖（此前仅文档提及、实际只读编译期内置 TOML）。
+
+### 变更
+
+- WebTransport 证书热轮换按证书独立进行：单张证书文件损坏只保留该张旧证书，其余证书正常轮换；不再整体重建 QUIC endpoint 配置。
+
+## [1.2.0-alpha.1-proto0.8.0] - 2026-09-07
+
+### 新增
+
+- 新增 WebTransport/QUIC 入口 `https://host:8766/web-map/wt`，与 WebSocket 共享房间状态，默认关闭。
 
 ### 文档
 

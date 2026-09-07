@@ -1,6 +1,6 @@
 services:
   backend:
-    image: ${TEAMVIEWER_IMAGE:-professornuo/teamviewrelay-rust:v1.2.0-alpha.1-proto0.8.0}
+    image: ${TEAMVIEWER_IMAGE:-professornuo/teamviewrelay-rust:v1.2.0-alpha.2-proto0.8.0}
     build:
       context: .
     container_name: teamviewer-backend
@@ -20,6 +20,9 @@ services:
       TEAMVIEWER_WT_BIND: "${TEAMVIEWER_WT_BIND:-0.0.0.0:8766}"
       TEAMVIEWER_WT_CERT_PATH: "${TEAMVIEWER_WT_CERT_PATH:-}"
       TEAMVIEWER_WT_KEY_PATH: "${TEAMVIEWER_WT_KEY_PATH:-}"
+      TEAMVIEWER_WT_IDENTITIES: "${TEAMVIEWER_WT_IDENTITIES:-}"
+      TEAMVIEWER_WT_POLL_INTERVAL_SEC: "${TEAMVIEWER_WT_POLL_INTERVAL_SEC:-}"
+      TEAMVIEWER_WT_RENEW_WINDOW_SEC: "${TEAMVIEWER_WT_RENEW_WINDOW_SEC:-}"
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - ./data-rust:/app/data

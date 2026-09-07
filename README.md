@@ -75,7 +75,7 @@ docker build -t teamviewrelay-backend:local .
 已发布镜像：
 
 ```text
-professornuo/teamviewrelay-rust:v1.2.0-alpha.1-proto0.8.0
+professornuo/teamviewrelay-rust:v1.2.0-alpha.2-proto0.8.0
 ```
 
 `docker-compose.yml` 默认使用该版本，并将 SQLite 数据目录挂载到宿主机的 `./data-rust`。
@@ -89,7 +89,7 @@ docker compose -f docker-compose.yml -f docker-compose.memory-debug.yml up -d --
 docker compose logs -f backend
 ```
 
-它对应镜像 tag `v1.2.0-alpha.1-memory-debug-proto0.8.0`，每 10 秒把资源快照写入
+它对应镜像 tag `v1.2.0-alpha.2-memory-debug-proto0.8.0`，每 10 秒把资源快照写入
 `./data-rust/memory-debug/samples-YYYY-MM-DD.jsonl`，heap 原始 dump、pprof、手动 CPU pprof 和 SVG
 火焰图写入 `./data-rust/memory-debug/profiles/`。首次 heap profile 默认在启动 2 分钟后生成；内存相对
 上次 profile 增长 8 MiB 时会自动追加抓取。heap 的符号解析由一次性子进程完成，解析缓存不会进入
@@ -123,6 +123,7 @@ RUSTFLAGS="-C force-frame-pointers=yes" \
 | `TEAMVIEWER_WT_BIND` | `0.0.0.0:8766` | QUIC UDP 监听地址 |
 | `TEAMVIEWER_WT_CERT_PATH` | 空 | PEM fullchain 路径；生产使用 Let’s Encrypt fullchain.pem |
 | `TEAMVIEWER_WT_KEY_PATH` | 空 | PEM private key 路径；生产使用 Let’s Encrypt privkey.pem |
+| `TEAMVIEWER_WT_IDENTITIES` | 空 | 多证书 JSON 数组，设置后整体覆盖 CERT_PATH/KEY_PATH 与 TOML 证书配置 |
 | `TEAMVIEWER_WT_POLL_INTERVAL_SEC` | `300` | 证书文件检查间隔，范围 30–86400 |
 | `TEAMVIEWER_WT_RENEW_WINDOW_SEC` | `604800` | 到期提前拒绝窗口，范围 1–30 天 |
 | `TEAMVIEWER_TRUST_PROXY_HEADERS` | `false` | 是否读取可信反代转发的真实 IP |
@@ -164,12 +165,41 @@ WebTransport 默认关闭。启用时必须提供 PEM 证书和私钥，后端�
 ACME。UDP 端口必须直连或在容器/防火墙上显式映射；Nginx 与 OpenResty 不能按普通 HTTP 反代
 WebTransport。
 
+单证书（向后兼容）：
+
 ```bash
 export TEAMVIEWER_WT_ENABLED=true
 export TEAMVIEWER_WT_BIND=0.0.0.0:8766
 export TEAMVIEWER_WT_CERT_PATH=/app/certs/fullchain.pem
 export TEAMVIEWER_WT_KEY_PATH=/app/certs/privkey.pem
 ```
+
+多证书（域名证书 + IP 证书等）：通过 `TEAMVIEWER_WT_IDENTITIES`（JSON 数组）或 TOML
+`identities` 配置，最多 16 张：
+
+```bash
+export TEAMVIEWER_WT_IDENTITIES='[
+  {"certPath": "/app/certs/fullchain.pem", "keyPath": "/app/certs/privkey.pem"},
+  {"certPath": "/app/certs/ip.crt.pem", "keyPath": "/app/certs/ip.key.pem", "default": true}
+]'
+```
+
+优先级：`TEAMVIEWER_WT_IDENTITIES` > `TEAMVIEWER_WT_CERT_PATH`/`KEY_PATH` > TOML
+`identities` > TOML `certPath`/`keyPath`；环境变量任一形式存在时整体替换 TOML 证书配置。
+
+每个 TLS 握手按以下顺序选证书：
+
+1. SNI 精确命中某张证书的 DNS SAN（大小写不敏感）；
+2. SNI 泛域名命中（仅最左单标签 `*.example.com`）；
+3. `default = true` 标记的证书；
+4. 第一张含 IP SAN 的证书；
+5. 第一张证书兜底。
+
+浏览器按 IP 直连时因 RFC 6066 不发送 SNI，因此需要一条 `default` 标记或 IP SAN 证书承接。
+SNI 未命中任意证书时回退到默认证书并记录 warn 日志。
+
+热轮换按证书独立进行：单张文件读取或解析失败只影响该张（保留旧证书，其余正常轮换）；新证书
+有效期落入 `renewWindowSec` 内则拒绝替换并保持旧证书，下个轮询周期复查。
 
 浏览器入口为 `https://host:8766/web-map/wt`。WS 路径保持不变；Java mod 第一版继续使用
 WebSocket。证书更新成功只影响新 QUIC 连接，已有连接保留旧 TLS 配置并按客户端重连收敛。
@@ -226,7 +256,7 @@ uv run python scripts/load_test_live.py \
   --stage-duration 300 \
   --report-hz 10 \
   --allow-remote \
-  --expected-build team-view-relay-rust-v1.2.0-alpha.1-proto0.8.0
+  --expected-build team-view-relay-rust-v1.2.0-alpha.2-proto0.8.0
 ```
 
 `--expected-build` 必须与目标 `/health` 返回的 `buildVersion` 完全一致，而不是 Docker tag。可先检查：

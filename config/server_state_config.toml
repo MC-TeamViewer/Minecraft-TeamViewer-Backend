@@ -63,6 +63,15 @@ observationUpdateIntervalSec = 300
 # WebTransport/QUIC 默认关闭；启用必须显式配置证书，失败不会影响 WebSocket 服务。
 enabled = false
 bindAddress = "0.0.0.0:8766"
+# 证书配置二选一：
+# 方式一（推荐）identities 数组，支持多张证书（如域名证书 + IP 证书）：
+# identities = [
+#   { certPath = "/etc/letsencrypt/live/example.com/fullchain.pem", keyPath = "/etc/letsencrypt/live/example.com/privkey.pem" },
+#   { certPath = "/app/certs/ip.crt.pem", keyPath = "/app/certs/ip.key.pem", default = true },
+# ]
+# default = true 的证书用于无 SNI 握手（浏览器按 IP 直连时不发送 SNI）；
+# 未标记 default 时回退到第一张含 IP SAN 的证书，再回退到第一张。
+# 方式二单证书写法（向后兼容）：
 # certPath = "/etc/letsencrypt/live/example.com/fullchain.pem"
 # keyPath = "/etc/letsencrypt/live/example.com/privkey.pem"
 pollIntervalSec = 300
