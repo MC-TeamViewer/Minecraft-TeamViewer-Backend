@@ -167,14 +167,17 @@ fn stream_bridge(
 
     tokio::spawn(async move {
         let control = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_connection.accept_bi()).await;
-        let Ok(Ok((mut send, mut recv))) = control else {
+        let Ok(Ok((send, mut recv))) = control else {
             let _ = incoming_tx
                 .send(Err(io::Error::other("WebTransport control stream missing")))
                 .await;
             return;
         };
-        let state = match tokio::time::timeout(WRITE_TIMEOUT, write_connection.open_uni()).await {
-            Ok(Ok(state)) => state,
+        // 控制流只承载 client→server;服务端→客户端的数据必须写服务端单向流,
+        // web 脚本只从 incomingUnidirectionalStreams 读取,写回 bi 流 send 半流无人消费
+        drop(send);
+        let opening = match tokio::time::timeout(WRITE_TIMEOUT, write_connection.open_uni()).await {
+            Ok(Ok(opening)) => opening,
             _ => {
                 let _ = incoming_tx
                     .send(Err(io::Error::other(
@@ -184,8 +187,8 @@ fn stream_bridge(
                 return;
             }
         };
-        let _state = match state.await {
-            Ok(state) => state,
+        let mut state_stream = match opening.await {
+            Ok(state_stream) => state_stream,
             Err(error) => {
                 let _ = incoming_tx
                     .send(Err(io::Error::other(format!(
@@ -212,9 +215,10 @@ fn stream_bridge(
         });
 
         while let Some(payload) = outgoing_rx.recv().await {
-            let result = tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut send, payload))
-                .await
-                .unwrap_or(Err(StreamWriteError::QuicProto));
+            let result =
+                tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut state_stream, payload))
+                    .await
+                    .unwrap_or(Err(StreamWriteError::QuicProto));
             if let Err(error) = result {
                 debug!(%error, "WebTransport state write failed");
                 break;
@@ -1019,5 +1023,105 @@ mod tests {
         runtime.reload().await;
         assert!(handshake_allowed(addr, "a.example.com", a.digest.clone()).await);
         assert!(handshake_allowed(addr, "b.example.com", b.digest.clone()).await);
+    }
+
+    async fn read_exact(stream: &mut RecvStream, buf: &mut [u8]) {
+        let mut filled = 0;
+        while filled < buf.len() {
+            let read =
+                tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf[filled..]))
+                    .await
+                    .expect("read timeout")
+                    .expect("read ok")
+                    .expect("stream open");
+            assert!(read > 0);
+            filled += read;
+        }
+    }
+
+    /// 回归测试:client→server 帧走客户端 bi 控制流,
+    /// server→client 帧(出站 MpscSink)必须走服务端单向流——web 脚本只读单向流。
+    #[tokio::test]
+    async fn state_frames_flow_on_unidirectional_stream() {
+        let dir = temp_dir("bridge");
+        let cert = write_test_cert(&dir, "a", &["a.example.com"]);
+        let config = wt_config(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            vec![cert_identity(&cert, true)],
+            7 * 24 * 60 * 60,
+        );
+        let (runtime, server_config) = CertRuntime::load(&config).await.expect("load");
+        let endpoint = Endpoint::server(server_config).expect("server endpoint");
+        let addr = endpoint.local_addr().expect("local addr");
+        let (bridges_tx, mut bridges_rx) = tokio::sync::mpsc::channel::<(
+            mpsc::Receiver<Result<Bytes, io::Error>>,
+            mpsc::Sender<Bytes>,
+        )>(1);
+        tokio::spawn(async move {
+            let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, endpoint.accept().await)
+                .await
+                .expect("incoming timeout")
+                .expect("session request");
+            let connection = request.accept().await.expect("session accepted");
+            let bridge = stream_bridge(connection);
+            bridges_tx.send(bridge).await.ok();
+        });
+        let _ = runtime;
+
+        let client_config = ClientConfig::builder()
+            .with_bind_default()
+            .with_server_certificate_hashes([cert.digest.clone()])
+            .dns_resolver(StaticDnsResolver)
+            .build();
+        let client = Endpoint::client(client_config).expect("client endpoint");
+        let url = format!("https://a.example.com:{}{WEB_TRANSPORT_PATH}", addr.port());
+        let session = client.connect(url).await.expect("connect");
+
+        // 客户端打开控制流并发送一帧
+        let control = session.open_bi().await.expect("open bi");
+        let (mut control_send, mut control_recv) = control.await.expect("bi stream");
+        write_frame(&mut control_send, Bytes::from_static(b"h"))
+            .await
+            .expect("control write");
+
+        // 服务端 bridge 读到该帧
+        let (mut incoming_rx, outgoing_tx) =
+            tokio::time::timeout(Duration::from_secs(5), bridges_rx.recv())
+                .await
+                .expect("bridge ready")
+                .expect("bridge channels");
+        let frame = tokio::time::timeout(Duration::from_secs(5), incoming_rx.recv())
+            .await
+            .expect("frame timeout")
+            .expect("frame")
+            .expect("frame ok");
+        assert_eq!(&frame[..], b"h");
+
+        // 服务端出站帧必须出现在客户端的单向流上
+        let mut uni_recv = tokio::time::timeout(Duration::from_secs(5), session.accept_uni())
+            .await
+            .expect("uni timeout")
+            .expect("uni stream");
+        outgoing_tx
+            .send(Bytes::from_static(b"state"))
+            .await
+            .expect("outgoing send");
+        let mut header = [0u8; 4];
+        read_exact(&mut uni_recv, &mut header).await;
+        let length = u32::from_be_bytes(header) as usize;
+        assert_eq!(length, 5);
+        let mut payload = vec![0u8; length];
+        read_exact(&mut uni_recv, &mut payload).await;
+        assert_eq!(&payload, b"state");
+
+        // 控制流的服务端方向不允许出现数据(修复前状态帧被错误写到这里);
+        // 服务端 drop send 半流会产生干净 EOF,同样算通过
+        let mut probe = [0u8; 1];
+        let probed =
+            tokio::time::timeout(Duration::from_millis(500), control_recv.read(&mut probe)).await;
+        assert!(
+            !matches!(&probed, Ok(Ok(Some(_)))),
+            "control stream server direction unexpectedly carried data"
+        );
     }
 }
