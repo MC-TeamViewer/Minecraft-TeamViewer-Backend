@@ -50,6 +50,22 @@ pub struct StateFrame {
     pub battle_revision: u64,
 }
 
+/// movement datagram 单帧 patch 编码上限。1024B + 4B 长度前缀落在 QUIC 初版
+/// PMTU(~1200B)预算内,低 MTU 链路也留有余量。
+pub const MOVEMENT_CHUNK_MAX_BYTES: usize = 1024;
+
+/// 一个连接单个 tick 最多发送的 movement datagram 数;超出部分顺延下一 tick
+/// (movement 批每 tick 全量重发,顺延只是该批玩家晚一 tick,无损)。
+pub const MOVEMENT_MAX_CHUNKS_PER_TICK: usize = 16;
+
+/// 一次广播周期内的玩家位置批:预编码为若干条目对齐的完整 patch(每块 ≤
+/// [`MOVEMENT_CHUNK_MAX_BYTES`] 字节),由 WT datagram 任务按预算发送。
+/// 绝对值 upsert、无 delete;丢失任意一块由下一 tick 全量重发自然恢复。
+#[derive(Clone, Default)]
+pub struct MovementBatch {
+    pub chunks: Arc<[Arc<[u8]>]>,
+}
+
 pub struct RegisterConnection {
     pub id: String,
     pub room: String,
@@ -61,6 +77,10 @@ pub struct RegisterConnection {
     pub remote_addr: String,
     pub control: mpsc::Sender<Arc<[u8]>>,
     pub state: watch::Sender<Option<StateFrame>>,
+    /// 服务端→客户端 movement datagram 批;无 datagram 的连接无人消费,空转无害。
+    pub movement: watch::Sender<Option<Arc<MovementBatch>>>,
+    /// 连接声明消费 datagram 位置且传输层支持:可靠 patch 剥离逐 tick 位置字段。
+    pub unreliable_positions: bool,
 }
 
 pub enum RelayEvent {
@@ -286,6 +306,9 @@ struct Connection {
     connected_at: i64,
     control: mpsc::Sender<Arc<[u8]>>,
     state: watch::Sender<Option<StateFrame>>,
+    movement: watch::Sender<Option<Arc<MovementBatch>>>,
+    unreliable_positions: bool,
+    last_position_refresh: Instant,
     delivered_revision: u64,
     delivered_snapshot: Option<Arc<SnapshotFull>>,
     delivered_battle_revision: u64,
@@ -833,6 +856,9 @@ impl Relay {
                         connected_at: unix_millis(),
                         control: register.control,
                         state: register.state,
+                        movement: register.movement,
+                        unreliable_positions: register.unreliable_positions,
+                        last_position_refresh: Instant::now(),
                         delivered_revision: 0,
                         delivered_snapshot: None,
                         delivered_battle_revision: 0,
@@ -2019,6 +2045,8 @@ impl Relay {
                     connection.room == room && connection.kind != ConnectionKind::ExternalSource
                 })
                 .map(|(id, connection)| {
+                    let position_refresh_due = now.duration_since(connection.last_position_refresh)
+                        >= Duration::from_secs(self.config.movement_refresh_sec);
                     (
                         id.clone(),
                         connection.kind,
@@ -2028,16 +2056,20 @@ impl Relay {
                         connection.delivered_battle_revision,
                         connection.kind == ConnectionKind::Player
                             && connection.next_digest_at <= now,
+                        // 位置低频保底到期的 tick 不剥离:可靠 patch 携带全量位置,
+                        // datagram 路径整体失效时客户端最多落后一个刷新周期
+                        connection.unreliable_positions && !position_refresh_due,
                     )
                 })
                 .collect::<Vec<_>>();
             let mut scoped_snapshots: HashMap<Vec<String>, Arc<SnapshotFull>> = HashMap::new();
             type ProjectionKey = (ConnectionKind, Vec<String>, ProtocolEpoch);
-            type PayloadKey = (ProjectionKey, bool, Option<usize>, u64);
+            type PayloadKey = (ProjectionKey, bool, Option<usize>, u64, bool);
             type DigestKey = (Vec<String>, bool, bool, bool, bool);
             let mut projected_snapshots: HashMap<ProjectionKey, Arc<SnapshotFull>> = HashMap::new();
             let mut encoded_payloads: HashMap<PayloadKey, Option<Arc<[u8]>>> = HashMap::new();
             let mut encoded_digests: HashMap<DigestKey, Arc<[u8]>> = HashMap::new();
+            let mut movement_batches: HashMap<ProjectionKey, Arc<MovementBatch>> = HashMap::new();
 
             for (
                 id,
@@ -2047,6 +2079,7 @@ impl Relay {
                 delivered_snapshot,
                 delivered_battle_revision,
                 digest_due,
+                strip_positions,
             ) in recipients
             {
                 if !state_dirty && kind != ConnectionKind::Player {
@@ -2082,6 +2115,24 @@ impl Relay {
                 } else {
                     WireChannel::Player
                 };
+                // movement 批必须在 payload 判空之前发布:能力连接的可靠 patch
+                // 常因位置被剥离而为空,datagram 恰是这些 tick 的唯一位置来源。
+                // 仅对启用分流的连接编码发布,legacy 连接(WS/未声明能力)不浪费。
+                if kind == ConnectionKind::WebMap
+                    && self
+                        .connections
+                        .get(&id)
+                        .is_some_and(|connection| connection.unreliable_positions)
+                {
+                    let batch = movement_batches
+                        .entry(projection_key.clone())
+                        .or_insert_with(|| Arc::new(movement_batch(&target)))
+                        .clone();
+                    if let Some(connection) = self.connections.get_mut(&id) {
+                        connection.movement.send_replace(Some(batch));
+                    }
+                }
+
                 let delivered_key = delivered_snapshot
                     .as_ref()
                     .map(|snapshot| Arc::as_ptr(snapshot) as usize);
@@ -2090,6 +2141,7 @@ impl Relay {
                     force_full,
                     delivered_key,
                     delivered_battle_revision,
+                    strip_positions,
                 );
                 let bytes = match encoded_payloads.entry(payload_key) {
                     std::collections::hash_map::Entry::Occupied(entry) => {
@@ -2109,6 +2161,7 @@ impl Relay {
                             force_full,
                             delivered_snapshot.as_deref(),
                             delivered_battle_revision,
+                            strip_positions,
                             &target,
                             self.battle_caches.get(&room),
                         )
@@ -2199,6 +2252,10 @@ impl Relay {
                     }));
                     if sent_state {
                         connection.force_full = false;
+                    }
+                    // 本 tick 的可靠 patch/full 携带了完整位置(未剥离),视为一次保底刷新
+                    if sent_state && !strip_positions {
+                        connection.last_position_refresh = now;
                     }
                     if digest_due {
                         connection.next_digest_at =
@@ -3045,13 +3102,15 @@ fn state_payload_for_profile(
     delivered_snapshot: Option<&SnapshotFull>,
     target: &SnapshotFull,
 ) -> Option<wire_envelope::Payload> {
-    if force_full || delivered_snapshot.is_none() {
-        return Some(wire_envelope::Payload::SnapshotFull(target.clone()));
-    }
-    let patch = build_patch(delivered_snapshot.expect("checked"), target)?;
-    Some(wire_envelope::Payload::Patch(adapt_outbound_patch(
-        profile, patch,
-    )))
+    state_payload_for_profile_with_battle(
+        profile,
+        force_full,
+        delivered_snapshot,
+        0,
+        false,
+        target,
+        None,
+    )
 }
 
 fn state_payload_for_profile_with_battle(
@@ -3059,6 +3118,7 @@ fn state_payload_for_profile_with_battle(
     force_full: bool,
     delivered_snapshot: Option<&SnapshotFull>,
     delivered_battle_revision: u64,
+    strip_positions: bool,
     target: &SnapshotFull,
     battle_cache: Option<&BattleRoomCache>,
 ) -> Option<wire_envelope::Payload> {
@@ -3089,10 +3149,135 @@ fn state_payload_for_profile_with_battle(
     if let Some(battle_chunks) = battle_patch.flatten() {
         patch.get_or_insert_with(Patch::default).battle_chunks = Some(battle_chunks);
     }
+    if strip_positions && let Some(patch) = patch.as_mut() {
+        strip_player_positions(patch, delivered_snapshot.expect("checked"));
+        if patch_is_empty(patch) {
+            return None;
+        }
+    }
     let patch = patch?;
     Some(wire_envelope::Payload::Patch(adapt_outbound_patch(
         profile, patch,
     )))
+}
+
+/// 从 patch 剥离既有玩家的逐 tick 位置字段(位置由 movement datagram 批承载),
+/// 并同时剔除与基线相同的非位置字段——纯移动玩家的 upsert 会被整体丢弃,
+/// 只真正变化了非位置字段(如血量)的玩家保留最小增量。
+/// 新玩家(基线中不存在)保留全字段——客户端 missing-baseline 检查要求新 upsert
+/// 携带 x/y/z/dimension。字段清除(clear_fields)始终保留,与位置无关。
+fn strip_player_positions(patch: &mut Patch, delivered: &SnapshotFull) {
+    let Some(scope) = &mut patch.players else {
+        return;
+    };
+    scope.upsert.retain_mut(|upsert| {
+        let Some(old) = delivered.players.get(&upsert.id) else {
+            return true;
+        };
+        let new = upsert.data.take().expect("upsert carries delta");
+        upsert.data = Some(PlayerDelta {
+            x: None,
+            y: None,
+            z: None,
+            vx: None,
+            vy: None,
+            vz: None,
+            dimension: None,
+            player_name: changed_field(&new.player_name, &old.player_name),
+            player_uuid: changed_field(&new.player_uuid, &old.player_uuid),
+            health: changed_field(&new.health, &old.health),
+            max_health: changed_field(&new.max_health, &old.max_health),
+            armor: changed_field(&new.armor, &old.armor),
+            is_riding: changed_field(&new.is_riding, &old.is_riding),
+            width: changed_field(&new.width, &old.width),
+            height: changed_field(&new.height, &old.height),
+            position_source_id: changed_field(&new.position_source_id, &old.position_source_id),
+            position_source_kind: changed_field(
+                &new.position_source_kind,
+                &old.position_source_kind,
+            ),
+            position_source_display_name: changed_field(
+                &new.position_source_display_name,
+                &old.position_source_display_name,
+            ),
+            position_resolution: changed_field(
+                &new.position_resolution,
+                &old.position_resolution,
+            ),
+        });
+        // 剥离后不再携带任何字段的 upsert 无信息量,丢弃
+        upsert.data.as_ref().is_some_and(|delta| *delta != PlayerDelta::default())
+            || !upsert.clear_fields.is_empty()
+    });
+    if scope.upsert.is_empty() && scope.delete.is_empty() {
+        patch.players = None;
+    }
+}
+
+/// 基线 diff:字段值未变化返回 None(不下发),变化则携带新值。
+fn changed_field<T: PartialEq + Clone>(new: &Option<T>, old: &Option<T>) -> Option<T> {
+    if new == old { None } else { new.clone() }
+}
+
+fn patch_is_empty(patch: &Patch) -> bool {
+    patch.players.is_none()
+        && patch.entities.is_none()
+        && patch.waypoints.is_none()
+        && patch.battle_chunks.is_none()
+        && patch.last_seen_players.is_none()
+        && patch.player_marks.is_none()
+        && patch.tab_state_patch.is_none()
+        && patch.connections.is_none()
+}
+
+/// 从快照编码 movement 批:全部活跃玩家的绝对值 upsert,按编码体积切成
+/// 条目对齐的块。upsert 不携带 clear_fields(快照即全部字段),同 ID 的
+/// 条目永不跨块,客户端按块原子应用。
+///
+/// 块数受 [`MOVEMENT_MAX_CHUNKS_PER_TICK`] 约束:超大花名册溢出的玩家本 tick
+/// 不占 datagram,由可靠流的低频位置刷新兜底,绝对值语义保证不产生污染。
+fn movement_batch(target: &SnapshotFull) -> MovementBatch {
+    let mut ids: Vec<&String> = target.players.keys().collect();
+    ids.sort();
+    let mut chunks: Vec<Arc<[u8]>> = Vec::new();
+    let mut current: Vec<PlayerUpsert> = Vec::new();
+    let mut current_bytes = 0_usize;
+    for id in ids {
+        if chunks.len() >= MOVEMENT_MAX_CHUNKS_PER_TICK {
+            break;
+        }
+        let value = &target.players[id.as_str()];
+        let upsert = player_upsert(id, value, None);
+        // +4:envelope 内 repeated 字段的 tag 与 varint 长度前缀的保守余量
+        let entry_bytes = upsert.encoded_len() + 4;
+        if !current.is_empty() && current_bytes + entry_bytes > MOVEMENT_CHUNK_MAX_BYTES {
+            flush_movement_chunk(&mut current, &mut chunks);
+            current_bytes = 0;
+        }
+        current_bytes += entry_bytes;
+        current.push(upsert);
+    }
+    flush_movement_chunk(&mut current, &mut chunks);
+    MovementBatch {
+        chunks: chunks.into(),
+    }
+}
+
+fn flush_movement_chunk(current: &mut Vec<PlayerUpsert>, chunks: &mut Vec<Arc<[u8]>>) {
+    if current.is_empty() {
+        return;
+    }
+    let patch = Patch {
+        players: Some(PlayerPatchScope {
+            upsert: std::mem::take(current),
+            delete: Vec::new(),
+        }),
+        ..Default::default()
+    };
+    chunks.push(encode_payload(
+        WireChannel::WebMap,
+        wire_envelope::Payload::Patch(patch),
+    ));
 }
 
 fn battle_missing_fields(value: &BattleChunkValue, include_mode: bool) -> Vec<String> {
@@ -4437,6 +4622,9 @@ mod tests {
                 delivered_battle_revision: 0,
                 next_digest_at: Instant::now(),
                 force_full: true,
+                movement: watch::channel(None).0,
+                unreliable_positions: false,
+                last_position_refresh: Instant::now(),
                 tab_history_subscribed: false,
             },
         );
@@ -4767,6 +4955,7 @@ mod tests {
             false,
             Some(&delivered),
             0,
+            false,
             &target,
             Some(&cache),
         )
@@ -4782,6 +4971,7 @@ mod tests {
                 false,
                 Some(&delivered),
                 cache.revision,
+                false,
                 &target,
                 Some(&cache),
             )
@@ -4795,6 +4985,7 @@ mod tests {
                 false,
                 Some(&delivered),
                 0,
+                false,
                 &target,
                 Some(&cache),
             ),
@@ -4811,6 +5002,7 @@ mod tests {
                 false,
                 Some(&delivered),
                 delivered_revision,
+                false,
                 &target,
                 Some(&cache),
             )
@@ -4856,6 +5048,7 @@ mod tests {
             false,
             Some(&delivered),
             cache.revision,
+            false,
             &target,
             Some(&cache),
         );
@@ -4872,6 +5065,7 @@ mod tests {
                 false,
                 Some(&delivered),
                 cache.revision,
+                false,
                 &target,
                 Some(&cache),
             )
@@ -5275,5 +5469,136 @@ mod tests {
             relay.allowed_sources_for_player("source-c", &grouping),
             HashSet::from(["source-c".to_owned()])
         );
+    }
+
+    fn add_player(
+        players: &mut HashMap<String, PlayerData>,
+        id: &str,
+        name: &str,
+        x: f64,
+        health: f64,
+    ) {
+        players.insert(
+            id.to_owned(),
+            PlayerData {
+                x,
+                y: 64.0,
+                z: -x,
+                vx: Some(0.5),
+                vy: Some(0.0),
+                vz: Some(-0.5),
+                dimension: "minecraft:overworld".to_owned(),
+                player_name: Some(name.to_owned()),
+                player_uuid: Some(format!("uuid-{id}")),
+                health: Some(health),
+                max_health: Some(20.0),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// 剥离规则:纯移动的既有玩家 upsert 整体丢弃;仅非位置字段变化的保留
+    /// 最小增量(无位置字段);新玩家保留全字段(missing-baseline 检查依赖)。
+    #[test]
+    fn strip_player_positions_keeps_minimal_delta_and_new_players() {
+        let mut delivered = SnapshotFull::default();
+        add_player(&mut delivered.players, "moved", "Moved", 1.0, 20.0);
+        add_player(&mut delivered.players, "hurt", "Hurt", 2.0, 20.0);
+        let mut target = delivered.clone();
+        target.players.get_mut("moved").expect("moved").x = 5.0;
+        target.players.get_mut("hurt").expect("hurt").health = Some(9.0);
+        add_player(&mut target.players, "newcomer", "New", 3.0, 20.0);
+
+        let mut patch = build_patch(&delivered, &target).expect("changed players");
+        strip_player_positions(&mut patch, &delivered);
+
+        let scope = patch.players.expect("players scope");
+        let upserts: HashMap<&str, &PlayerUpsert> = scope
+            .upsert
+            .iter()
+            .map(|upsert| (upsert.id.as_str(), upsert))
+            .collect();
+        // 纯位置变化:整体丢弃
+        assert!(!upserts.contains_key("moved"));
+        // 血量变化:保留最小增量,无任何位置字段
+        let hurt = upserts["hurt"].data.as_ref().expect("delta");
+        assert_eq!(hurt.health, Some(9.0));
+        assert_eq!(hurt.x, None);
+        assert_eq!(hurt.dimension, None);
+        assert_eq!(upserts["hurt"].clear_fields, Vec::<String>::new());
+        // 新玩家:保留全字段
+        let newcomer = upserts["newcomer"].data.as_ref().expect("delta");
+        assert_eq!(newcomer.x, Some(3.0));
+        assert_eq!(
+            newcomer.dimension.as_deref(),
+            Some("minecraft:overworld")
+        );
+        assert_eq!(scope.delete, Vec::<String>::new());
+    }
+
+    /// 位置字段被清除(字段消失而非值变化)同样走保留路径:clear_fields 表达删除。
+    #[test]
+    fn strip_player_positions_preserves_clear_fields() {
+        let mut delivered = SnapshotFull::default();
+        add_player(&mut delivered.players, "p", "P", 1.0, 20.0);
+        delivered
+            .players
+            .get_mut("p")
+            .expect("player")
+            .position_source_id = Some("source-1".to_owned());
+        let mut target = delivered.clone();
+        let player = target.players.get_mut("p").expect("player");
+        player.position_source_id = None;
+        player.x = 9.0;
+
+        let mut patch = build_patch(&delivered, &target).expect("changed player");
+        strip_player_positions(&mut patch, &delivered);
+
+        let scope = patch.players.expect("players scope");
+        assert_eq!(scope.upsert.len(), 1);
+        let delta = scope.upsert[0].data.as_ref().expect("delta");
+        assert_eq!(delta.x, None);
+        assert_eq!(scope.upsert[0].clear_fields, ["positionSourceId"]);
+    }
+
+    /// movement 批:绝对值 upsert、条目对齐切块、不超过单 tick 块数上限。
+    #[test]
+    fn movement_batch_packs_entry_aligned_chunks_within_budget() {
+        let mut target = SnapshotFull::default();
+        for index in 0..36 {
+            let name = format!("{:0>180}", index); // 拉大单条编码体积,强制多块
+            add_player(
+                &mut target.players,
+                &format!("p{index}"),
+                &name,
+                index as f64,
+                20.0,
+            );
+        }
+
+        let batch = movement_batch(&target);
+        assert!(!batch.chunks.is_empty());
+        assert!(batch.chunks.len() <= MOVEMENT_MAX_CHUNKS_PER_TICK);
+
+        let mut seen_ids = HashSet::new();
+        for chunk in batch.chunks.iter() {
+            assert!(chunk.len() <= MOVEMENT_CHUNK_MAX_BYTES + 64);
+            let envelope = WireEnvelope::decode(chunk.as_ref()).expect("envelope");
+            assert_eq!(envelope.channel, WireChannel::WebMap as i32);
+            let wire_envelope::Payload::Patch(patch) = envelope.payload.expect("payload") else {
+                panic!("movement chunk carries a patch");
+            };
+            let scope = patch.players.expect("players scope");
+            assert!(scope.delete.is_empty());
+            for upsert in scope.upsert {
+                assert!(seen_ids.insert(upsert.id), "player split across chunks");
+                let delta = upsert.data.as_ref().expect("absolute delta");
+                // 绝对值:坐标与维度始终在场,客户端丢帧也不会污染状态
+                assert!(delta.x.is_some() && delta.dimension.is_some());
+            }
+        }
+        // 预算上限只在本 tick 截断,不丢人:花名册内的玩家要么本 tick 出现,
+        // 要么下 tick 重发(绝对值语义),这里 36 人应全部命中
+        assert_eq!(seen_ids.len(), target.players.len());
     }
 }

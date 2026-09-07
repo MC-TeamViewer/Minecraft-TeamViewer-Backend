@@ -16,6 +16,7 @@ pub struct RuntimeConfig {
     pub refresh_lead_sec: f64,
     pub refresh_max_items: usize,
     pub digest_interval_sec: u64,
+    pub movement_refresh_sec: u64,
     pub default_broadcast_hz: f64,
     pub min_broadcast_hz: f64,
     pub congestion_levels: Vec<(usize, f64)>,
@@ -280,6 +281,8 @@ impl Default for RefreshConfig {
 struct ProtocolConfig {
     #[serde(rename = "digestIntervalSec")]
     digest_interval_sec: u64,
+    #[serde(rename = "movementRefreshSec")]
+    movement_refresh_sec: u64,
     #[serde(rename = "defaultBroadcastHz")]
     default_broadcast_hz: f64,
     #[serde(rename = "minBroadcastHz")]
@@ -294,6 +297,7 @@ impl Default for ProtocolConfig {
     fn default() -> Self {
         Self {
             digest_interval_sec: 10,
+            movement_refresh_sec: 10,
             default_broadcast_hz: 20.0,
             min_broadcast_hz: 2.0,
             tab_report_timeout_sec: 45,
@@ -393,6 +397,10 @@ impl RuntimeConfig {
             refresh_lead_sec: parsed.refresh_request.lead_sec.clamp(0.1, 30.0),
             refresh_max_items: parsed.refresh_request.max_items_per_scope.clamp(1, 500),
             digest_interval_sec: parsed.protocol.digest_interval_sec.clamp(1, 120),
+            movement_refresh_sec: env_string("TEAMVIEWER_MOVEMENT_REFRESH_SEC")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(parsed.protocol.movement_refresh_sec)
+                .clamp(1, 3_600),
             default_broadcast_hz: parsed.protocol.default_broadcast_hz.clamp(1.0, 120.0),
             min_broadcast_hz: parsed.protocol.min_broadcast_hz.clamp(0.5, 60.0),
             congestion_levels,

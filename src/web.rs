@@ -47,8 +47,8 @@ use crate::{
     proxy_ip::effective_remote_addr,
     relationship_store::RelationshipStore,
     relay::{
-        CONTROL_CAPACITY, ConnectionKind, RegisterConnection, RelayEvent, RelayHandle, StateFrame,
-        encode_payload,
+        CONTROL_CAPACITY, ConnectionKind, MovementBatch, RegisterConnection, RelayEvent,
+        RelayHandle, StateFrame, encode_payload,
     },
     tab_history::{
         DEFAULT_CHUNK_ENTRIES, MAX_CHUNK_BYTES, MAX_CHUNK_ENTRIES, MAX_LOOKUP_SELECTORS,
@@ -85,7 +85,7 @@ impl Stream for WebMapFrameStream {
 const PROGRAM_VERSION: &str = concat!(
     "team-view-relay-rust-v",
     env!("CARGO_PKG_VERSION"),
-    "-proto0.8.0"
+    "-proto0.8.1"
 );
 
 #[derive(Clone)]
@@ -266,6 +266,8 @@ pub async fn serve_web_map_session<Si>(
     mut writer_sink: Si,
     state: AppState,
     remote_addr: String,
+    movement_tx: watch::Sender<Option<Arc<MovementBatch>>>,
+    datagram_capable: bool,
 ) where
     Si: Sink<Bytes, Error = io::Error> + Unpin + Send + 'static,
 {
@@ -293,6 +295,7 @@ pub async fn serve_web_map_session<Si>(
         position_resolution,
         program_version,
         complete_online_roster,
+        unreliable_positions,
     ) = match (ConnectionKind::WebMap, envelope.payload) {
         (
             ConnectionKind::WebMap,
@@ -315,6 +318,11 @@ pub async fn serve_web_map_session<Si>(
                 None,
                 handshake.local_program_version,
                 false,
+                // 客户端声明可消费 datagram 位置 且 本连接 datagram 预算装得下 movement 块
+                handshake
+                    .accepts_unreliable_positions
+                    .unwrap_or(false)
+                    && datagram_capable,
             )
         }
         _ => {
@@ -407,6 +415,8 @@ pub async fn serve_web_map_session<Si>(
             remote_addr: remote_addr.clone(),
             control: control_tx.clone(),
             state: state_tx,
+            movement: movement_tx,
+            unreliable_positions,
         }))
         .await
         .is_err()
@@ -703,6 +713,8 @@ async fn serve_socket(
 
     let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
     let (state_tx, state_rx) = watch::channel(None::<StateFrame>);
+    // WS 没有 datagram 通道:即便客户端声明 accepts_unreliable_positions 也不启用分流
+    let (movement_tx, _movement_rx) = watch::channel(None);
     if state
         .relay
         .send(RelayEvent::Register(RegisterConnection {
@@ -716,6 +728,8 @@ async fn serve_socket(
             remote_addr: remote_addr.clone(),
             control: control_tx.clone(),
             state: state_tx,
+            movement: movement_tx,
+            unreliable_positions: false,
         }))
         .await
         .is_err()

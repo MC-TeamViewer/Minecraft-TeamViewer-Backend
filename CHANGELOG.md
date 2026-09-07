@@ -5,6 +5,13 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。Backend 版本与网络协议版本分别演进；版本标题中的
 `protoX.Y.Z` 表示该 Backend 发布时使用的协议版本，而不是 Backend 版本的一部分。
 
+## [1.2.0-alpha.4-proto0.8.1] - 2026-09-07
+
+### 新增
+
+- WebTransport 位置分流（协议 `0.8.1`，新增 `WebMapHandshakeRequest.accepts_unreliable_positions`）：声明能力且连接 datagram 预算足够的网页地图会话，逐 tick 玩家位置改走不可靠 QUIC datagram（绝对值 upsert，丢失即被下 tick 覆盖，不重传），同时可靠补丁剥离既有玩家的位置字段、只保留真正变化的非位置增量；新玩家全字段 upsert 与低频（默认 10 秒，`[protocol] movementRefreshSec` / `TEAMVIEWER_MOVEMENT_REFRESH_SEC` 可调）保底全位置刷新仍走可靠流，兼容旧客户端与 WebSocket 连接（行为不变）。
+- movement 批按 ≤1024 字节条目对齐切块编码一次、跨连接共享，单 tick 最多 16 块；datagram 帧格式与可靠流一致（4 字节长度前缀 + protobuf envelope），路径 MTU 收缩时跳过装不下的块、由下个 dirty tick 重发自愈。
+
 ## [1.2.0-alpha.3-proto0.8.0] - 2026-09-07
 
 ### 修复

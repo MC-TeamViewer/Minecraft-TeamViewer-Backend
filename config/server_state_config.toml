@@ -26,6 +26,10 @@ maxItemsPerScope = 64
 [protocol]
 # digest 下发间隔（秒）
 digestIntervalSec = 10
+# WebTransport 位置分流下,可靠补丁携带完整玩家位置的保底刷新间隔（秒）。
+# 支持 datagram 的连接,逐 tick 位置改走不可靠 datagram,可靠流仅低频携带全位置兜底。
+# 环境变量 TEAMVIEWER_MOVEMENT_REFRESH_SEC 可覆盖。
+movementRefreshSec = 10
 # 默认广播频率（Hz）
 defaultBroadcastHz = 20.0
 # 广播频率下限（Hz）

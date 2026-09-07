@@ -13,7 +13,9 @@ use futures_util::{Sink, Stream};
 use std::future::Future;
 
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
+use wtransport::error::SendDatagramError;
 use wtransport::tls::rustls::{
     ServerConfig as TlsServerConfig,
     crypto::{CryptoProvider, ring::default_provider as ring_provider},
@@ -32,6 +34,7 @@ use x509_parser::prelude::{GeneralName, parse_x509_certificate, parse_x509_pem};
 
 use crate::{
     config::{CertIdentity, WebTransportConfig},
+    relay::{MovementBatch, MOVEMENT_CHUNK_MAX_BYTES},
     web::{self, WebMapFrameStream},
 };
 
@@ -143,12 +146,20 @@ async fn accept_session(
         user_agent = user_agent.as_deref().unwrap_or("unknown"),
         "WebTransport session accepted"
     );
-    let (control_rx, state_sink) = stream_bridge(connection);
+    // max_datagram_size 已扣除 WebTransport Datagram 头,返回值即应用层预算;
+    // None 表示对端未协商 datagram 扩展。再预留 4B 应用层长度前缀。
+    let datagram_capable = connection
+        .max_datagram_size()
+        .is_some_and(|size| size >= MOVEMENT_CHUNK_MAX_BYTES + 4);
+    let (movement_tx, movement_rx) = watch::channel(None::<Arc<MovementBatch>>);
+    let (control_rx, state_sink) = stream_bridge(connection, movement_rx);
     web::serve_web_map_session(
         WebMapFrameStream::new(MpscReceiver::new(control_rx)),
         MpscSink::new(state_sink),
         state,
         remote_addr,
+        movement_tx,
+        datagram_capable,
     )
     .await;
     Ok(())
@@ -156,6 +167,7 @@ async fn accept_session(
 
 fn stream_bridge(
     connection: wtransport::Connection,
+    mut movement_rx: watch::Receiver<Option<Arc<MovementBatch>>>,
 ) -> (
     mpsc::Receiver<Result<Bytes, io::Error>>,
     mpsc::Sender<Bytes>,
@@ -164,6 +176,55 @@ fn stream_bridge(
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Bytes>(256);
     let read_connection = connection.clone();
     let write_connection = connection.clone();
+
+    // 位置 datagram 发送任务:relay 每 dirty tick 经 movement watch 发布
+    // 预切好的 movement 批,这里逐块装入单个 datagram(4B 长度前缀 + WireEnvelope,
+    // 与可靠流帧格式一致)。块在编码侧已按 ≤MOVEMENT_CHUNK_MAX_BYTES 切好;
+    // 路径 MTU 收缩触发 TooLarge 时重查预算,装不下的块跳过——下个 dirty tick
+    // 全量重发,不需要重传。
+    let send_connection = connection.clone();
+    tokio::spawn(async move {
+        loop {
+            if movement_rx.changed().await.is_err() {
+                return;
+            }
+            let Some(batch) = movement_rx.borrow_and_update().clone() else {
+                continue;
+            };
+            let mut max_size = send_connection.max_datagram_size();
+            for chunk in batch.chunks.iter() {
+                let frame_len = chunk.len() + 4;
+                if !max_size.is_some_and(|size| frame_len <= size) {
+                    max_size = send_connection.max_datagram_size();
+                    if !max_size.is_some_and(|size| frame_len <= size) {
+                        continue;
+                    }
+                }
+                let mut datagram = BytesMut::with_capacity(frame_len);
+                datagram.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
+                datagram.extend_from_slice(chunk);
+                match send_connection.send_datagram(datagram.freeze()) {
+                    Ok(()) => {}
+                    // 握手时已确认对端支持 datagram;UnsupportedByPeer/NotConnected
+                    // 意味着会话已死,停发即可——可靠流的低频位置刷新兜底
+                    Err(SendDatagramError::TooLarge) => continue,
+                    Err(error) => {
+                        debug!(%error, "WebTransport datagram send stopped");
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    // 收方向 datagram 排空:web 脚本不回发 datagram,但必须持续读取,
+    // 否则对端发送缓冲堆积会触发其丢弃或流控
+    let drain_connection = connection.clone();
+    tokio::spawn(async move {
+        while let Ok(datagram) = drain_connection.receive_datagram().await {
+            drop(datagram);
+        }
+    });
 
     tokio::spawn(async move {
         let control = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_connection.accept_bi()).await;
@@ -1063,7 +1124,8 @@ mod tests {
                 .expect("incoming timeout")
                 .expect("session request");
             let connection = request.accept().await.expect("session accepted");
-            let bridge = stream_bridge(connection);
+            let (_movement_tx, movement_rx) = watch::channel(None);
+            let bridge = stream_bridge(connection, movement_rx);
             bridges_tx.send(bridge).await.ok();
         });
         let _ = runtime;
@@ -1123,5 +1185,89 @@ mod tests {
             !matches!(&probed, Ok(Ok(Some(_)))),
             "control stream server direction unexpectedly carried data"
         );
+    }
+
+    /// 集成测试:relay 经 movement watch 发布的批,必须原样作为 datagram
+    /// 到达客户端(4B 长度前缀 + WireEnvelope,与可靠流帧格式一致)。
+    #[tokio::test]
+    async fn movement_batches_flow_as_datagrams() {
+        let dir = temp_dir("datagram");
+        let cert = write_test_cert(&dir, "a", &["a.example.com"]);
+        let config = wt_config(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            vec![cert_identity(&cert, true)],
+            7 * 24 * 60 * 60,
+        );
+        let (runtime, server_config) = CertRuntime::load(&config).await.expect("load");
+        let endpoint = Endpoint::server(server_config).expect("server endpoint");
+        let addr = endpoint.local_addr().expect("local addr");
+        let (sessions_tx, mut sessions_rx) = tokio::sync::mpsc::channel::<(
+            mpsc::Receiver<Result<Bytes, io::Error>>,
+            mpsc::Sender<Bytes>,
+            watch::Sender<Option<Arc<MovementBatch>>>,
+        )>(1);
+        tokio::spawn(async move {
+            let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, endpoint.accept().await)
+                .await
+                .expect("incoming timeout")
+                .expect("session request");
+            let connection = request.accept().await.expect("session accepted");
+            let (movement_tx, movement_rx) = watch::channel(None);
+            let bridge = stream_bridge(connection, movement_rx);
+            sessions_tx.send((bridge.0, bridge.1, movement_tx)).await.ok();
+        });
+        let _ = runtime;
+
+        let client_config = ClientConfig::builder()
+            .with_bind_default()
+            .with_server_certificate_hashes([cert.digest.clone()])
+            .dns_resolver(StaticDnsResolver)
+            .build();
+        let client = Endpoint::client(client_config).expect("client endpoint");
+        let url = format!("https://a.example.com:{}{WEB_TRANSPORT_PATH}", addr.port());
+        let session = client.connect(url).await.expect("connect");
+
+        // 客户端打开控制流触发 bridge 建立
+        let control = session.open_bi().await.expect("open bi");
+        let (mut control_send, _control_recv) = control.await.expect("bi stream");
+        write_frame(&mut control_send, Bytes::from_static(b"h"))
+            .await
+            .expect("control write");
+
+        let (_incoming_rx, _outgoing_tx, movement_tx) =
+            tokio::time::timeout(Duration::from_secs(5), sessions_rx.recv())
+                .await
+                .expect("bridge ready")
+                .expect("bridge channels");
+
+        // relay 侧发布一个 movement 批(两块);块本身是裸 WireEnvelope 编码,
+        // 长度前缀由 datagram 发送端包装
+        let chunk_a: Arc<[u8]> = Bytes::from_static(b"abc").to_vec().into();
+        let chunk_b: Arc<[u8]> = Bytes::from_static(b"xyz").to_vec().into();
+        movement_tx.send_replace(Some(Arc::new(MovementBatch {
+            chunks: Vec::from([chunk_a, chunk_b]).into(),
+        })));
+
+        // 客户端按序收到两个 datagram,载荷 = 4B 长度前缀 + 块
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            let datagram = tokio::time::timeout(Duration::from_secs(5), session.receive_datagram())
+                .await
+                .expect("datagram timeout")
+                .expect("datagram ok");
+            received.push(datagram.payload().to_vec());
+        }
+        assert_eq!(received[0], {
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&3u32.to_be_bytes());
+            expected.extend_from_slice(b"abc");
+            expected
+        });
+        assert_eq!(received[1], {
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&3u32.to_be_bytes());
+            expected.extend_from_slice(b"xyz");
+            expected
+        });
     }
 }
