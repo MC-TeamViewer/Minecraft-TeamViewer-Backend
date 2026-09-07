@@ -8,9 +8,8 @@ use std::{
 };
 
 use anyhow::Context as AnyhowContext;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::Bytes;
 use futures_util::{Sink, Stream};
-use std::future::Future;
 
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -23,17 +22,13 @@ use wtransport::tls::rustls::{
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
-use wtransport::{
-    Endpoint, Identity, ServerConfig,
-    endpoint::IncomingSession,
-    error::{StreamReadError, StreamWriteError},
-    stream::{RecvStream, SendStream},
-};
+use wtransport::{Endpoint, Identity, ServerConfig, endpoint::IncomingSession};
 
 use x509_parser::prelude::{GeneralName, parse_x509_certificate, parse_x509_pem};
 
 use crate::{
     config::{CertIdentity, WebTransportConfig},
+    frame,
     relay::{MOVEMENT_CHUNK_MAX_BYTES, MovementBatch},
     web::{self, WebMapFrameStream},
 };
@@ -93,7 +88,6 @@ impl Sink<Bytes> for MpscSink {
 const WEB_TRANSPORT_PATH: &str = "/web-map/wt";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
 
 pub async fn serve(config: WebTransportConfig, state: crate::web::AppState) -> anyhow::Result<()> {
     let (runtime, server_config) = CertRuntime::load(&config).await?;
@@ -147,10 +141,10 @@ async fn accept_session(
         "WebTransport session accepted"
     );
     // max_datagram_size 已扣除 WebTransport Datagram 头,返回值即应用层预算;
-    // None 表示对端未协商 datagram 扩展。再预留 4B 应用层长度前缀。
+    // None 表示对端未协商 datagram 扩展。datagram 自带报文边界,无应用层前缀。
     let datagram_capable = connection
         .max_datagram_size()
-        .is_some_and(|size| size >= MOVEMENT_CHUNK_MAX_BYTES + 4);
+        .is_some_and(|size| size >= MOVEMENT_CHUNK_MAX_BYTES);
     let (movement_tx, movement_rx) = watch::channel(None::<Arc<MovementBatch>>);
     let (control_rx, state_sink) = stream_bridge(connection, movement_rx);
     web::serve_web_map_session(
@@ -178,8 +172,9 @@ fn stream_bridge(
     let write_connection = connection.clone();
 
     // 位置 datagram 发送任务:relay 每 dirty tick 经 movement watch 发布
-    // 预切好的 movement 批,这里逐块装入单个 datagram(4B 长度前缀 + WireEnvelope,
-    // 与可靠流帧格式一致)。块在编码侧已按 ≤MOVEMENT_CHUNK_MAX_BYTES 切好;
+    // 预切好的 movement 批,这里逐块装入单个 datagram——裸 WireEnvelope,
+    // 无应用层长度前缀(datagram 自带报文边界,alpha.5 起,与流分帧解耦)。
+    // 块在编码侧已按 ≤MOVEMENT_CHUNK_MAX_BYTES 切好;
     // 路径 MTU 收缩触发 TooLarge 时重查预算,装不下的块跳过——下个 dirty tick
     // 全量重发,不需要重传。
     let send_connection = connection.clone();
@@ -193,17 +188,15 @@ fn stream_bridge(
             };
             let mut max_size = send_connection.max_datagram_size();
             for chunk in batch.chunks.iter() {
-                let frame_len = chunk.len() + 4;
+                let frame_len = chunk.len();
                 if !max_size.is_some_and(|size| frame_len <= size) {
                     max_size = send_connection.max_datagram_size();
                     if !max_size.is_some_and(|size| frame_len <= size) {
                         continue;
                     }
                 }
-                let mut datagram = BytesMut::with_capacity(frame_len);
-                datagram.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
-                datagram.extend_from_slice(chunk);
-                match send_connection.send_datagram(datagram.freeze()) {
+                let datagram = Bytes::copy_from_slice(chunk);
+                match send_connection.send_datagram(datagram) {
                     Ok(()) => {}
                     // 握手时已确认对端支持 datagram;UnsupportedByPeer/NotConnected
                     // 意味着会话已死,停发即可——可靠流的低频位置刷新兜底
@@ -261,7 +254,7 @@ fn stream_bridge(
         };
 
         let reader = tokio::spawn(async move {
-            if let Err(error) = read_frames(&mut recv, |frame| {
+            if let Err(error) = frame::read_frames(&mut recv, |frame| {
                 let incoming_tx = incoming_tx.clone();
                 async move { incoming_tx.send(Ok(frame)).await.is_ok() }
             })
@@ -276,10 +269,12 @@ fn stream_bridge(
         });
 
         while let Some(payload) = outgoing_rx.recv().await {
-            let result =
-                tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut state_stream, payload))
-                    .await
-                    .unwrap_or(Err(StreamWriteError::QuicProto));
+            let result = tokio::time::timeout(
+                WRITE_TIMEOUT,
+                frame::write_frame(&mut state_stream, &payload),
+            )
+            .await
+            .unwrap_or(Err(io::Error::other("state stream write timeout")));
             if let Err(error) = result {
                 debug!(%error, "WebTransport state write failed");
                 break;
@@ -647,56 +642,6 @@ fn parse_not_after(cert_bytes: &[u8]) -> anyhow::Result<SystemTime> {
     Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(timestamp))
 }
 
-async fn read_frames<F, Fut>(
-    stream: &mut RecvStream,
-    mut on_frame: F,
-) -> Result<(), StreamReadError>
-where
-    F: FnMut(Bytes) -> Fut,
-    Fut: Future<Output = bool>,
-{
-    let mut buffer = BytesMut::new();
-    let mut chunk = [0u8; 16 * 1024];
-    loop {
-        while let Some((length, payload)) = split_frame_length(&buffer) {
-            let frame = payload.to_vec();
-            buffer.advance(4 + length);
-            if !on_frame(Bytes::from(frame)).await {
-                return Ok(());
-            }
-        }
-        let read = stream.read(&mut chunk).await?;
-        let Some(read) = read else {
-            return Ok(());
-        };
-        buffer.extend_from_slice(&chunk[..read]);
-    }
-}
-
-fn split_frame_length(buffer: &[u8]) -> Option<(usize, &[u8])> {
-    if buffer.len() < 4 {
-        return None;
-    }
-    let length = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
-    if length > MAX_FRAME_LEN {
-        return None;
-    }
-    let end = 4usize.checked_add(length)?;
-    if buffer.len() < end {
-        return None;
-    }
-    Some((length, &buffer[4..end]))
-}
-
-async fn write_frame(stream: &mut SendStream, payload: Bytes) -> Result<(), StreamWriteError> {
-    let length = u32::try_from(payload.len())
-        .map_err(|_| StreamWriteError::QuicProto)?
-        .to_be_bytes();
-    stream.write_all(&length).await?;
-    stream.write_all(&payload).await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,6 +653,7 @@ mod tests {
     };
 
     use wtransport::config::{ClientConfig, DnsLookupFuture, DnsResolver};
+    use wtransport::stream::RecvStream;
     use wtransport::tls::Sha256Digest;
 
     // ---------- 单元测试:纯函数 ----------
@@ -732,20 +678,30 @@ mod tests {
     }
 
     #[test]
-    fn splits_length_prefixed_frames_from_partial_buffer() {
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&7u32.to_be_bytes());
-        frame.extend_from_slice(b"web-map");
-        let (length, payload) = split_frame_length(&frame).expect("complete frame");
-        assert_eq!(length, 7);
-        assert_eq!(payload, b"web-map");
-        assert!(split_frame_length(&frame[..8]).is_none());
+    fn splits_varint_prefixed_frames() {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&[0x07]);
+        wire.extend_from_slice(b"web-map");
+        match frame::split_frame_header(&wire) {
+            frame::FrameScan::Complete {
+                header_len,
+                payload_len,
+            } => {
+                assert_eq!(header_len, 1);
+                assert_eq!(payload_len, 7);
+            }
+            other => panic!("expected complete frame, got {other:?}"),
+        }
     }
 
     #[test]
     fn rejects_oversized_frames() {
-        let frame = (MAX_FRAME_LEN as u32 + 1).to_be_bytes();
-        assert!(split_frame_length(&frame).is_none());
+        // 4 字节 varint,值 = MAX_FRAME_LEN + 1
+        let frame = [0x81u8, 0x80, 0x80, 0x04];
+        assert!(matches!(
+            frame::split_frame_header(&frame),
+            frame::FrameScan::Malformed
+        ));
     }
 
     #[test]
@@ -1142,7 +1098,7 @@ mod tests {
         // 客户端打开控制流并发送一帧
         let control = session.open_bi().await.expect("open bi");
         let (mut control_send, mut control_recv) = control.await.expect("bi stream");
-        write_frame(&mut control_send, Bytes::from_static(b"h"))
+        frame::write_frame(&mut control_send, b"h")
             .await
             .expect("control write");
 
@@ -1168,11 +1124,11 @@ mod tests {
             .send(Bytes::from_static(b"state"))
             .await
             .expect("outgoing send");
-        let mut header = [0u8; 4];
+        // varint 长度头:5 字节 payload 恰为单字节 0x05
+        let mut header = [0u8; 1];
         read_exact(&mut uni_recv, &mut header).await;
-        let length = u32::from_be_bytes(header) as usize;
-        assert_eq!(length, 5);
-        let mut payload = vec![0u8; length];
+        assert_eq!(header[0], 5);
+        let mut payload = vec![0u8; 5];
         read_exact(&mut uni_recv, &mut payload).await;
         assert_eq!(&payload, b"state");
 
@@ -1188,7 +1144,7 @@ mod tests {
     }
 
     /// 集成测试:relay 经 movement watch 发布的批,必须原样作为 datagram
-    /// 到达客户端(4B 长度前缀 + WireEnvelope,与可靠流帧格式一致)。
+    /// 到达客户端(裸 WireEnvelope,无长度前缀;datagram 自带报文边界)。
     #[tokio::test]
     async fn movement_batches_flow_as_datagrams() {
         let dir = temp_dir("datagram");
@@ -1233,7 +1189,7 @@ mod tests {
         // 客户端打开控制流触发 bridge 建立
         let control = session.open_bi().await.expect("open bi");
         let (mut control_send, _control_recv) = control.await.expect("bi stream");
-        write_frame(&mut control_send, Bytes::from_static(b"h"))
+        frame::write_frame(&mut control_send, b"h")
             .await
             .expect("control write");
 
@@ -1243,15 +1199,14 @@ mod tests {
                 .expect("bridge ready")
                 .expect("bridge channels");
 
-        // relay 侧发布一个 movement 批(两块);块本身是裸 WireEnvelope 编码,
-        // 长度前缀由 datagram 发送端包装
+        // relay 侧发布一个 movement 批(两块);块即 datagram 载荷本身
         let chunk_a: Arc<[u8]> = Bytes::from_static(b"abc").to_vec().into();
         let chunk_b: Arc<[u8]> = Bytes::from_static(b"xyz").to_vec().into();
         movement_tx.send_replace(Some(Arc::new(MovementBatch {
             chunks: Vec::from([chunk_a, chunk_b]).into(),
         })));
 
-        // 客户端按序收到两个 datagram,载荷 = 4B 长度前缀 + 块
+        // 客户端按序收到两个 datagram,载荷 = 裸块(无长度前缀)
         let mut received = Vec::new();
         for _ in 0..2 {
             let datagram = tokio::time::timeout(Duration::from_secs(5), session.receive_datagram())
@@ -1260,17 +1215,7 @@ mod tests {
                 .expect("datagram ok");
             received.push(datagram.payload().to_vec());
         }
-        assert_eq!(received[0], {
-            let mut expected = Vec::new();
-            expected.extend_from_slice(&3u32.to_be_bytes());
-            expected.extend_from_slice(b"abc");
-            expected
-        });
-        assert_eq!(received[1], {
-            let mut expected = Vec::new();
-            expected.extend_from_slice(&3u32.to_be_bytes());
-            expected.extend_from_slice(b"xyz");
-            expected
-        });
+        assert_eq!(received[0], b"abc");
+        assert_eq!(received[1], b"xyz");
     }
 }

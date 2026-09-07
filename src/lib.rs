@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod config;
+pub mod frame;
 pub mod metrics;
 pub mod proto;
 pub mod protocol_compat;
