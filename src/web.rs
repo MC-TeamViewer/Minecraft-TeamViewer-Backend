@@ -319,10 +319,7 @@ pub async fn serve_web_map_session<Si>(
                 handshake.local_program_version,
                 false,
                 // 客户端声明可消费 datagram 位置 且 本连接 datagram 预算装得下 movement 块
-                handshake
-                    .accepts_unreliable_positions
-                    .unwrap_or(false)
-                    && datagram_capable,
+                handshake.accepts_unreliable_positions.unwrap_or(false) && datagram_capable,
             )
         }
         _ => {

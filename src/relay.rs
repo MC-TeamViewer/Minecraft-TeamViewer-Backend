@@ -3200,13 +3200,13 @@ fn strip_player_positions(patch: &mut Patch, delivered: &SnapshotFull) {
                 &new.position_source_display_name,
                 &old.position_source_display_name,
             ),
-            position_resolution: changed_field(
-                &new.position_resolution,
-                &old.position_resolution,
-            ),
+            position_resolution: changed_field(&new.position_resolution, &old.position_resolution),
         });
         // 剥离后不再携带任何字段的 upsert 无信息量,丢弃
-        upsert.data.as_ref().is_some_and(|delta| *delta != PlayerDelta::default())
+        upsert
+            .data
+            .as_ref()
+            .is_some_and(|delta| *delta != PlayerDelta::default())
             || !upsert.clear_fields.is_empty()
     });
     if scope.upsert.is_empty() && scope.delete.is_empty() {
@@ -5529,10 +5529,7 @@ mod tests {
         // 新玩家:保留全字段
         let newcomer = upserts["newcomer"].data.as_ref().expect("delta");
         assert_eq!(newcomer.x, Some(3.0));
-        assert_eq!(
-            newcomer.dimension.as_deref(),
-            Some("minecraft:overworld")
-        );
+        assert_eq!(newcomer.dimension.as_deref(), Some("minecraft:overworld"));
         assert_eq!(scope.delete, Vec::<String>::new());
     }
 

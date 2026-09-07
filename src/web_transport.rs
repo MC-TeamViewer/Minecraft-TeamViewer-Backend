@@ -34,7 +34,7 @@ use x509_parser::prelude::{GeneralName, parse_x509_certificate, parse_x509_pem};
 
 use crate::{
     config::{CertIdentity, WebTransportConfig},
-    relay::{MovementBatch, MOVEMENT_CHUNK_MAX_BYTES},
+    relay::{MOVEMENT_CHUNK_MAX_BYTES, MovementBatch},
     web::{self, WebMapFrameStream},
 };
 
@@ -1214,7 +1214,10 @@ mod tests {
             let connection = request.accept().await.expect("session accepted");
             let (movement_tx, movement_rx) = watch::channel(None);
             let bridge = stream_bridge(connection, movement_rx);
-            sessions_tx.send((bridge.0, bridge.1, movement_tx)).await.ok();
+            sessions_tx
+                .send((bridge.0, bridge.1, movement_tx))
+                .await
+                .ok();
         });
         let _ = runtime;
 
