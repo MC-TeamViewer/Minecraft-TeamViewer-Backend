@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 import websockets
+import zstandard
 from google.protobuf.json_format import MessageToDict
 from grpc_tools import protoc
 
@@ -271,6 +272,13 @@ def apply_players(state: dict, packet: dict) -> None:
                 player[key] = value
 
 
+def decode_wire(zstd_decoder, raw: bytes) -> bytes:
+    """压缩套下行块 → envelope 字节;plain 模式原样返回。"""
+    if zstd_decoder is None:
+        return raw
+    return zstd_decoder.decompress(raw)
+
+
 @dataclass
 class VirtualClient:
     kind: str
@@ -280,6 +288,10 @@ class VirtualClient:
     state: dict = field(default_factory=dict)
     state_frames: int = 0
     bytes_received: int = 0
+    # 压缩套(zstd)下行块解压器:每条 binary WS 消息 = 连续 zstd 流的一个
+    # 压缩块,解出 envelope 本体再进 CODEC;bytes_received 始终按线上字节
+    # 计,带宽对比才有意义。
+    zstd_chunk_decoder: object | None = None
     disconnected: bool = False
     disconnect_detail: str | None = None
     reader: asyncio.Task | None = None
@@ -299,6 +311,8 @@ class VirtualClient:
         try:
             async for raw in self.socket:
                 self.bytes_received += len(raw)
+                if self.zstd_chunk_decoder is not None:
+                    raw = self.zstd_chunk_decoder.decompress(raw)
                 packet = CODEC.decode(raw)
                 if packet.get("type") in {"snapshot_full", "patch"}:
                     self.state_frames += 1
@@ -364,16 +378,29 @@ class VirtualClient:
 
 
 class LoadRun:
-    def __init__(self, base_url: str, room: str, run_id: str) -> None:
+    def __init__(self, base_url: str, room: str, run_id: str, compression: str = "plain") -> None:
         self.ws_url = base_url.rstrip("/").replace("http://", "ws://").replace("https://", "wss://")
         self.room = room
         self.run_id = run_id
+        self.compression = compression
+        # zstd 压缩套经 WS 门原生子协议协商;plain 路径不提供子协议,
+        # 与旧版本压测行为零差异。
+        self.connect_kwargs: dict = (
+            {"subprotocols": ["teamviewrelay.zstd.v1"]}
+            if compression == "zstd"
+            else {}
+        )
         self.mods: list[VirtualClient] = []
         self.webs: list[VirtualClient] = []
         self.externals: list[VirtualClient] = []
         self.stopping = asyncio.Event()
         self.connection_attempts = 0
         self.connection_failures: list[str] = []
+
+    def _new_chunk_decoder(self):
+        if self.compression != "zstd":
+            return None
+        return zstandard.ZstdDecompressor().decompressobj()
 
     async def _connect_player(
         self,
@@ -385,16 +412,26 @@ class LoadRun:
         socket = await websockets.connect(
             f"{self.ws_url}/mc-client", max_size=16 * 1024 * 1024,
             open_timeout=10, close_timeout=3, ping_interval=None,
+            **self.connect_kwargs,
         )
+        # zstd 模式:整条连接的下行(含握手 ack)是同一条连续 zstd 流,
+        # 解压器必须在 ack 之前就位并一路喂到底。
+        chunk_decoder = self._new_chunk_decoder()
         try:
             await socket.send(player_handshake(client_id, self.room, external=external))
-            ack = CODEC.decode(await asyncio.wait_for(socket.recv(), 10))
+            ack = CODEC.decode(
+                decode_wire(
+                    chunk_decoder,
+                    await asyncio.wait_for(socket.recv(), 10),
+                )
+            )
             if not ack.get("ready"):
                 raise RuntimeError(f"{client_id}: {ack.get('rejectReason') or ack.get('error')}")
         except Exception:
             await socket.close()
             raise
         client = VirtualClient("external" if external else "mod", socket, client_id, index)
+        client.zstd_chunk_decoder = chunk_decoder
         client.reader = asyncio.create_task(client.read(self.stopping))
         return client
 
@@ -402,16 +439,24 @@ class LoadRun:
         socket = await websockets.connect(
             f"{self.ws_url}/web-map/ws", max_size=16 * 1024 * 1024,
             open_timeout=10, close_timeout=3, ping_interval=None,
+            **self.connect_kwargs,
         )
+        chunk_decoder = self._new_chunk_decoder()
         try:
             await socket.send(web_handshake(self.room))
-            ack = CODEC.decode(await asyncio.wait_for(socket.recv(), 10))
+            ack = CODEC.decode(
+                decode_wire(
+                    chunk_decoder,
+                    await asyncio.wait_for(socket.recv(), 10),
+                )
+            )
             if not ack.get("ready"):
                 raise RuntimeError(f"web-{index}: {ack.get('rejectReason') or ack.get('error')}")
         except Exception:
             await socket.close()
             raise
         client = VirtualClient("web", socket, f"web-{index}")
+        client.zstd_chunk_decoder = chunk_decoder
         client.reader = asyncio.create_task(client.read(self.stopping))
         try:
             await socket.send(
@@ -447,10 +492,12 @@ class LoadRun:
             open_timeout=10,
             close_timeout=3,
             ping_interval=None,
+            **self.connect_kwargs,
         )
+        probe_zstd = self._new_chunk_decoder()
         try:
             await probe.send(web_handshake(self.room))
-            ack = CODEC.decode(await asyncio.wait_for(probe.recv(), 10))
+            ack = CODEC.decode(decode_wire(probe_zstd, await asyncio.wait_for(probe.recv(), 10)))
             if not ack.get("ready"):
                 raise RuntimeError(
                     f"fixture web probe rejected: "
@@ -466,10 +513,13 @@ class LoadRun:
                 try:
                     while True:
                         raw = await asyncio.wait_for(probe.recv(), 2)
-                        packet = CODEC.decode(raw)
+                        decoded = decode_wire(probe_zstd, raw)
+                        packet = CODEC.decode(decoded)
                         if packet.get("type") != "snapshot_full":
                             continue
-                        web_snapshot_bytes = len(raw)
+                        # 字节统计一律按解压后 envelope 计,plain/zstd 两种
+                        # 模式的快照尺寸校验才可比。
+                        web_snapshot_bytes = len(decoded)
                         web_last_seen = len(packet.get("lastSeenPlayers", {}))
                         web_tab_state_players = tab_state_player_count(packet)
                         break
@@ -492,13 +542,14 @@ class LoadRun:
             deadline = time.monotonic() + 20
             while not tab_history_final and time.monotonic() < deadline:
                 raw = await asyncio.wait_for(probe.recv(), 3)
-                packet = CODEC.decode(raw)
+                decoded = decode_wire(probe_zstd, raw)
+                packet = CODEC.decode(decoded)
                 if (
                     packet.get("type") != "tab_history_sync_chunk"
                     or packet.get("requestId") != request_id
                 ):
                     continue
-                tab_history_bytes += len(raw)
+                tab_history_bytes += len(decoded)
                 tab_history_entries += len(packet.get("upsert", []))
                 tab_history_final = bool(packet.get("final"))
                 if packet.get("errorCode"):
@@ -513,12 +564,16 @@ class LoadRun:
             open_timeout=10,
             close_timeout=3,
             ping_interval=None,
+            **self.connect_kwargs,
         )
+        player_probe_zstd = self._new_chunk_decoder()
         try:
             await player_probe.send(
                 player_handshake(player_probe_id, self.room, external=False)
             )
-            ack = CODEC.decode(await asyncio.wait_for(player_probe.recv(), 10))
+            ack = CODEC.decode(
+                decode_wire(player_probe_zstd, await asyncio.wait_for(player_probe.recv(), 10))
+            )
             if not ack.get("ready"):
                 raise RuntimeError(
                     f"fixture player probe rejected: "
@@ -529,9 +584,10 @@ class LoadRun:
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 raw = await asyncio.wait_for(player_probe.recv(), 3)
-                packet = CODEC.decode(raw)
+                decoded = decode_wire(player_probe_zstd, raw)
+                packet = CODEC.decode(decoded)
                 if packet.get("type") == "snapshot_full":
-                    player_snapshot_bytes = len(raw)
+                    player_snapshot_bytes = len(decoded)
                     player_last_seen = len(packet.get("lastSeenPlayers", {}))
                     break
         finally:
@@ -712,9 +768,10 @@ async def execute(
     minimum_snapshot_bytes: int,
     minimum_rate_ratio: float,
     target_build_version: str | None,
+    compression: str = "plain",
 ) -> dict:
     run_id = secrets.token_hex(5)
-    load = LoadRun(base_url, room, run_id)
+    load = LoadRun(base_url, room, run_id, compression)
     results = []
     revision = 0
     heartbeat_monitor_stop = asyncio.Event()
@@ -950,6 +1007,7 @@ async def execute(
             "loadTestSchemaVersion": LOAD_TEST_SCHEMA_VERSION,
             "target": base_url,
             "targetBuildVersion": target_build_version,
+            "compression": compression,
             "room": room,
             "runId": run_id,
             "fixture": fixture,
@@ -983,6 +1041,13 @@ def main() -> int:
     parser.add_argument("--history-players", type=int, default=1_000)
     parser.add_argument("--min-snapshot-kib", type=float, default=200.0)
     parser.add_argument("--min-rate-ratio", type=float, default=0.95)
+    parser.add_argument(
+        "--compression",
+        choices=("plain", "zstd"),
+        default="plain",
+        help="downlink compression suite: zstd negotiates the "
+        "teamviewrelay.zstd.v1 WebSocket subprotocol",
+    )
     parser.add_argument(
         "--expected-build",
         help="exact /health buildVersion expected from the target implementation",
@@ -1050,6 +1115,7 @@ def main() -> int:
         int(args.min_snapshot_kib * 1024),
         args.min_rate_ratio,
         target_build_version,
+        args.compression,
     ))
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["passed"] else 1
