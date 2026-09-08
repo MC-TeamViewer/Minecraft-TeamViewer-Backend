@@ -49,7 +49,7 @@ use crate::{
     proxy_ip::effective_remote_addr,
     relationship_store::RelationshipStore,
     relay::{
-        CONTROL_CAPACITY, ConnectionKind, MovementBatch, RegisterConnection, RelayEvent,
+        CONTROL_CAPACITY, ConnectionKind, RegisterConnection, RelayEvent,
         RelayHandle, StateFrame, encode_payload,
     },
     tab_history::{
@@ -311,16 +311,19 @@ fn websocket_options() -> Options {
         .with_backpressure_boundary(32 * 1024 * 1024)
 }
 
-pub async fn serve_web_map_session<Si>(
-    mut socket: WebMapFrameStream,
-    mut writer_sink: Si,
+pub(crate) async fn serve_web_map_session(
+    session: crate::door::DoorSession,
     state: AppState,
     remote_addr: String,
-    movement_tx: watch::Sender<Option<Arc<MovementBatch>>>,
-    datagram_capable: bool,
-) where
-    Si: Sink<Bytes, Error = io::Error> + Unpin + Send + 'static,
-{
+) {
+    // 稳定信道解构(桥接模式):上层只依赖 DoorSession,门差异封在桥内
+    let crate::door::DoorSession {
+        incoming: mut socket,
+        outgoing: mut writer_sink,
+        movement_tx,
+        capabilities: crate::door::DoorCapabilities { datagram: datagram_capable, .. },
+        ..
+    } = session;
     let first = match tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
         Ok(Some(Ok(frame))) if !frame.is_empty() => frame,
         _ => {
@@ -2385,12 +2388,15 @@ mod tests {
         let (movement_tx, _movement_rx) = watch::channel(None);
 
         let session = tokio::spawn(serve_web_map_session(
-            stream,
-            sink,
+            crate::door::DoorSession {
+                incoming: stream,
+                outgoing: sink,
+                movement_tx,
+                bulk: None,
+                capabilities: crate::door::DoorCapabilities::default(),
+            },
             state,
             "test-remote".to_owned(),
-            movement_tx,
-            false,
         ));
 
         let handshake = PlayerHandshakeRequest {

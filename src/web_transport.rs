@@ -27,7 +27,7 @@ use crate::{
     frame,
     proto::teamviewer::door::v1::door_control_frame::Payload as DoorControlPayload,
     relay::{MOVEMENT_CHUNK_MAX_BYTES, MovementBatch},
-    web::{self, WebMapFrameStream},
+    web,
 };
 
 /// 门合同违规的应用层错误码(与 QUIC 门同值,断连出口唯一)。
@@ -157,26 +157,13 @@ async fn accept_session(
         ?suite,
         "WebTransport session accepted"
     );
-    // max_datagram_size 已扣除 WebTransport Datagram 头,返回值即应用层预算;
-    // None 表示对端未协商 datagram 扩展。datagram 自带报文边界,无应用层前缀。
-    let datagram_capable = connection
-        .max_datagram_size()
-        .is_some_and(|size| size >= MOVEMENT_CHUNK_MAX_BYTES);
-    let (movement_tx, movement_rx) = watch::channel(None::<Arc<MovementBatch>>);
-    let (control_rx, state_sink, bulk_tx) =
-        stream_bridge(connection, movement_rx, suite.unwrap_or_default());
+    let mut session = stream_bridge(connection, suite.unwrap_or_default());
     // bulk 触发通道入表(debug 端点按表投递;会话死透时发送失败自然逐出)
-    let hub_id = state.bulk_hub.register(bulk_tx).await;
-    debug!(connection_id = %hub_id, "WebTransport session registered for bulk push");
-    web::serve_web_map_session(
-        WebMapFrameStream::new(MpscReceiver::new(control_rx)),
-        MpscSink::new(state_sink),
-        state,
-        remote_addr,
-        movement_tx,
-        datagram_capable,
-    )
-    .await;
+    if let Some(bulk_tx) = session.bulk.take() {
+        let hub_id = state.bulk_hub.register(bulk_tx).await;
+        debug!(connection_id = %hub_id, "WebTransport session registered for bulk push");
+    }
+    web::serve_web_map_session(session, state, remote_addr).await;
     Ok(())
 }
 
@@ -195,15 +182,11 @@ fn wt_suite_from_headers(
 
 fn stream_bridge(
     connection: wtransport::Connection,
-    mut movement_rx: watch::Receiver<Option<Arc<MovementBatch>>>,
     suite: crate::compress::Suite,
-) -> (
-    mpsc::Receiver<Result<Bytes, io::Error>>,
-    mpsc::Sender<Bytes>,
-    mpsc::Sender<bulk::BulkRequest>,
-) {
+) -> crate::door::DoorSession {
     let (incoming_tx, incoming_rx) = mpsc::channel::<Result<Bytes, io::Error>>(256);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Bytes>(256);
+    let (movement_tx, mut movement_rx) = watch::channel(None::<Arc<MovementBatch>>);
     // bulk 触发通道(容量 1 = 每会话同时只允许一个在途 bulk,满即拒)
     let (bulk_tx, mut bulk_rx) = mpsc::channel::<bulk::BulkRequest>(1);
     // bulk 流必须在 door-control 下行流之后开启(流识别按开启序),
@@ -542,7 +525,20 @@ fn stream_bridge(
         reader.abort();
     });
 
-    (incoming_rx, outgoing_tx, bulk_tx)
+    crate::door::DoorSession {
+        incoming: crate::web::WebMapFrameStream::new(MpscReceiver::new(incoming_rx)),
+        outgoing: MpscSink::new(outgoing_tx),
+        movement_tx,
+        bulk: Some(bulk_tx),
+        capabilities: crate::door::DoorCapabilities {
+            datagram: connection
+                .max_datagram_size()
+                .is_some_and(|size| size >= MOVEMENT_CHUNK_MAX_BYTES),
+            door_control: true,
+            bulk: true,
+            wire_metrics: false,
+        },
+    }
 }
 
 /// 门合同违规的唯一出口:当场断连,绝不静默容忍(合同真相源 README
@@ -912,8 +908,7 @@ mod tests {
                 .expect("incoming timeout")
                 .expect("session request");
             let connection = request.accept().await.expect("session accepted");
-            let (_movement_tx, movement_rx) = watch::channel(None);
-            let _bridge = stream_bridge(connection, movement_rx, crate::compress::Suite::Plain);
+            let _bridge = stream_bridge(connection, crate::compress::Suite::Plain);
         });
         let _ = runtime;
 
@@ -945,6 +940,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_frames_flow_on_unidirectional_stream() {
+        use futures_util::{SinkExt as _, StreamExt as _};
         let dir = temp_dir("bridge");
         let cert = write_test_cert(&dir, "a", &["a.example.com"]);
         let config = wt_config(
@@ -959,19 +955,15 @@ mod tests {
             .build();
         let endpoint = Endpoint::server(server_config).expect("server endpoint");
         let addr = endpoint.local_addr().expect("local addr");
-        let (bridges_tx, mut bridges_rx) = tokio::sync::mpsc::channel::<(
-            mpsc::Receiver<Result<Bytes, io::Error>>,
-            mpsc::Sender<Bytes>,
-            mpsc::Sender<crate::bulk::BulkRequest>,
-        )>(1);
+        let (bridges_tx, mut bridges_rx) =
+            tokio::sync::mpsc::channel::<crate::door::DoorSession>(1);
         tokio::spawn(async move {
             let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, endpoint.accept().await)
                 .await
                 .expect("incoming timeout")
                 .expect("session request");
             let connection = request.accept().await.expect("session accepted");
-            let (_movement_tx, movement_rx) = watch::channel(None);
-            let bridge = stream_bridge(connection, movement_rx, crate::compress::Suite::Plain);
+            let bridge = stream_bridge(connection, crate::compress::Suite::Plain);
             bridges_tx.send(bridge).await.ok();
         });
         let _ = runtime;
@@ -993,12 +985,13 @@ mod tests {
             .expect("control write");
 
         // 服务端 bridge 读到该帧
-        let (mut incoming_rx, outgoing_tx, _bulk_tx) =
-            tokio::time::timeout(Duration::from_secs(5), bridges_rx.recv())
-                .await
-                .expect("bridge ready")
-                .expect("bridge channels");
-        let frame = tokio::time::timeout(Duration::from_secs(5), incoming_rx.recv())
+        let arrived = tokio::time::timeout(Duration::from_secs(5), bridges_rx.recv())
+            .await
+            .expect("bridge ready")
+            .expect("bridge channels");
+        let mut incoming_rx = arrived.incoming;
+        let mut outgoing_tx = arrived.outgoing;
+        let frame = tokio::time::timeout(Duration::from_secs(5), incoming_rx.next())
             .await
             .expect("frame timeout")
             .expect("frame")
@@ -1051,24 +1044,16 @@ mod tests {
             .build();
         let endpoint = Endpoint::server(server_config).expect("server endpoint");
         let addr = endpoint.local_addr().expect("local addr");
-        let (sessions_tx, mut sessions_rx) = tokio::sync::mpsc::channel::<(
-            mpsc::Receiver<Result<Bytes, io::Error>>,
-            mpsc::Sender<Bytes>,
-            mpsc::Sender<crate::bulk::BulkRequest>,
-            watch::Sender<Option<Arc<MovementBatch>>>,
-        )>(1);
+        let (sessions_tx, mut sessions_rx) =
+            tokio::sync::mpsc::channel::<crate::door::DoorSession>(1);
         tokio::spawn(async move {
             let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, endpoint.accept().await)
                 .await
                 .expect("incoming timeout")
                 .expect("session request");
             let connection = request.accept().await.expect("session accepted");
-            let (movement_tx, movement_rx) = watch::channel(None);
-            let bridge = stream_bridge(connection, movement_rx, crate::compress::Suite::Plain);
-            sessions_tx
-                .send((bridge.0, bridge.1, bridge.2, movement_tx))
-                .await
-                .ok();
+            let bridge = stream_bridge(connection, crate::compress::Suite::Plain);
+            sessions_tx.send(bridge).await.ok();
         });
         let _ = runtime;
 
@@ -1088,11 +1073,11 @@ mod tests {
             .await
             .expect("control write");
 
-        let (_incoming_rx, _outgoing_tx, _bulk_tx, movement_tx) =
-            tokio::time::timeout(Duration::from_secs(5), sessions_rx.recv())
-                .await
-                .expect("bridge ready")
-                .expect("bridge channels");
+        let arrived = tokio::time::timeout(Duration::from_secs(5), sessions_rx.recv())
+            .await
+            .expect("bridge ready")
+            .expect("bridge channels");
+        let movement_tx = arrived.movement_tx;
 
         // relay 侧发布一个 movement 批(两块);块即 datagram 载荷本身
         let chunk_a: Arc<[u8]> = Bytes::from_static(b"abc").to_vec().into();
@@ -1153,6 +1138,7 @@ mod tests {
     /// 块解出依赖首块窗口的字节)。
     #[tokio::test]
     async fn zstd_suite_compresses_only_downlink() {
+        use futures_util::{SinkExt as _, StreamExt as _};
         let dir = temp_dir("bridge-zstd");
         let cert = write_test_cert(&dir, "a", &["a.example.com"]);
         let config = wt_config(
@@ -1167,19 +1153,15 @@ mod tests {
             .build();
         let endpoint = Endpoint::server(server_config).expect("server endpoint");
         let addr = endpoint.local_addr().expect("local addr");
-        let (bridges_tx, mut bridges_rx) = tokio::sync::mpsc::channel::<(
-            mpsc::Receiver<Result<Bytes, io::Error>>,
-            mpsc::Sender<Bytes>,
-            mpsc::Sender<crate::bulk::BulkRequest>,
-        )>(1);
+        let (bridges_tx, mut bridges_rx) =
+            tokio::sync::mpsc::channel::<crate::door::DoorSession>(1);
         tokio::spawn(async move {
             let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, endpoint.accept().await)
                 .await
                 .expect("incoming timeout")
                 .expect("session request");
             let connection = request.accept().await.expect("session accepted");
-            let (_movement_tx, movement_rx) = watch::channel(None);
-            let bridge = stream_bridge(connection, movement_rx, crate::compress::Suite::Zstd);
+            let bridge = stream_bridge(connection, crate::compress::Suite::Zstd);
             bridges_tx.send(bridge).await.ok();
         });
         let _ = runtime;
@@ -1204,13 +1186,14 @@ mod tests {
         }
 
         // 服务端桥原样解出两个 envelope,顺序一致
-        let (mut incoming_rx, outgoing_tx, _bulk_tx) =
-            tokio::time::timeout(Duration::from_secs(5), bridges_rx.recv())
-                .await
-                .expect("bridge ready")
-                .expect("bridge channels");
+        let arrived = tokio::time::timeout(Duration::from_secs(5), bridges_rx.recv())
+            .await
+            .expect("bridge ready")
+            .expect("bridge channels");
+        let mut incoming_rx = arrived.incoming;
+        let mut outgoing_tx = arrived.outgoing;
         for expected in uplink_envelopes {
-            let frame = tokio::time::timeout(Duration::from_secs(5), incoming_rx.recv())
+            let frame = tokio::time::timeout(Duration::from_secs(5), incoming_rx.next())
                 .await
                 .expect("frame timeout")
                 .expect("frame")
@@ -1269,24 +1252,16 @@ mod tests {
             .build();
         let endpoint = Endpoint::server(server_config).expect("server endpoint");
         let addr = endpoint.local_addr().expect("local addr");
-        let (bridges_tx, mut bridges_rx) = tokio::sync::mpsc::channel::<(
-            mpsc::Receiver<Result<Bytes, io::Error>>,
-            mpsc::Sender<Bytes>,
-            mpsc::Sender<crate::bulk::BulkRequest>,
-            watch::Sender<Option<Arc<MovementBatch>>>,
-        )>(1);
+        let (bridges_tx, mut bridges_rx) =
+            tokio::sync::mpsc::channel::<crate::door::DoorSession>(1);
         tokio::spawn(async move {
             let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, endpoint.accept().await)
                 .await
                 .expect("incoming timeout")
                 .expect("session request");
             let connection = request.accept().await.expect("session accepted");
-            let (movement_tx, movement_rx) = watch::channel(None);
-            let bridge = stream_bridge(connection, movement_rx, crate::compress::Suite::ZstdDict);
-            bridges_tx
-                .send((bridge.0, bridge.1, bridge.2, movement_tx))
-                .await
-                .ok();
+            let bridge = stream_bridge(connection, crate::compress::Suite::ZstdDict);
+            bridges_tx.send(bridge).await.ok();
         });
         let _ = runtime;
 
@@ -1311,11 +1286,12 @@ mod tests {
             .await
             .expect("state uni timeout")
             .expect("state uni");
-        let (incoming_rx, _outgoing_tx, _bulk_tx, movement_tx) =
-            tokio::time::timeout(Duration::from_secs(5), bridges_rx.recv())
-                .await
-                .expect("bridge ready")
-                .expect("bridge channels");
+        let arrived = tokio::time::timeout(Duration::from_secs(5), bridges_rx.recv())
+            .await
+            .expect("bridge ready")
+            .expect("bridge channels");
+        let incoming_rx = arrived.incoming;
+        let movement_tx = arrived.movement_tx;
         drop(incoming_rx);
         drop(state_stream);
 

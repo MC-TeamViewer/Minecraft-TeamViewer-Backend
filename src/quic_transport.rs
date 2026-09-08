@@ -31,8 +31,7 @@ use crate::{
     frame,
     proto::teamviewer::door::v1::door_control_frame::Payload as DoorControlPayload,
     relay::{MOVEMENT_CHUNK_MAX_BYTES, MovementBatch},
-    web::{self, WebMapFrameStream},
-    web_transport::{MpscReceiver, MpscSink},
+    web,
 };
 
 /// 门合同违规的应用层错误码(混用/合同外流等,当场断连的唯一出口)。
@@ -114,25 +113,13 @@ async fn accept_connection(
         ?suite,
         "QUIC connection accepted"
     );
-    // max_datagram_size 已扣除 QUIC 帧头开销;裸 QUIC 无 WT capsule 头,
-    // 预算即应用层整帧大小。None 表示对端未协商 datagram 扩展。
-    let datagram_capable = connection
-        .max_datagram_size()
-        .is_some_and(|size| size >= MOVEMENT_CHUNK_MAX_BYTES);
-    let (movement_tx, movement_rx) = watch::channel(None::<Arc<MovementBatch>>);
-    let (control_rx, state_sink, bulk_tx) = stream_bridge(connection, movement_rx, suite);
+    let mut session = stream_bridge(connection, suite);
     // bulk 触发通道入表(debug 端点按表投递;会话死透时发送失败自然逐出)
-    let hub_id = state.bulk_hub.register(bulk_tx).await;
-    debug!(connection_id = %hub_id, "QUIC session registered for bulk push");
-    web::serve_web_map_session(
-        WebMapFrameStream::new(MpscReceiver::new(control_rx)),
-        MpscSink::new(state_sink),
-        state,
-        remote_addr,
-        movement_tx,
-        datagram_capable,
-    )
-    .await;
+    if let Some(bulk_tx) = session.bulk.take() {
+        let hub_id = state.bulk_hub.register(bulk_tx).await;
+        debug!(connection_id = %hub_id, "QUIC session registered for bulk push");
+    }
+    web::serve_web_map_session(session, state, remote_addr).await;
     Ok(())
 }
 
@@ -158,15 +145,11 @@ fn negotiated_alpn(connection: &Connection) -> Option<String> {
 
 fn stream_bridge(
     connection: Connection,
-    mut movement_rx: watch::Receiver<Option<Arc<MovementBatch>>>,
     suite: crate::compress::Suite,
-) -> (
-    mpsc::Receiver<Result<Bytes, io::Error>>,
-    mpsc::Sender<Bytes>,
-    mpsc::Sender<bulk::BulkRequest>,
-) {
+) -> crate::door::DoorSession {
     let (incoming_tx, incoming_rx) = mpsc::channel::<Result<Bytes, io::Error>>(256);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Bytes>(256);
+    let (movement_tx, mut movement_rx) = watch::channel(None::<Arc<MovementBatch>>);
     // bulk 触发通道(容量 1 = 每会话同时只允许一个在途 bulk,满即拒)
     let (bulk_tx, mut bulk_rx) = mpsc::channel::<bulk::BulkRequest>(1);
     // bulk 流必须在 door-control 下行流之后开启(流识别按开启序),
@@ -495,7 +478,22 @@ fn stream_bridge(
         reader.abort();
     });
 
-    (incoming_rx, outgoing_tx, bulk_tx)
+    crate::door::DoorSession {
+        incoming: crate::web::WebMapFrameStream::new(crate::web_transport::MpscReceiver::new(
+            incoming_rx,
+        )),
+        outgoing: crate::web_transport::MpscSink::new(outgoing_tx),
+        movement_tx,
+        bulk: Some(bulk_tx),
+        capabilities: crate::door::DoorCapabilities {
+            datagram: connection
+                .max_datagram_size()
+                .is_some_and(|size| size >= MOVEMENT_CHUNK_MAX_BYTES),
+            door_control: true,
+            bulk: true,
+            wire_metrics: false,
+        },
+    }
 }
 
 /// 门合同违规的唯一出口:当场断连,绝不静默容忍(合同真相源 README
@@ -527,6 +525,8 @@ fn spawn_bulk_heartbeat(connection: &Connection, stop: Arc<AtomicBool>) -> tokio
 #[cfg(test)]
 mod tests {
     use std::{net::SocketAddr, sync::Arc as StdArc, time::Duration};
+
+    use futures_util::{SinkExt as _, StreamExt as _};
 
     use quinn::crypto::rustls::QuicClientConfig;
     use wtransport::Identity;
@@ -688,9 +688,9 @@ mod tests {
         let server_conn = server_rx.recv().await.expect("server accepted");
 
         // bridge 建立(镜像 accept_connection 装配,movement 关闭)
-        let (_movement_tx, movement_rx) = watch::channel(None);
-        let (mut incoming_rx, outgoing_tx, _bulk_tx) =
-            stream_bridge(server_conn, movement_rx, crate::compress::Suite::Plain);
+        let session = stream_bridge(server_conn, crate::compress::Suite::Plain);
+        let mut incoming_rx = session.incoming;
+        let mut outgoing_tx = session.outgoing;
 
         // 客户端打开控制流并发送一帧
         let (mut control_send, mut control_recv) = connection.open_bi().await.expect("open bi");
@@ -698,7 +698,7 @@ mod tests {
             .await
             .expect("control write");
 
-        let frame = tokio::time::timeout(Duration::from_secs(5), incoming_rx.recv())
+        let frame = tokio::time::timeout(Duration::from_secs(5), incoming_rx.next())
             .await
             .expect("frame timeout")
             .expect("frame")
@@ -748,9 +748,9 @@ mod tests {
         );
         let server_conn = server_rx.recv().await.expect("server accepted");
 
-        let (_movement_tx, movement_rx) = watch::channel(None);
-        let (mut incoming_rx, outgoing_tx, _bulk_tx) =
-            stream_bridge(server_conn, movement_rx, crate::compress::Suite::Zstd);
+        let session = stream_bridge(server_conn, crate::compress::Suite::Zstd);
+        let mut incoming_rx = session.incoming;
+        let mut outgoing_tx = session.outgoing;
 
         // 上行恒为 plain:envelope 原样 varint 分帧写控制流(zstd 套仅压缩下行)
         let (mut control_send, _control_recv) = connection.open_bi().await.expect("open bi");
@@ -760,7 +760,7 @@ mod tests {
                 .expect("control write");
         }
         for envelope in [b"handshake".to_vec(), vec![7u8; 2048]] {
-            let frame = tokio::time::timeout(Duration::from_secs(5), incoming_rx.recv())
+            let frame = tokio::time::timeout(Duration::from_secs(5), incoming_rx.next())
                 .await
                 .expect("frame timeout")
                 .expect("frame")
@@ -813,9 +813,8 @@ mod tests {
         let connection = connect(addr, leaf, &[ALPN_PLAIN.as_bytes()]).await;
         let server_conn = server_rx.recv().await.expect("server accepted");
 
-        let (movement_tx, movement_rx) = watch::channel(None);
-        let (_incoming_rx, _outgoing_tx, _bulk_tx) =
-            stream_bridge(server_conn, movement_rx, crate::compress::Suite::Plain);
+        let session = stream_bridge(server_conn, crate::compress::Suite::Plain);
+        let movement_tx = session.movement_tx;
 
         let chunk_a: Arc<[u8]> = Bytes::from_static(b"abc").to_vec().into();
         let chunk_b: Arc<[u8]> = Bytes::from_static(b"xyz").to_vec().into();

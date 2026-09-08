@@ -3,6 +3,7 @@ pub mod bulk;
 pub mod cert;
 pub mod compress;
 pub mod config;
+pub(crate) mod door;
 pub(crate) mod door_control;
 pub mod frame;
 pub mod metrics;

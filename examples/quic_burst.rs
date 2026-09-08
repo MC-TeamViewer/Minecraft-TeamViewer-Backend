@@ -317,6 +317,7 @@ async fn connect(server: &str) -> Result<quinn::Connection> {
     let quic_tls = QuicClientConfig::try_from(tls)
         .map_err(|error| anyhow::anyhow!("rustls → QUIC TLS 适配失败:{error}"))?;
     let mut config = quinn::ClientConfig::new(Arc::new(quic_tls));
+    // 客户端 BBR 只作用于上行(ping 等小载荷),与服务端同参数
     config.transport_config(Arc::new(quinn::TransportConfig::default()));
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(config);
