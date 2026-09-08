@@ -34,12 +34,16 @@ CERT_DIR="/tmp/tv-burst/certs"
 LOG_DIR="/tmp/tv-burst"
 BACKEND_PID=""
 PROXY_PIDS=()
+CLIENT_PIDS=()
 
 cleanup() {
-    [[ -n "$BACKEND_PID" ]] && kill "$BACKEND_PID" 2>/dev/null || true
+    for pid in "${CLIENT_PIDS[@]:-}"; do
+        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    done
     for pid in "${PROXY_PIDS[@]:-}"; do
         [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
     done
+    [[ -n "$BACKEND_PID" ]] && kill "$BACKEND_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -74,6 +78,7 @@ run_case() {
         TEAMVIEWER_BURST_DGRAM_LOSS_TOLERANCE="$(python3 -c "print($loss / 100 * 2 + 0.05)")" \
         "$@" ./target/debug/examples/"$client" >"$log" 2>&1 &
     local client_pid=$!
+    CLIENT_PIDS+=("$client_pid")
     if ! wait_for "READY" "$log" "客户端就绪($label)"; then
         cat "$log" >&2
         kill "$client_pid" 2>/dev/null || true

@@ -92,7 +92,8 @@ async fn build_server_endpoint(
         ALPN_PLAIN.as_bytes().to_vec(),
     ];
     let quic_tls = QuicServerConfig::try_from(tls_config).context("rustls → QUIC TLS 适配失败")?;
-    let server_config = ServerConfig::with_crypto(Arc::new(quic_tls));
+    let mut server_config = ServerConfig::with_crypto(Arc::new(quic_tls));
+    server_config.transport_config(Arc::new(bbr_transport_config()));
     let endpoint = Endpoint::server(server_config, config.bind_address)
         .context("failed to bind QUIC UDP endpoint")?;
     Ok((runtime, endpoint))
@@ -133,6 +134,17 @@ async fn accept_connection(
     )
     .await;
     Ok(())
+}
+
+/// 服务端传输配置:BBR 拥塞控制。BBR 按带宽×RTT 模型发速,不把随机
+/// 丢包当拥塞信号——跨洲高丢包线路上 Cubic 会把窗口压死(5% 丢 +
+/// 400ms RTT 实测坍缩到 ~9KiB/s),BBR 则贴近瓶颈速率。其余参数全默认。
+pub(crate) fn bbr_transport_config() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(
+        quinn::congestion::BbrConfig::default(),
+    ));
+    transport
 }
 
 /// 读取握手协商出的 ALPN(现阶段仅日志;压缩阶段起据此选择压缩套)。

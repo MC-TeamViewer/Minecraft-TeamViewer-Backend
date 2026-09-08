@@ -53,7 +53,7 @@ uuid = { version = "1.18", features = ["v4"] }
 unicode-normalization = "0.1"
 url = "2.5"
 yawc = { version = "0.3.4", default-features = false, features = ["axum"] }
-wtransport = "0.7.2"
+wtransport = { version = "0.7.2", features = ["quinn"] }
 rustls-pemfile = "2.2.0"
 x509-parser = "0.18.1"
 

@@ -93,7 +93,7 @@ pub async fn serve(config: WebTransportConfig, state: crate::web::AppState) -> a
     let (runtime, tls_config) = CertRuntime::load(&config).await?;
     let server_config = ServerConfig::builder()
         .with_bind_address(config.bind_address)
-        .with_custom_tls(tls_config)
+        .with_custom_tls_and_transport(tls_config, crate::quic_transport::bbr_transport_config())
         .build();
     let endpoint =
         Endpoint::server(server_config).context("failed to bind WebTransport UDP endpoint")?;
