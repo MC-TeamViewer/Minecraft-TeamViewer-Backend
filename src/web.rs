@@ -282,7 +282,13 @@ async fn upgrade_websocket(
         match upgraded.await {
             Ok(socket) => {
                 transport.wire.activate();
-                serve_socket(socket, state, route_kind, &transport, remote_addr, suite).await;
+                // 桥接模式:WS 门桥把 socket 泵成稳定信道,会话层与
+                // WT/QUIC 门共享同一实现
+                if let Some(session) =
+                    ws_socket_bridge(socket, suite, route_kind, &transport, &state).await
+                {
+                    serve_web_map_session(session, state, remote_addr).await;
+                }
                 transport.wire.deactivate();
             }
             Err(error) => warn!(%error, "websocket upgrade failed"),
@@ -309,6 +315,194 @@ fn websocket_options() -> Options {
         .with_balanced_compression()
         .with_limits(16 * 1024 * 1024, 32 * 1024 * 1024)
         .with_backpressure_boundary(32 * 1024 * 1024)
+}
+
+/// WS 门桥(桥接模式收编):把 yawc WebSocket 泵成稳定信道 `DoorSession`,
+/// 对上与 WT/QUIC 门桥交付同一形态,会话层由 `serve_web_map_session` 统一承载。
+/// 门差异封在本桥内:URL 路由通道前门(WS 有 path,不像无 path 门自识别)、
+/// WS 关闭帧诊断、下行 zstd 压缩(消息级 flush)、Wire 层 TCP 字节计量。
+/// 返回 `None` = 握手被前门拒绝(关闭帧已发出,连接即弃)。
+async fn ws_socket_bridge(
+    mut socket: HttpWebSocket,
+    suite: Option<crate::compress::Suite>,
+    route_kind: ConnectionKind,
+    transport: &TransportConnectInfo,
+    state: &AppState,
+) -> Option<crate::door::DoorSession> {
+    // 握手前门:首帧必须是指定时间内到达的 binary 帧且载荷可解码,
+    // 载荷类型必须与路由通道匹配(错配即 channel_mismatch)
+    let first = match tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
+        Ok(Some(frame)) if frame.opcode() == OpCode::Binary => frame.payload().clone(),
+        _ => {
+            let _ = socket
+                .send(Frame::close(
+                    yawc::close::CloseCode::Policy,
+                    "handshake_required",
+                ))
+                .await;
+            return None;
+        }
+    };
+    let envelope = match WireEnvelope::decode(first.clone()) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            warn!(%error, "invalid protobuf handshake");
+            let _ = socket
+                .send(Frame::close(
+                    yawc::close::CloseCode::Policy,
+                    "invalid_payload",
+                ))
+                .await;
+            return None;
+        }
+    };
+    let matches_route = matches!(
+        (&envelope.payload, route_kind),
+        (
+            Some(wire_envelope::Payload::PlayerHandshakeRequest(_)),
+            ConnectionKind::Player
+        ) | (
+            Some(wire_envelope::Payload::WebMapHandshakeRequest(_)),
+            ConnectionKind::WebMap
+        )
+    );
+    if !matches_route {
+        reject(&mut socket, channel_for(route_kind), "channel_mismatch").await;
+        return None;
+    }
+
+    // 下行 zstd 压缩器:消息级 flush 块,跨消息共享压缩上下文。zstd 套语义
+    // 为单向:仅下行(服务端→客户端)压缩,上行恒为 plain 消息。
+    let encoder = match suite.filter(|suite| suite.stream_zstd()) {
+        Some(_) => match crate::compress::StreamEncoder::new() {
+            Ok(encoder) => Some(encoder),
+            Err(error) => {
+                warn!(%error, "zstd encoder unavailable, closing connection");
+                return None;
+            }
+        },
+        None => None,
+    };
+
+    let (incoming_tx, incoming_rx) = mpsc::channel::<Result<Bytes, io::Error>>(256);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<Bytes>(256);
+    let (movement_tx, _movement_rx) = watch::channel(None);
+
+    let (sink, mut stream) = socket.split();
+    // 入站泵:上行恒 plain,非 binary 帧跳过(Close 帧即会话终结);
+    // 首帧已过前门,补进出站流保持 envelope 次序
+    let reader_incoming_tx = incoming_tx.clone();
+    let reader = tokio::spawn(async move {
+        if reader_incoming_tx.send(Ok(first)).await.is_err() {
+            return;
+        }
+        while let Some(frame) = stream.next().await {
+            let keep_going = match frame.opcode() {
+                OpCode::Binary => reader_incoming_tx
+                    .send(Ok(frame.payload().clone()))
+                    .await
+                    .is_ok(),
+                OpCode::Close => false,
+                _ => true,
+            };
+            if !keep_going {
+                break;
+            }
+        }
+    });
+
+    // 出站泵:plain envelope → 持久 CCtx flush 压缩块 → WS binary 帧。
+    // 出站泵是本门会话的"心跳":它退出(压缩失败/写出失败/socket 死亡)时
+    // abort 入站泵,会话随之拆除——与 QUIC/WT 门桥的 reader.abort() 同构。
+    // Wire 层(TCP 字节)计量随泵起止采样,退场时落最终增量。
+    let traffic_channel = match route_kind {
+        ConnectionKind::WebMap => TrafficChannel::WebMap,
+        _ => TrafficChannel::Player,
+    };
+    let wire = transport.wire.clone();
+    let metrics = state.metrics.clone();
+    tokio::spawn(async move {
+        let last_wire_ingress = Arc::new(AtomicU64::new(0));
+        let last_wire_egress = Arc::new(AtomicU64::new(0));
+        let wire_sampler = tokio::spawn(sample_wire_traffic(
+            wire.clone(),
+            metrics.clone(),
+            traffic_channel,
+            last_wire_ingress.clone(),
+            last_wire_egress.clone(),
+        ));
+        ws_egress_loop(sink, outgoing_rx, encoder, metrics.clone()).await;
+        reader.abort();
+        wire_sampler.abort();
+        let (wire_ingress, wire_egress) = wire.totals();
+        metrics.record(
+            Layer::Wire,
+            traffic_channel,
+            Direction::Ingress,
+            wire_ingress.saturating_sub(last_wire_ingress.load(Ordering::Relaxed)) as usize,
+        );
+        metrics.record(
+            Layer::Wire,
+            traffic_channel,
+            Direction::Egress,
+            wire_egress.saturating_sub(last_wire_egress.load(Ordering::Relaxed)) as usize,
+        );
+    });
+
+    Some(crate::door::DoorSession {
+        incoming: crate::web::WebMapFrameStream::new(crate::web_transport::MpscReceiver::new(
+            incoming_rx,
+        )),
+        outgoing: crate::web_transport::MpscSink::new(outgoing_tx),
+        movement_tx,
+        // WS 门无多流/datagram 能力,bulk 触发与上行位置通道不可见
+        bulk: None,
+        incoming_datagrams: None,
+        capabilities: crate::door::DoorCapabilities {
+            datagram: false,
+            door_control: false,
+            bulk: false,
+            wire_metrics: true,
+        },
+    })
+}
+
+/// WS 门桥出站泵:每条消息独立成帧(zstd 套下为可独立解码的压缩块),
+/// 写出超时 2s 判慢速/死亡。应用层 envelope 计量由会话层 door_writer_loop
+/// 负责(那里才有连接 id),本泵只做门原生的压缩与分帧。
+async fn ws_egress_loop<S, E>(
+    mut sink: S,
+    mut outgoing: mpsc::Receiver<Bytes>,
+    mut encoder: Option<crate::compress::StreamEncoder>,
+    metrics: Arc<Metrics>,
+) where
+    S: Sink<Frame, Error = E> + Unpin,
+{
+    #[cfg(not(feature = "memory-debug"))]
+    let _ = &metrics;
+    while let Some(payload) = outgoing.recv().await {
+        let wire = match encoder.as_mut() {
+            Some(encoder) => match encoder.compress_chunk(&payload) {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    warn!(%error, "egress compress failed");
+                    return;
+                }
+            },
+            None => payload,
+        };
+        #[cfg(feature = "memory-debug")]
+        let send_started = std::time::Instant::now();
+        let sent =
+            tokio::time::timeout(Duration::from_secs(2), sink.send(Frame::binary(wire))).await;
+        let succeeded = matches!(sent, Ok(Ok(())));
+        #[cfg(feature = "memory-debug")]
+        metrics.record_writer_send(send_started.elapsed(), succeeded);
+        if !succeeded {
+            warn!("slow or failed websocket writer disconnected");
+            return;
+        }
+    }
 }
 
 pub(crate) async fn serve_web_map_session(
@@ -460,6 +654,7 @@ pub(crate) async fn serve_web_map_session(
 
     let maintenance_guard = state.maintenance_rooms.clone().read_owned().await;
     if maintenance_guard.contains(&room) {
+        door_reject(&mut writer_sink, channel, "room_maintenance").await;
         return;
     }
     let traffic_channel = match channel {
@@ -573,7 +768,7 @@ pub(crate) async fn serve_web_map_session(
 
     let event_tx = state.relay.sender();
     let writer_events = event_tx.clone();
-    let mut writer = tokio::spawn(wt_writer_loop(
+    let mut writer = tokio::spawn(door_writer_loop(
         writer_sink,
         control_rx,
         state_rx,
@@ -585,7 +780,7 @@ pub(crate) async fn serve_web_map_session(
         },
     ));
     let reader_id = id.clone();
-    let mut reader = tokio::spawn(wt_reader_loop(
+    let mut reader = tokio::spawn(door_reader_loop(
         first,
         socket,
         ReaderContext {
@@ -617,7 +812,6 @@ pub(crate) async fn serve_web_map_session(
             Some(tokio::spawn(async move {
                 let mut rx = rx;
                 while let Some(mut report) = rx.recv().await {
-                    eprintln!("DBG datagram report submit={} patch={}", report.submit_player_id, report.players_patch.is_some());
                     if report.submit_player_id != id {
                         continue;
                     }
@@ -696,335 +890,6 @@ async fn sample_wire_traffic(
     }
 }
 
-async fn serve_socket(
-    mut socket: HttpWebSocket,
-    state: AppState,
-    route_kind: ConnectionKind,
-    transport: &TransportConnectInfo,
-    remote_addr: String,
-    suite: Option<crate::compress::Suite>,
-) {
-    // 每连接一个持久 zstd 压缩器:消息级 flush 块,跨消息共享压缩上下文。
-    // zstd 套语义为单向:仅下行(服务端→客户端)压缩,上行恒为 plain 消息。
-    let mut encoder = match suite.filter(|suite| suite.stream_zstd()) {
-        Some(_) => match crate::compress::StreamEncoder::new() {
-            Ok(encoder) => Some(encoder),
-            Err(error) => {
-                warn!(%error, "zstd encoder unavailable, closing connection");
-                return;
-            }
-        },
-        None => None,
-    };
-    let first = match tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
-        Ok(Some(frame)) if frame.opcode() == OpCode::Binary => frame.payload().clone(),
-        _ => {
-            let _ = socket
-                .send(Frame::close(
-                    yawc::close::CloseCode::Policy,
-                    "handshake_required",
-                ))
-                .await;
-            return;
-        }
-    };
-    let envelope = match WireEnvelope::decode(first) {
-        Ok(envelope) => envelope,
-        Err(error) => {
-            warn!(%error, "invalid protobuf handshake");
-            let _ = socket
-                .send(Frame::close(
-                    yawc::close::CloseCode::Policy,
-                    "invalid_payload",
-                ))
-                .await;
-            return;
-        }
-    };
-
-    let (
-        id,
-        room,
-        profile,
-        kind,
-        channel,
-        display_name,
-        position_resolution,
-        program_version,
-        complete_online_roster,
-    ) = match (route_kind, envelope.payload) {
-        (
-            ConnectionKind::Player,
-            Some(wire_envelope::Payload::PlayerHandshakeRequest(handshake)),
-        ) => {
-            if handshake.submit_player_id.is_empty() {
-                reject(&mut socket, WireChannel::Player, "invalid_submit_player_id").await;
-                return;
-            }
-            let profile = match ProtocolProfile::negotiate(
-                &handshake.network_protocol_version,
-                &handshake.minimum_compatible_network_protocol_version,
-            ) {
-                Ok(profile) => profile,
-                Err(error) => {
-                    reject(&mut socket, WireChannel::Player, error.reason()).await;
-                    return;
-                }
-            };
-            let role = if profile.supports_external_source_role()
-                && matches!(
-                    handshake
-                        .client_role
-                        .and_then(|value| ClientRole::try_from(value).ok()),
-                    Some(ClientRole::ExternalSource)
-                ) {
-                ConnectionKind::ExternalSource
-            } else {
-                ConnectionKind::Player
-            };
-            let complete_online_roster = role == ConnectionKind::ExternalSource
-                && handshake
-                    .external_source_capabilities
-                    .as_ref()
-                    .is_some_and(|caps| {
-                        caps.datasets.iter().any(|dataset| {
-                            dataset.coverage
-                                == crate::proto::teamviewer::v1::DatasetCoverage::Complete as i32
-                                && dataset.scopes.contains(
-                                    &(crate::proto::teamviewer::v1::ExternalDataScope::OnlineRoster
-                                        as i32),
-                                )
-                        })
-                    });
-            (
-                handshake.submit_player_id,
-                normalize_room(handshake.room_code.as_deref()),
-                profile,
-                role,
-                WireChannel::Player,
-                handshake.client_display_name,
-                handshake.position_resolution,
-                handshake.local_program_version,
-                complete_online_roster,
-            )
-        }
-        (
-            ConnectionKind::WebMap,
-            Some(wire_envelope::Payload::WebMapHandshakeRequest(handshake)),
-        ) => {
-            let profile = match ProtocolProfile::negotiate(
-                &handshake.network_protocol_version,
-                &handshake.minimum_compatible_network_protocol_version,
-            ) {
-                Ok(profile) => profile,
-                Err(error) => {
-                    reject(&mut socket, WireChannel::WebMap, error.reason()).await;
-                    return;
-                }
-            };
-            (
-                format!("web-map-{}", Uuid::new_v4()),
-                normalize_room(handshake.room_code.as_deref()),
-                profile,
-                ConnectionKind::WebMap,
-                WireChannel::WebMap,
-                Some("Web Map".to_owned()),
-                None,
-                handshake.local_program_version,
-                false,
-            )
-        }
-        _ => {
-            reject(&mut socket, channel_for(route_kind), "channel_mismatch").await;
-            return;
-        }
-    };
-
-    let accepted_role = match kind {
-        ConnectionKind::ExternalSource => ClientRole::ExternalSource,
-        _ => ClientRole::Player,
-    };
-    let maintenance_guard = state.maintenance_rooms.clone().read_owned().await;
-    if maintenance_guard.contains(&room) {
-        reject(&mut socket, channel, "room_maintenance").await;
-        return;
-    }
-    let traffic_channel = match channel {
-        WireChannel::WebMap => TrafficChannel::WebMap,
-        _ => TrafficChannel::Player,
-    };
-    state.metrics.register(&id, traffic_channel);
-    let ack = HandshakeAck {
-        ready: true,
-        network_protocol_version: CURRENT_PROTOCOL_VERSION.to_string(),
-        minimum_compatible_network_protocol_version: MINIMUM_PROTOCOL_VERSION.to_string(),
-        local_program_version: PROGRAM_VERSION.to_owned(),
-        room_code: room.clone(),
-        delta_enabled: true,
-        digest_interval_sec: Some(state.config.digest_interval_sec as i32),
-        broadcast_hz: Some(
-            state
-                .config
-                .broadcast_hz(state.relay.player_connection_count()),
-        ),
-        report_interval_ticks: Some(
-            state.config.report_interval_ticks(
-                state
-                    .config
-                    .broadcast_hz(state.relay.player_connection_count()),
-            ),
-        ),
-        player_timeout_sec: Some(state.config.player_timeout_sec as i32),
-        entity_timeout_sec: Some(state.config.entity_timeout_sec as i32),
-        battle_chunk_timeout_sec: Some(state.config.battle_chunk_timeout_sec as i32),
-        accepted_client_role: profile
-            .supports_external_source_role()
-            .then_some(accepted_role as i32),
-        tab_history: profile
-            .supports_tab_history()
-            .then(|| tab_capabilities(&state.config)),
-        relationship_query: profile.supports_relationships().then_some(
-            RelationshipQueryCapabilities {
-                supported: true,
-                max_selectors: 256,
-                default_chunk_entries: 256,
-                max_chunk_entries: 256,
-                max_chunk_bytes: 256 * 1024,
-                relation_kinds: vec![1, 2, 3, 4, 5],
-            },
-        ),
-        report_policy: profile
-            .supports_relationships()
-            .then(|| report_policy(false)),
-        ..Default::default()
-    };
-    let ack = encode_payload(channel, wire_envelope::Payload::HandshakeAck(ack));
-    let ack_len = ack.len();
-    let ack_wire = match encoder.as_mut() {
-        Some(encoder) => match encoder.compress_chunk(&ack) {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                warn!(%error, "ack compress failed");
-                state.metrics.unregister(&id);
-                return;
-            }
-        },
-        None => Bytes::from_owner(ack),
-    };
-    if tokio::time::timeout(Duration::from_secs(2), socket.send(Frame::binary(ack_wire)))
-        .await
-        .is_err()
-    {
-        state.metrics.unregister(&id);
-        return;
-    }
-    state.metrics.record(
-        Layer::Application,
-        traffic_channel,
-        Direction::Egress,
-        ack_len,
-    );
-    state.metrics.record_protobuf(&id, "handshake_ack", ack_len);
-
-    let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
-    let (state_tx, state_rx) = watch::channel(None::<StateFrame>);
-    // WS 没有 datagram 通道:即便客户端声明可消费 movement datagram 也不启用分流
-    let (movement_tx, _movement_rx) = watch::channel(None);
-    if state
-        .relay
-        .send(RelayEvent::Register(RegisterConnection {
-            id: id.clone(),
-            room: room.clone(),
-            protocol: profile,
-            kind,
-            display_name,
-            position_resolution,
-            program_version,
-            remote_addr: remote_addr.clone(),
-            control: control_tx.clone(),
-            state: state_tx,
-            movement: movement_tx,
-            unreliable_positions: false,
-        }))
-        .await
-        .is_err()
-    {
-        state.metrics.unregister(&id);
-        return;
-    }
-    drop(maintenance_guard);
-    record_connection_started(&state.db, &id, &room, kind, &remote_addr).await;
-    info!(connection_id = %id, %room, ?kind, protocol = %profile.peer_current(), %remote_addr, "websocket connected");
-
-    let (sink, stream) = socket.split();
-    let event_tx = state.relay.sender();
-    let writer_events = event_tx.clone();
-    let mut writer = tokio::spawn(writer_loop(
-        sink,
-        control_rx,
-        state_rx,
-        WriterContext {
-            id: id.clone(),
-            events: writer_events,
-            metrics: state.metrics.clone(),
-            traffic_channel,
-        },
-        encoder,
-    ));
-    let reader_id = id.clone();
-    let mut reader = tokio::spawn(reader_loop(
-        stream,
-        ReaderContext {
-            id: reader_id,
-            room: room.clone(),
-            control: control_tx,
-            events: event_tx.clone(),
-            channel,
-            kind,
-            tab_history: state.tab_history.clone(),
-            relationships: state.relationships.clone(),
-            metrics: state.metrics.clone(),
-            traffic_channel,
-            profile,
-            complete_online_roster,
-        },
-    ));
-    let last_wire_ingress = Arc::new(AtomicU64::new(0));
-    let last_wire_egress = Arc::new(AtomicU64::new(0));
-    let wire_sampler = tokio::spawn(sample_wire_traffic(
-        transport.wire.clone(),
-        state.metrics.clone(),
-        traffic_channel,
-        last_wire_ingress.clone(),
-        last_wire_egress.clone(),
-    ));
-
-    tokio::select! {
-        _ = &mut writer => reader.abort(),
-        _ = &mut reader => writer.abort(),
-    }
-    wire_sampler.abort();
-    let (wire_ingress, wire_egress) = transport.wire.totals();
-    state.metrics.record(
-        Layer::Wire,
-        traffic_channel,
-        Direction::Ingress,
-        wire_ingress.saturating_sub(last_wire_ingress.load(Ordering::Relaxed)) as usize,
-    );
-    state.metrics.record(
-        Layer::Wire,
-        traffic_channel,
-        Direction::Egress,
-        wire_egress.saturating_sub(last_wire_egress.load(Ordering::Relaxed)) as usize,
-    );
-    let _ = event_tx
-        .send(RelayEvent::Disconnect { id: id.clone() })
-        .await;
-    record_connection_ended(&state.db, &id, &room, kind, &remote_addr).await;
-    state.metrics.unregister(&id);
-    info!(connection_id = %id, "websocket disconnected");
-}
-
 enum WriterAction {
     State(StateFrame),
     Control(Arc<[u8]>),
@@ -1037,133 +902,9 @@ struct WriterContext {
     traffic_channel: TrafficChannel,
 }
 
-async fn writer_loop<S, E>(
-    mut sink: S,
-    mut control: mpsc::Receiver<Arc<[u8]>>,
-    mut state: watch::Receiver<Option<StateFrame>>,
-    context: WriterContext,
-    mut encoder: Option<crate::compress::StreamEncoder>,
-) where
-    S: Sink<Frame, Error = E> + Unpin,
-{
-    loop {
-        let action = tokio::select! {
-            biased;
-            changed = state.changed() => {
-                if changed.is_err() { None } else {
-                    state.borrow_and_update().clone().map(WriterAction::State)
-                }
-            }
-            value = control.recv() => value.map(WriterAction::Control),
-        };
-        let Some(action) = action else {
-            break;
-        };
-
-        match action {
-            WriterAction::State(frame) => {
-                if let Some(bytes) = frame.bytes
-                    && !send_writer_payload(
-                        &context.id,
-                        &mut sink,
-                        bytes,
-                        &context.metrics,
-                        context.traffic_channel,
-                        &mut encoder,
-                    )
-                    .await
-                {
-                    break;
-                }
-
-                if let Some(digest) = frame.digest
-                    && !send_writer_payload(
-                        &context.id,
-                        &mut sink,
-                        digest,
-                        &context.metrics,
-                        context.traffic_channel,
-                        &mut encoder,
-                    )
-                    .await
-                {
-                    break;
-                }
-
-                let _ = context
-                    .events
-                    .send(RelayEvent::Delivered {
-                        id: context.id.clone(),
-                        revision: frame.revision,
-                        snapshot: frame.snapshot,
-                        battle_revision: frame.battle_revision,
-                    })
-                    .await;
-            }
-            WriterAction::Control(bytes) => {
-                if !send_writer_payload(
-                    &context.id,
-                    &mut sink,
-                    bytes,
-                    &context.metrics,
-                    context.traffic_channel,
-                    &mut encoder,
-                )
-                .await
-                {
-                    break;
-                }
-            }
-        }
-    }
-}
-
-async fn send_writer_payload<S, E>(
-    id: &str,
-    sink: &mut S,
-    bytes: Arc<[u8]>,
-    metrics: &Metrics,
-    traffic_channel: TrafficChannel,
-    encoder: &mut Option<crate::compress::StreamEncoder>,
-) -> bool
-where
-    S: Sink<Frame, Error = E> + Unpin,
-{
-    let byte_count = bytes.len();
-    let message_type = protobuf_message_type(&bytes);
-    // 计量按应用层 envelope 字节;压缩后实际线上字节由 Wire 层计数反映
-    let payload = match encoder.as_mut() {
-        Some(encoder) => match encoder.compress_chunk(&bytes) {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                warn!(connection_id = %id, %error, "egress compress failed");
-                return false;
-            }
-        },
-        None => Bytes::from_owner(bytes),
-    };
-    #[cfg(feature = "memory-debug")]
-    let send_started = std::time::Instant::now();
-    let sent =
-        tokio::time::timeout(Duration::from_secs(2), sink.send(Frame::binary(payload))).await;
-    let succeeded = matches!(sent, Ok(Ok(())));
-    #[cfg(feature = "memory-debug")]
-    metrics.record_writer_send(send_started.elapsed(), succeeded);
-    if !succeeded {
-        warn!(connection_id = %id, "slow or failed websocket writer disconnected");
-        return false;
-    }
-    metrics.record(
-        Layer::Application,
-        traffic_channel,
-        Direction::Egress,
-        byte_count,
-    );
-    metrics.record_protobuf(id, message_type, byte_count);
-    true
-}
-
-async fn wt_writer_loop<Si>(
+/// 三门共享的会话出站循环(桥接模式):DoorSession.outgoing 是 plain
+/// envelope 的 MpscSink,门原生的压缩与分帧封在各门桥的出站泵内。
+async fn door_writer_loop<Si>(
     mut sink: Si,
     mut control: mpsc::Receiver<Arc<[u8]>>,
     mut state: watch::Receiver<Option<StateFrame>>,
@@ -1231,7 +972,9 @@ async fn wt_writer_loop<Si>(
     }
 }
 
-async fn wt_reader_loop(first_frame: Bytes, mut stream: WebMapFrameStream, context: ReaderContext) {
+/// 三门共享的会话入站循环(桥接模式):入站一帧 = 裸 envelope(恒 plain),
+/// 门原生分帧已由门桥消化;载荷分发统一委托 handle_envelope。
+async fn door_reader_loop(first_frame: Bytes, mut stream: WebMapFrameStream, context: ReaderContext) {
     let ReaderContext {
         id,
         room,
@@ -1633,38 +1376,6 @@ struct ReaderContext {
     traffic_channel: TrafficChannel,
     profile: ProtocolProfile,
     complete_online_roster: bool,
-}
-
-async fn reader_loop(
-    mut stream: futures_util::stream::SplitStream<HttpWebSocket>,
-    mut context: ReaderContext,
-) {
-    // 入站字节计量是 WS 门特有视角(桥接抽象未覆盖的传输层观测),
-    // 载荷分发统一走 handle_envelope(与 WT/QUIC 门桥同一路径)
-    let metrics = context.metrics.clone();
-    let traffic_channel = context.traffic_channel;
-    while let Some(frame) = stream.next().await {
-        if frame.opcode() != OpCode::Binary {
-            if frame.opcode() == OpCode::Close {
-                break;
-            }
-            continue;
-        }
-        // 上行恒为 plain 消息(zstd 套仅压缩下行)
-        let payload = frame.payload().clone();
-        metrics.record(
-            Layer::Application,
-            traffic_channel,
-            Direction::Ingress,
-            payload.len(),
-        );
-        let Ok(envelope) = WireEnvelope::decode(payload) else {
-            continue;
-        };
-        if !handle_envelope(envelope, &mut context).await {
-            break;
-        }
-    }
 }
 
 async fn send_tab_sync(
@@ -2172,10 +1883,47 @@ mod tests {
         }
     }
 
+    /// 会话出站循环的接收端:直接收集 plain envelope 字节(门桥出站泵之前)。
+    struct RecordingByteSink {
+        payloads: mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    impl Sink<Bytes> for RecordingByteSink {
+        type Error = io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+            let _ = self.payloads.send(item.to_vec());
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn writer_orders_each_state_before_its_matching_digest() {
-        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel();
-        let sink = RecordingSink { frames: frames_tx };
+    async fn door_writer_orders_each_state_before_its_matching_digest() {
+        let (payloads_tx, mut payloads_rx) = mpsc::unbounded_channel();
+        let sink = RecordingByteSink {
+            payloads: payloads_tx,
+        };
         let (control_tx, control_rx) = mpsc::channel(4);
         let (state_tx, state_rx) = watch::channel(None::<StateFrame>);
         let (events_tx, mut events_rx) = mpsc::channel(4);
@@ -2196,7 +1944,7 @@ mod tests {
             battle_revision: 1,
         }));
 
-        let writer = tokio::spawn(writer_loop(
+        let writer = tokio::spawn(door_writer_loop(
             sink,
             control_rx,
             state_rx,
@@ -2206,12 +1954,11 @@ mod tests {
                 metrics: Arc::new(Metrics::default()),
                 traffic_channel: TrafficChannel::Player,
             },
-            None,
         ));
 
-        assert_eq!(frames_rx.recv().await.as_deref(), Some(&b"state-1"[..]));
-        assert_eq!(frames_rx.recv().await.as_deref(), Some(&b"digest-1"[..]));
-        assert_eq!(frames_rx.recv().await.as_deref(), Some(&b"control"[..]));
+        assert_eq!(payloads_rx.recv().await.as_deref(), Some(&b"state-1"[..]));
+        assert_eq!(payloads_rx.recv().await.as_deref(), Some(&b"digest-1"[..]));
+        assert_eq!(payloads_rx.recv().await.as_deref(), Some(&b"control"[..]));
 
         let RelayEvent::Delivered {
             revision, snapshot, ..
@@ -2232,53 +1979,39 @@ mod tests {
             }),
             battle_revision: 2,
         }));
-        assert_eq!(frames_rx.recv().await.as_deref(), Some(&b"state-2"[..]));
-        assert_eq!(frames_rx.recv().await.as_deref(), Some(&b"digest-2"[..]));
+        assert_eq!(payloads_rx.recv().await.as_deref(), Some(&b"state-2"[..]));
+        assert_eq!(payloads_rx.recv().await.as_deref(), Some(&b"digest-2"[..]));
 
         writer.abort();
     }
 
-    /// WS 门 +zstd 套:writer_loop 出站的每条消息必须是可独立解码的 zstd
-    /// 块(逐 envelope flush),按序还原出原 envelope。
-    #[tokio::test(start_paused = true)]
-    async fn writer_compresses_each_message_with_persistent_zstd_context() {
+    /// WS 门桥出站泵 +zstd 套:经出站泵落地的每条 WS 消息必须是可独立
+    /// 解码的 zstd 块(逐 envelope flush),按序还原出原 envelope。
+    #[tokio::test]
+    async fn ws_egress_compresses_each_message_with_persistent_zstd_context() {
         let (frames_tx, mut frames_rx) = mpsc::unbounded_channel();
         let sink = RecordingSink { frames: frames_tx };
-        let (control_tx, control_rx) = mpsc::channel(4);
-        let (state_tx, state_rx) = watch::channel(None::<StateFrame>);
-        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let (payload_tx, payload_rx) = mpsc::channel::<Bytes>(4);
         let metrics = Arc::new(Metrics::default());
 
         let first_payload = vec![9u8; 4096];
         let second_payload = b"control-frame".to_vec();
-        control_tx
-            .send(Arc::from(&second_payload[..]))
-            .await
-            .expect("control channel");
-        state_tx.send_replace(Some(StateFrame {
-            revision: 1,
-            bytes: Some(Arc::from(&first_payload[..])),
-            digest: None,
-            snapshot: Arc::new(SnapshotFull {
-                server_time: Some(1.0),
-                ..Default::default()
-            }),
-            battle_revision: 1,
-        }));
-
         let encoder = crate::compress::StreamEncoder::new().expect("zstd encoder");
-        let writer = tokio::spawn(writer_loop(
+        let egress = tokio::spawn(ws_egress_loop(
             sink,
-            control_rx,
-            state_rx,
-            WriterContext {
-                id: "test-zstd".to_owned(),
-                events: events_tx,
-                metrics: metrics.clone(),
-                traffic_channel: TrafficChannel::Player,
-            },
+            payload_rx,
             Some(encoder),
+            metrics,
         ));
+        payload_tx
+            .send(Bytes::from(first_payload.clone()))
+            .await
+            .expect("payload channel");
+        payload_tx
+            .send(Bytes::from(second_payload.clone()))
+            .await
+            .expect("payload channel");
+        drop(payload_tx);
 
         let mut decoder = crate::compress::StreamDecoder::new().expect("zstd decoder");
         for expected in [first_payload, second_payload] {
@@ -2288,14 +2021,11 @@ mod tests {
             let decoded = decoder.decompress_chunk(&chunk).expect("decompress");
             assert_eq!(decoded, expected);
         }
-
-        let RelayEvent::Delivered { revision, .. } =
-            events_rx.recv().await.expect("delivered event")
-        else {
-            panic!("expected delivered event");
-        };
-        assert_eq!(revision, 1);
-        writer.abort();
+        // 通道关闭后出站泵退出(会话拆除信号)
+        tokio::time::timeout(Duration::from_secs(5), egress)
+            .await
+            .expect("egress loop exit")
+            .expect("egress join");
     }
 
     /// WS 子协议 → 压缩套:多值/逗号合并头都按客户端偏好序解析,

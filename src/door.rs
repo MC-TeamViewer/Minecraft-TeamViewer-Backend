@@ -6,6 +6,7 @@
 //! UDP 相对 TCP 的优势在抽象层显式为两项能力:
 //! - `datagram`:movement 位置批走不可靠 datagram(不重传、不队头阻塞);
 //! - `door_control`/`bulk`:额外的独立流(门控/大内容),与应用流互不混用。
+//!
 //! WebSocket 不具备这些能力,由 WS 适配器报告 `false` 并走等价降级路径。
 
 use std::sync::Arc;
@@ -18,7 +19,8 @@ use crate::relay::MovementBatch;
 
 /// 门会话能力矩阵。`datagram=false` 时应用层以可靠流低频位置兜底;
 /// `bulk=false` 时 bulk-push 触发对该会话不可见。`door_control`/`wire_metrics`
-/// 由后续 WS 收编 commit 消费(桥内已按能力装配)。
+/// 为观测性标注:door_control 流与 Wire 字节采样都在各自门桥内装配,
+/// 会话层只读 `datagram`。
 #[derive(Clone, Copy, Debug, Default)]
 #[allow(dead_code)]
 pub(crate) struct DoorCapabilities {
