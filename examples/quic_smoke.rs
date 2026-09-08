@@ -33,6 +33,14 @@ const SERVER_ADDR: &str = "127.0.0.1:8767";
 /// 与 mod/脚本一致的解压窗口上限(2^23)。
 const MAX_DECOMPRESSION_WINDOW_LOG: u32 = 23;
 
+/// 目标门地址,默认本机;弱网代理/netem 场景用环境变量改指代理端口。
+fn server_addr() -> std::net::SocketAddr {
+    std::env::var("TEAMVIEWER_QUIC_SMOKE_SERVER")
+        .unwrap_or_else(|_| SERVER_ADDR.to_string())
+        .parse()
+        .expect("TEAMVIEWER_QUIC_SMOKE_SERVER 必须是合法的 host:port")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let zstd = run_case(ALPN_ZSTD, true, "quic-smoke-zstd").await;
@@ -174,7 +182,9 @@ async fn connect(alpn: &str) -> Result<quinn::Connection> {
     ));
     config.transport_config(Arc::new(quinn::TransportConfig::default()));
     endpoint.set_default_client_config(config);
-    let connection = endpoint.connect(SERVER_ADDR.parse()?, "127.0.0.1")?.await?;
+    let connection = endpoint
+        .connect(server_addr(), "127.0.0.1")?
+        .await?;
     Ok(connection)
 }
 
