@@ -150,6 +150,8 @@ fn stream_bridge(
     let (incoming_tx, incoming_rx) = mpsc::channel::<Result<Bytes, io::Error>>(256);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Bytes>(256);
     let (movement_tx, mut movement_rx) = watch::channel(None::<Arc<MovementBatch>>);
+    // 上行位置 datagram 通道(alpha.5):桥内解析,只转发合法形状
+    let (uplink_tx, uplink_rx) = mpsc::channel::<crate::proto::teamviewer::v1::PlayerReportBundle>(32);
     // bulk 触发通道(容量 1 = 每会话同时只允许一个在途 bulk,满即拒)
     let (bulk_tx, mut bulk_rx) = mpsc::channel::<bulk::BulkRequest>(1);
     // bulk 流必须在 door-control 下行流之后开启(流识别按开启序),
@@ -236,14 +238,34 @@ fn stream_bridge(
         }
     });
 
-    // 收方向 datagram 排空:mod 客户端不回发 datagram,但必须持续读取,
-    // 否则对端发送缓冲堆积会触发其丢弃或流控
-    let drain_connection = connection.clone();
-    tokio::spawn(async move {
-        while let Ok(datagram) = drain_connection.read_datagram().await {
-            drop(datagram);
-        }
-    });
+    // 上行 datagram 接收(alpha.5):裸 WireEnvelope{PLAYER, PlayerReportBundle}
+    // 且仅 players_patch 有值才转发;声明校验在应用层(serve 侧)。
+    // 持续读取本身也必须保留:否则对端发送缓冲堆积会触发其丢弃或流控。
+    {
+        let drain_connection = connection.clone();
+        tokio::spawn(async move {
+            while let Ok(datagram) = drain_connection.read_datagram().await {
+                use prost::Message as _;
+use crate::proto::teamviewer::v1::{WireChannel, WireEnvelope, wire_envelope};
+                let Ok(envelope) = WireEnvelope::decode(datagram.as_ref()) else {
+                    continue;
+                };
+                if envelope.channel != WireChannel::Player as i32 {
+                    continue;
+                }
+                let Some(wire_envelope::Payload::PlayerReportBundle(report)) = envelope.payload
+                else {
+                    continue;
+                };
+                if report.players_patch.is_none() {
+                    continue;
+                }
+                if uplink_tx.send(report).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
 
     // door-control 上行(全部压缩套常开,约定见 TeamViewRelay-Protocol
     // "传输层/应用层分层与 door-control 流"):客户端第 1 条单向流承载门控
@@ -485,6 +507,7 @@ fn stream_bridge(
         outgoing: crate::web_transport::MpscSink::new(outgoing_tx),
         movement_tx,
         bulk: Some(bulk_tx),
+        incoming_datagrams: Some(uplink_rx),
         capabilities: crate::door::DoorCapabilities {
             datagram: connection
                 .max_datagram_size()

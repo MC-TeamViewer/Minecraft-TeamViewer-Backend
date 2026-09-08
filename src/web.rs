@@ -321,6 +321,7 @@ pub(crate) async fn serve_web_map_session(
         incoming: mut socket,
         outgoing: mut writer_sink,
         movement_tx,
+        incoming_datagrams,
         capabilities: crate::door::DoorCapabilities { datagram: datagram_capable, .. },
         ..
     } = session;
@@ -349,6 +350,7 @@ pub(crate) async fn serve_web_map_session(
         program_version,
         complete_online_roster,
         unreliable_positions,
+        unreliable_channels_accepted,
     ) = match envelope.payload {
         // 无 path 的门(WT/QUIC)靠首个握手的载荷类型自识别 Player/WebMap 通道
         Some(wire_envelope::Payload::PlayerHandshakeRequest(handshake)) => {
@@ -396,6 +398,19 @@ pub(crate) async fn serve_web_map_session(
                                 )
                         })
                     });
+            // 上行位置通道(alpha.5):客户端声明将经 datagram 上送的通道;
+            // 实际启用 = 声明 ∩ 已知值 ∩ 本门具备 datagram 接收能力
+            let unreliable_channels_accepted: Vec<UnreliableChannel> =
+                if incoming_datagrams.is_some() {
+                    handshake
+                        .unreliable_channels
+                        .iter()
+                        .filter_map(|value| UnreliableChannel::try_from(*value).ok())
+                        .filter(|value| *value != UnreliableChannel::Unspecified)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             (
                 handshake.submit_player_id,
                 normalize_room(handshake.room_code.as_deref()),
@@ -408,6 +423,7 @@ pub(crate) async fn serve_web_map_session(
                 complete_online_roster,
                 // 玩家连接是位置的产出方,不做 movement datagram 分流
                 false,
+                unreliable_channels_accepted,
             )
         }
         Some(wire_envelope::Payload::WebMapHandshakeRequest(handshake)) => {
@@ -434,6 +450,7 @@ pub(crate) async fn serve_web_map_session(
                 handshake.local_program_version,
                 false,
                 unreliable_positions,
+                Vec::new(),
             )
         }
         _ => {
@@ -496,6 +513,14 @@ pub(crate) async fn serve_web_map_session(
         report_policy: profile
             .supports_relationships()
             .then(|| report_policy(false)),
+        unreliable_channels_accepted: if channel == WireChannel::Player {
+            unreliable_channels_accepted
+                .iter()
+                .map(|value| *value as i32)
+                .collect()
+        } else {
+            Vec::new()
+        },
         ..Default::default()
     };
     let ack = encode_payload(channel, wire_envelope::Payload::HandshakeAck(ack));
@@ -579,9 +604,60 @@ pub(crate) async fn serve_web_map_session(
         },
     ));
 
+    // 上行位置 datagram 消费(alpha.5):Player 通道且握手声明启用时,
+    // datagram 里的 players_patch 与可靠流上报汇入同一 relay 入口;
+    // 未启用/非 Player 通道则排空(保持 datagram 管道畅通,内容丢弃)
+    let mut datagram_task = match (channel, &unreliable_channels_accepted, incoming_datagrams)
+    {
+        (WireChannel::Player, accepted, Some(rx))
+            if accepted.contains(&UnreliableChannel::Movement) =>
+        {
+            let events = event_tx.clone();
+            let id = id.clone();
+            Some(tokio::spawn(async move {
+                let mut rx = rx;
+                while let Some(mut report) = rx.recv().await {
+                    eprintln!("DBG datagram report submit={} patch={}", report.submit_player_id, report.players_patch.is_some());
+                    if report.submit_player_id != id {
+                        continue;
+                    }
+                    sanitize_player_report(profile, &mut report);
+                    if events
+                        .send(RelayEvent::PlayerReport {
+                            id: id.clone(),
+                            report: Box::new(report),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }))
+        }
+        (_, _, Some(mut rx)) => Some(tokio::spawn(async move {
+            while rx.recv().await.is_some() {}
+        })),
+        (_, _, None) => None,
+    };
+
     tokio::select! {
         _ = &mut writer => reader.abort(),
         _ = &mut reader => writer.abort(),
+        _ = async {
+            match datagram_task.as_mut() {
+                Some(task) => {
+                    let _ = task.await;
+                }
+                None => futures_util::future::pending::<()>().await,
+            }
+        } => {
+            if let Some(task) = datagram_task.take() {
+                task.abort();
+            }
+            reader.abort();
+            writer.abort();
+        }
     }
     let _ = event_tx
         .send(RelayEvent::Disconnect { id: id.clone() })
@@ -2312,6 +2388,7 @@ mod tests {
                 outgoing: sink,
                 movement_tx,
                 bulk: None,
+                incoming_datagrams: None,
                 capabilities: crate::door::DoorCapabilities::default(),
             },
             state,
@@ -2323,6 +2400,7 @@ mod tests {
             network_protocol_version: CURRENT_PROTOCOL_VERSION.to_string(),
             minimum_compatible_network_protocol_version: MINIMUM_PROTOCOL_VERSION.to_string(),
             room_code: Some("door-room".to_owned()),
+            unreliable_channels: vec![UnreliableChannel::Movement as i32],
             ..Default::default()
         };
         let envelope = WireEnvelope {
@@ -2347,6 +2425,152 @@ mod tests {
         assert_eq!(ack.network_protocol_version, "0.9.0");
         assert_eq!(ack.room_code, "door-room");
         assert_eq!(ack.accepted_client_role, Some(ClientRole::Player as i32));
+        // 声明回执:本测试 DoorSession 无 datagram 通道(None)→ 不启用
+        assert!(ack.unreliable_channels_accepted.is_empty());
+
+        session.abort();
+    }
+
+    /// 上行位置 datagram(alpha.5)端到端:握手声明 MOVEMENT 且门具备
+    /// datagram 接收 → ack 回执启用;datagram 里的 players_patch 与可靠
+    /// 流上报汇入同一 relay,位置出现在快照中。
+    #[tokio::test]
+    async fn door_session_uplink_position_datagram_reaches_relay() {
+        use crate::proto::teamviewer::v1::{
+            PlayerDelta, PlayerHandshakeRequest, PlayerPatchScope, PlayerUpsert,
+            UnreliableChannel, wire_envelope,
+        };
+        use crate::web_transport::{MpscReceiver, MpscSink};
+        use prost::Message as _;
+
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        sqlx::migrate!().run(&db).await.expect("migrations");
+        let tab_history = Arc::new(TabHistoryStore::new(db.clone()));
+        tab_history.initialize().await.expect("tab history schema");
+        let relationships = Arc::new(RelationshipStore::new(db.clone()));
+        relationships
+            .initialize()
+            .await
+            .expect("relationship schema");
+        let config = Arc::new(RuntimeConfig::load());
+        let state = AppState {
+            relay: RelayHandle::spawn(config.clone()),
+            db,
+            tab_history,
+            relationships,
+            config,
+            metrics: Arc::new(Metrics::default()),
+            maintenance_rooms: Arc::new(RwLock::new(HashSet::new())),
+            bulk_hub: crate::bulk::Hub::new(),
+            #[cfg(feature = "memory-debug")]
+            resource_debug: None,
+        };
+
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(4);
+        let (datagram_tx, datagram_rx) = mpsc::channel::<crate::proto::teamviewer::v1::PlayerReportBundle>(8);
+        let stream = WebMapFrameStream::new(MpscReceiver::new(inbound_rx));
+        let sink = MpscSink::new(outbound_tx);
+        let (movement_tx, _movement_rx) = watch::channel(None);
+
+        let session = tokio::spawn(serve_web_map_session(
+            crate::door::DoorSession {
+                incoming: stream,
+                outgoing: sink,
+                movement_tx,
+                bulk: None,
+                incoming_datagrams: Some(datagram_rx),
+                capabilities: crate::door::DoorCapabilities {
+                    datagram: true,
+                    ..Default::default()
+                },
+            },
+            state,
+            "test-remote".to_owned(),
+        ));
+
+        let handshake = PlayerHandshakeRequest {
+            submit_player_id: "door-player".to_owned(),
+            network_protocol_version: CURRENT_PROTOCOL_VERSION.to_string(),
+            minimum_compatible_network_protocol_version: MINIMUM_PROTOCOL_VERSION.to_string(),
+            room_code: Some("door-room".to_owned()),
+            unreliable_channels: vec![UnreliableChannel::Movement as i32],
+            ..Default::default()
+        };
+        let envelope = WireEnvelope {
+            channel: WireChannel::Player as i32,
+            payload: Some(wire_envelope::Payload::PlayerHandshakeRequest(handshake)),
+        };
+        inbound_tx
+            .send(Ok(Bytes::from(envelope.encode_to_vec())))
+            .await
+            .expect("inbound frame");
+
+        let ack_bytes = tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("ack timeout")
+            .expect("ack frame");
+        let ack_envelope = WireEnvelope::decode(ack_bytes).expect("ack envelope");
+        let Some(wire_envelope::Payload::HandshakeAck(ack)) = ack_envelope.payload else {
+            panic!("expected handshake ack");
+        };
+        // 门具备 datagram 能力:声明获得回执
+        assert_eq!(
+            ack.unreliable_channels_accepted,
+            vec![UnreliableChannel::Movement as i32]
+        );
+
+        // datagram 上报:位置 upsert(独立 envelope,无分帧)
+        let report = crate::proto::teamviewer::v1::PlayerReportBundle {
+            submit_player_id: "door-player".to_owned(),
+            players_patch: Some(PlayerPatchScope {
+                upsert: vec![PlayerUpsert {
+                    id: "p1".to_owned(),
+                    data: Some(PlayerDelta {
+                        x: Some(1.5),
+                        y: Some(64.0),
+                        z: Some(-2.0),
+                        dimension: Some("minecraft:overworld".to_owned()),
+                        player_name: Some("p1".to_owned()),
+                        ..Default::default()
+                    }),
+                    clear_fields: Vec::new(),
+                }],
+                delete: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        datagram_tx.send(report).await.expect("datagram send");
+
+        // 位置经 relay 进入快照:轮询出站帧直至 SnapshotFull 含 p1
+        let deadline = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = outbound_rx.recv().await.expect("outbound frame");
+                let Ok(envelope) = WireEnvelope::decode(frame) else {
+                    continue;
+                };
+                // delta_enabled 会话首帧为 SnapshotFull,此后位置走 Patch
+                let arrived = match &envelope.payload {
+                    Some(wire_envelope::Payload::SnapshotFull(snapshot)) => {
+                        snapshot.players.contains_key("p1")
+                    }
+                    Some(wire_envelope::Payload::Patch(patch)) => patch
+                        .players
+                        .as_ref()
+                        .is_some_and(|scope| scope.upsert.iter().any(|u| u.id == "p1")),
+                    _ => false,
+                };
+                if arrived {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(deadline.is_ok(), "位置未在超时内进入快照");
 
         session.abort();
     }

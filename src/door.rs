@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
 use crate::bulk;
+use crate::proto::teamviewer::v1::PlayerReportBundle;
 use crate::relay::MovementBatch;
 
 /// 门会话能力矩阵。`datagram=false` 时应用层以可靠流低频位置兜底;
@@ -38,5 +39,8 @@ pub(crate) struct DoorSession {
     pub movement_tx: watch::Sender<Option<Arc<MovementBatch>>>,
     /// bulk 触发通道(容量 1);`None` = 该门不支持(WS)。
     pub bulk: Option<mpsc::Sender<bulk::BulkRequest>>,
+    /// 上行 datagram 位置通道(alpha.5):桥内解析出的 `PlayerReportBundle`
+    /// (仅 players_patch 有值);`None` = 该门无 datagram 能力(WS)。
+    pub incoming_datagrams: Option<mpsc::Receiver<PlayerReportBundle>>,
     pub capabilities: DoorCapabilities,
 }
