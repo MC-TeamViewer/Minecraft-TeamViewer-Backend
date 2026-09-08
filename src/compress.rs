@@ -23,14 +23,17 @@ use std::io;
 
 use bytes::Bytes;
 
+#[cfg(test)]
 use crate::frame::MAX_FRAME_LEN;
 use crate::quic_transport::{ALPN_PLAIN, ALPN_ZSTD, ALPN_ZSTD_DICT};
 
-/// 服务端下行流压缩级别。上行(客户端)可自选更低级别;级别是纯发送端
-/// 决策,zstd 帧自描述,无需协商。
+/// 服务端下行流压缩级别(压缩套语义为单向,上行恒 plain)。级别是纯
+/// 发送端决策,zstd 帧自描述,无需协商。
 pub(crate) const STREAM_COMPRESSION_LEVEL: i32 = 3;
 
 /// 解压窗口上限(2^23 = 8 MiB):防对端大窗口帧逼出大内存分配。
+/// 仅测试用(服务端不再解压任何流,客户端实现须自行设同款上限)。
+#[cfg(test)]
 const MAX_DECOMPRESSION_WINDOW_LOG: u32 = 23;
 
 /// 门协商出的压缩套。
@@ -54,8 +57,10 @@ impl Suite {
         }
     }
 
-    /// 可靠流是否走 zstd 分块压缩。WS 门无 datagram,其 `ZstdDict` 与
-    /// `Zstd` 在流上行为一致,故仅按此判断即可。
+    /// 可靠流下行(服务端→客户端)是否走 zstd 分块压缩。压缩套语义为
+    /// 单向:上行恒为 plain 分帧(上行载荷小,且浏览器端 fzstd 仅解压)。
+    /// WS 门无 datagram,其 `ZstdDict` 与 `Zstd` 在流上行为一致,故仅按
+    /// 此判断即可。
     pub(crate) fn stream_zstd(self) -> bool {
         matches!(self, Suite::Zstd | Suite::ZstdDict)
     }
@@ -168,12 +173,16 @@ impl StreamEncoder {
     }
 }
 
-/// 上行(客户端→服务端)持久解压器:与对端 StreamEncoder 配对的同一连续
-/// zstd 流。每连接实例,仅由单个读任务使用。
+/// 下行(服务端→客户端)流持久解压器:与对端 StreamEncoder 配对的同一连续
+/// zstd 流。服务端不解压任何上行(压缩套语义为单向,上行恒 plain);本结构
+/// 用于测试与服务端出站的解码验证,也是客户端实现(fzstd/zstd-jni)对齐的
+/// 参照。每连接实例,仅由单个读任务使用。
+#[cfg(test)]
 pub(crate) struct StreamDecoder {
     dctx: zstd_safe::DCtx<'static>,
 }
 
+#[cfg(test)]
 impl StreamDecoder {
     pub(crate) fn new() -> io::Result<StreamDecoder> {
         let mut dctx = zstd_safe::DCtx::create();
@@ -211,6 +220,7 @@ impl StreamDecoder {
     }
 }
 
+#[cfg(test)]
 fn zstd_error(error: zstd_safe::ErrorCode) -> io::Error {
     io::Error::other(format!("zstd error: {error:?}"))
 }

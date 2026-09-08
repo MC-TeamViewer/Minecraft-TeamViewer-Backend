@@ -256,8 +256,10 @@ WebSocket。证书更新成功只影响新 QUIC 连接，已有连接保留旧 T
 envelope `write + flush` 保证即时可解码，压缩块作为一帧 payload 走 varint 分帧（WS 门
 的压缩块即整条 binary 消息，消息边界天然对齐）；接收端把逐帧压缩块持续喂进同一条持久
 DCtx——压缩块边界与 envelope 一一对应，跨帧共享压缩上下文（等效 permessage-deflate
-的 context takeover）。解压窗口上限 8 MiB。datagram 不适用该模型（自包含单元，丢弃互
-不影响）。
+的 context takeover）。解压窗口上限 8 MiB。压缩为**单向语义**：仅下行（服务端→客户端）
+压缩，上行恒为 plain varint 分帧（WS 门为 plain 消息）——上行载荷小（握手、命令、回执），
+浏览器端解压库 fzstd 仅解压，双向压缩需在用户脚本内嵌完整压缩器，得不偿失。
+datagram 不适用该模型（自包含单元，丢弃互不影响）。
 
 datagram 的压缩语义（QUIC/WT 门，`+zstd`/`+zstd-dict` 套）：每块压缩为**一个自包含
 zstd 单帧**（无跨 datagram 上下文，丢一块不影响后续），无应用层长度前缀。

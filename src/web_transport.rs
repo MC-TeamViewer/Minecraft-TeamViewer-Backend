@@ -363,45 +363,11 @@ fn stream_bridge(
         }
 
         let reader = tokio::spawn(async move {
-            // 上行 zstd:压缩块 → 持久 DCtx → envelope;分块边界由对端
-            // flush 保证,但解码按流推进,不依赖该假设
-            let mut decoder = if suite.stream_zstd() {
-                match crate::compress::StreamDecoder::new() {
-                    Ok(decoder) => Some(decoder),
-                    Err(error) => {
-                        debug!(%error, "WebTransport uplink decoder unavailable");
-                        let _ = incoming_tx
-                            .clone()
-                            .send(Err(io::Error::other("uplink decoder unavailable")))
-                            .await;
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
+            // 上行恒为 plain varint 分帧:zstd 套只压缩下行(上行载荷小,
+            // 且浏览器端 fzstd 仅解压,压缩套语义为单向)。
             if let Err(error) = frame::read_frames(&mut recv, |frame| {
                 let incoming_tx = incoming_tx.clone();
-                // 解码在闭包体内同步完成;future 只做跨任务投递
-                let decoded = match decoder.as_mut() {
-                    Some(decoder) => decoder.decompress_chunk(&frame).map(Bytes::from),
-                    None => Ok(frame),
-                };
-                async move {
-                    match decoded {
-                        Ok(payload) => incoming_tx.send(Ok(payload)).await.is_ok(),
-                        // 解压失败属协议违规:显式断连
-                        Err(error) => {
-                            debug!(%error, "WebTransport uplink decompress failed");
-                            incoming_tx
-                                .send(Err(io::Error::other(format!(
-                                    "uplink decompress failed: {error}"
-                                ))))
-                                .await
-                                .is_ok()
-                        }
-                    }
-                }
+                async move { incoming_tx.send(Ok(frame)).await.is_ok() }
             })
             .await
                 && incoming_tx
@@ -967,12 +933,12 @@ mod tests {
         assert_eq!(wt_suite_from_headers(&other), None);
     }
 
-    /// zstd 套桥接双向压缩:上行 bi 流载压缩块(桥内持久 DCtx 解出 envelope),
-    /// 下行 uni 流由桥内持久 CCtx 逐 envelope flush 压缩;每方向发两个
+    /// zstd 套桥接单向压缩:上行 bi 流恒为 plain 分帧(原样解出 envelope),
+    /// 下行 uni 流由桥内持久 CCtx 逐 envelope flush 压缩;下行发两个
     /// envelope,第二个验证跨块上下文共享(重新初始化的压缩器不可能让第二
     /// 块解出依赖首块窗口的字节)。
     #[tokio::test]
-    async fn zstd_suite_compresses_both_bridge_directions() {
+    async fn zstd_suite_compresses_only_downlink() {
         let dir = temp_dir("bridge-zstd");
         let cert = write_test_cert(&dir, "a", &["a.example.com"]);
         let config = wt_config(
@@ -1012,19 +978,17 @@ mod tests {
         let url = format!("https://a.example.com:{}{WEB_TRANSPORT_PATH}", addr.port());
         let session = client.connect(url).await.expect("connect");
 
-        // 客户端持久 CCtx 把两个 envelope 压成两个压缩块,写上控制流
-        let mut uplink = crate::compress::StreamEncoder::new().expect("uplink encoder");
+        // 上行恒为 plain:envelope 原样 varint 分帧写控制流(zstd 套仅压缩下行)
         let control = session.open_bi().await.expect("open bi");
         let (mut control_send, _control_recv) = control.await.expect("bi stream");
         let uplink_envelopes: [&[u8]; 2] = [b"first-uplink", b"second-uplink-payload-larger"];
         for envelope in uplink_envelopes {
-            let chunk = uplink.compress_chunk(envelope).expect("compress");
-            frame::write_frame(&mut control_send, &chunk)
+            frame::write_frame(&mut control_send, envelope)
                 .await
                 .expect("control write");
         }
 
-        // 服务端桥持久 DCtx 解出两个 envelope,顺序一致
+        // 服务端桥原样解出两个 envelope,顺序一致
         let (mut incoming_rx, outgoing_tx) =
             tokio::time::timeout(Duration::from_secs(5), bridges_rx.recv())
                 .await

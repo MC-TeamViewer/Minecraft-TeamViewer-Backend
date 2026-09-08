@@ -622,22 +622,13 @@ async fn serve_socket(
     remote_addr: String,
     suite: Option<crate::compress::Suite>,
 ) {
-    // 每连接一对持久 zstd 编解码器:消息级 flush 块,跨消息共享压缩上下文
+    // 每连接一个持久 zstd 压缩器:消息级 flush 块,跨消息共享压缩上下文。
+    // zstd 套语义为单向:仅下行(服务端→客户端)压缩,上行恒为 plain 消息。
     let mut encoder = match suite.filter(|suite| suite.stream_zstd()) {
         Some(_) => match crate::compress::StreamEncoder::new() {
             Ok(encoder) => Some(encoder),
             Err(error) => {
                 warn!(%error, "zstd encoder unavailable, closing connection");
-                return;
-            }
-        },
-        None => None,
-    };
-    let mut decoder = match suite.filter(|suite| suite.stream_zstd()) {
-        Some(_) => match crate::compress::StreamDecoder::new() {
-            Ok(decoder) => Some(decoder),
-            Err(error) => {
-                warn!(%error, "zstd decoder unavailable, closing connection");
                 return;
             }
         },
@@ -654,22 +645,6 @@ async fn serve_socket(
                 .await;
             return;
         }
-    };
-    let first = match decoder.as_mut() {
-        Some(decoder) => match decoder.decompress_chunk(&first) {
-            Ok(envelope) => Bytes::from(envelope),
-            Err(error) => {
-                warn!(%error, "handshake decompress failed");
-                let _ = socket
-                    .send(Frame::close(
-                        yawc::close::CloseCode::Policy,
-                        "invalid_payload",
-                    ))
-                    .await;
-                return;
-            }
-        },
-        None => first,
     };
     let envelope = match WireEnvelope::decode(first) {
         Ok(envelope) => envelope,
@@ -931,7 +906,6 @@ async fn serve_socket(
             profile,
             complete_online_roster,
         },
-        decoder,
     ));
     let last_wire_ingress = Arc::new(AtomicU64::new(0));
     let last_wire_egress = Arc::new(AtomicU64::new(0));
@@ -1324,7 +1298,6 @@ struct ReaderContext {
 async fn reader_loop(
     mut stream: futures_util::stream::SplitStream<HttpWebSocket>,
     context: ReaderContext,
-    mut decoder: Option<crate::compress::StreamDecoder>,
 ) {
     let ReaderContext {
         id,
@@ -1347,16 +1320,8 @@ async fn reader_loop(
             }
             continue;
         }
-        let payload = match decoder.as_mut() {
-            Some(decoder) => match decoder.decompress_chunk(frame.payload()) {
-                Ok(envelope) => Bytes::from(envelope),
-                Err(error) => {
-                    warn!(connection_id = %id, %error, "ingress decompress failed");
-                    break;
-                }
-            },
-            None => frame.payload().clone(),
-        };
+        // 上行恒为 plain 消息(zstd 套仅压缩下行)
+        let payload = frame.payload().clone();
         metrics.record(
             Layer::Application,
             traffic_channel,

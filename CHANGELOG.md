@@ -16,7 +16,7 @@
   压缩块以 `[varint 长度][压缩块]` 走 varint 分帧；接收端持久 DCtx 连续喂入，压缩块边界
   与 envelope 一一对应但解码不依赖该假设，跨帧共享压缩上下文（等效 permessage-deflate
   的 context takeover），解压窗口上限 2^23（8 MiB），解压结果超过帧上限视为协议违规。
-- 下行压缩级别 3（服务端决策，zstd 帧自描述无需协商）；上行由客户端自选级别。
+- 下行压缩级别 3（服务端决策，zstd 帧自描述无需协商）。压缩为**单向语义**：仅下行（服务端→客户端）压缩，上行恒为 plain 分帧（WS 门为 plain 消息）——上行载荷小（握手、命令、回执），浏览器端解压库 fzstd 仅解压，双向压缩需在用户脚本内嵌完整压缩器，得不偿失。
 - 压缩套协商落地 WS 门：`Sec-WebSocket-Protocol` 子协议 `teamviewrelay.{plain,zstd,zstd-dict}.v1`
   三套并列，服务端按客户端偏好序择一并原样回显（101 响应确认，握手内 0 额外 RTT；回显
   必须取自客户端提供的列表，RFC 6455 硬性要求——zstd-dict 原样回显不折叠，WS 门无
@@ -47,8 +47,9 @@
 
 ### 变更
 
-- QUIC 门在 `+zstd`/`+zstd-dict` 套下流链路（客户端 bi 上行、服务端 uni 下行）自动启用
-  zstd；plain 套与 `1.2.0-alpha.5` 线路行为完全一致。
+- QUIC/WT 门在 `+zstd`/`+zstd-dict` 套下仅服务端下行流（uni）自动启用 zstd；客户端
+  上行流（bi）恒为 plain varint 分帧。plain 套与 `1.2.0-alpha.5` 线路行为完全一致。
+  WS 门选定 zstd 套后仅服务端→客户端消息压缩，客户端→服务端消息恒为 plain envelope。
 - QUIC/WT 门 datagram 发送路径按套分流：`+zstd`/`+zstd-dict` 套逐块压缩后装入
   datagram，`plain` 套裸块直发（与 `1.2.0-alpha.5` 一致）。
 - WS 门选定 zstd 套后不再协商 permessage-deflate 扩展；旧客户端（无 teamviewrelay 子协议）
