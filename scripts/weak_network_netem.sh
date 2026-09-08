@@ -24,9 +24,12 @@ fi
 
 # 只有 tc 需要 root;cargo/uv/测试以调用者(sudo 前的用户)身份跑,
 # 避免 root 在 target/、~/.cache/uv 留下属主污染,破坏后续普通用户构建。
+# PATH 取用户登录 shell 的真实 PATH(root 的 secure_path 不含
+# ~/.cargo/bin、~/.local/bin,直接降权会找不到 cargo/uv)。
 RUN_AS=()
 if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-    RUN_AS=(sudo -u "$SUDO_USER" env "HOME=/home/$SUDO_USER" "PATH=$PATH")
+    USER_PATH="$(su - "$SUDO_USER" -c 'echo "$PATH"' 2>/dev/null || true)"
+    RUN_AS=(sudo -u "$SUDO_USER" env "HOME=/home/$SUDO_USER" "PATH=${USER_PATH:-$PATH}")
 fi
 
 restore() {
