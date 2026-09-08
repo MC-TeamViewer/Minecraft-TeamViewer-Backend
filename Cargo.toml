@@ -72,3 +72,7 @@ strip = "none"
 [[example]]
 name = "gencert-wt"
 path = "examples/gencert_wt.rs"
+
+[[example]]
+name = "quic-smoke"
+path = "examples/quic_smoke.rs"
