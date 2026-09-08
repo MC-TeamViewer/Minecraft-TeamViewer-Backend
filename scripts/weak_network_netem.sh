@@ -22,6 +22,13 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# 只有 tc 需要 root;cargo/uv/测试以调用者(sudo 前的用户)身份跑,
+# 避免 root 在 target/、~/.cache/uv 留下属主污染,破坏后续普通用户构建。
+RUN_AS=()
+if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    RUN_AS=(sudo -u "$SUDO_USER" env "HOME=/home/$SUDO_USER" "PATH=$PATH")
+fi
+
 restore() {
     tc qdisc del dev lo root 2>/dev/null || true
     echo "netem 已移除(lo 恢复默认)"
@@ -41,19 +48,20 @@ apply_profile() {
 
 run_quic() {
     echo "[QUIC] quic-smoke(直连 8767):"
-    ./target/debug/examples/quic-smoke && echo "[QUIC] PASS" || { echo "[QUIC] FAIL"; return 1; }
+    "${RUN_AS[@]}" ./target/debug/examples/quic-smoke \
+        && echo "[QUIC] PASS" || { echo "[QUIC] FAIL"; return 1; }
 }
 
 run_ws() {
     local compression="$1"
     echo "[WS:$compression] load_test_live 短档:"
-    uv run --with websockets --with grpcio-tools --with zstandard \
+    "${RUN_AS[@]}" uv run --with websockets --with grpcio-tools --with zstandard \
         python scripts/load_test_live.py \
         --url http://127.0.0.1:8765 \
         --room "weaknet-netem-$compression" \
         --stages 10 --stage-duration 15 --report-hz 10 \
         --compression "$compression" >"/tmp/tv-netem-ws-$compression.json" \
-        && { echo "[WS:$compression] PASS"; python3 - "$compression" <<'PY'
+        && { echo "[WS:$compression] PASS"; "${RUN_AS[@]}" python3 - "$compression" <<'PY'
 import json, sys
 r = json.load(open(f"/tmp/tv-netem-ws-{sys.argv[1]}.json"))
 s = r["stages"][0]
@@ -63,7 +71,7 @@ PY
 }
 
 echo "构建 quic-smoke ..."
-cargo build --example quic-smoke -j 2
+"${RUN_AS[@]}" cargo build --example quic-smoke -j 2
 
 FAIL=0
 for profile in "0 0 0" "0.05 40 15" "0.15 80 30"; do
