@@ -10,7 +10,10 @@
 
 use std::{
     io,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -21,14 +24,19 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info};
 
 use crate::{
+    bulk,
     cert::CertRuntime,
-    compress,
     config::WebTransportConfig,
-    door_control, frame,
+    door_control,
+    frame,
+    proto::teamviewer::door::v1::door_control_frame::Payload as DoorControlPayload,
     relay::{MOVEMENT_CHUNK_MAX_BYTES, MovementBatch},
     web::{self, WebMapFrameStream},
     web_transport::{MpscReceiver, MpscSink},
 };
+
+/// 门合同违规的应用层错误码(混用/合同外流等,当场断连的唯一出口)。
+const DOOR_VIOLATION_CODE: u32 = 0x01;
 
 /// 协议版本线:ALPN 三套并列(alpha.6 压缩阶段启用),rustls 按客户端
 /// 偏好序选择;语义见 compress::Suite。
@@ -111,7 +119,10 @@ async fn accept_connection(
         .max_datagram_size()
         .is_some_and(|size| size >= MOVEMENT_CHUNK_MAX_BYTES);
     let (movement_tx, movement_rx) = watch::channel(None::<Arc<MovementBatch>>);
-    let (control_rx, state_sink) = stream_bridge(connection, movement_rx, suite);
+    let (control_rx, state_sink, bulk_tx) = stream_bridge(connection, movement_rx, suite);
+    // bulk 触发通道入表(debug 端点按表投递;会话死透时发送失败自然逐出)
+    let hub_id = state.bulk_hub.register(bulk_tx).await;
+    debug!(connection_id = %hub_id, "QUIC session registered for bulk push");
     web::serve_web_map_session(
         WebMapFrameStream::new(MpscReceiver::new(control_rx)),
         MpscSink::new(state_sink),
@@ -140,9 +151,15 @@ fn stream_bridge(
 ) -> (
     mpsc::Receiver<Result<Bytes, io::Error>>,
     mpsc::Sender<Bytes>,
+    mpsc::Sender<bulk::BulkRequest>,
 ) {
     let (incoming_tx, incoming_rx) = mpsc::channel::<Result<Bytes, io::Error>>(256);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Bytes>(256);
+    // bulk 触发通道(容量 1 = 每会话同时只允许一个在途 bulk,满即拒)
+    let (bulk_tx, mut bulk_rx) = mpsc::channel::<bulk::BulkRequest>(1);
+    // bulk 流必须在 door-control 下行流之后开启(流识别按开启序),
+    // door_ready 由 bi 接收任务在开出 door-control 流后放行
+    let (door_ready_tx, door_ready_rx) = tokio::sync::oneshot::channel::<()>();
     let read_connection = connection.clone();
     let write_connection = connection.clone();
 
@@ -153,8 +170,13 @@ fn stream_bridge(
     // dict_ready(+zstd-dict 套):激活就发生在本任务独占的编码器上,与
     // 编码天然串行,无锁。
     let send_connection = connection.clone();
-    let (dict_offer_tx, dict_offer_rx) = mpsc::channel::<Bytes>(8);
+    // door-control 下行流帧通道:dict_offer(+zstd-dict)与 bulk 通告共用,
+    // 单一写出任务独占该流,天然保序
+    let (door_frame_tx, door_frame_rx) = mpsc::channel::<Bytes>(8);
     let (dict_ready_tx, mut dict_ready_rx) = mpsc::channel::<String>(8);
+    // bulk 任务的门控帧通道克隆(必须在 movement 任务 spawn 前建,它会把
+    // door_frame_tx move 走)
+    let bulk_door_tx = door_frame_tx.clone();
     let mut dict_encoder = door_control::DatagramDictEncoder::for_suite(suite);
     tokio::spawn(async move {
         loop {
@@ -172,7 +194,7 @@ fn stream_bridge(
                     if let Some(offer) = dict_encoder.observe(&batch, Instant::now()) {
                         match door_control::dict_offer_frame(&offer.id, &offer.content) {
                             Some(offer_frame) => {
-                                if dict_offer_tx.try_send(offer_frame).is_err() {
+                                if door_frame_tx.try_send(offer_frame).is_err() {
                                     // 下行控制流死透或堆积:字典保持不激活,
                                     // datagram 维持独立压缩,语义自愈,不阻塞
                                     // movement 主路径
@@ -226,26 +248,96 @@ fn stream_bridge(
         }
     });
 
-    // door-control 上行(仅 +zstd-dict 套,约定见 TeamViewRelay-Protocol):
-    // 客户端第 1 条单向流,承载 dict_ready 回执。plain/+zstd 套两端都不得
-    // 开启 door-control 流,这里直接不建任务。
-    if suite == compress::Suite::ZstdDict {
+    // door-control 上行(全部压缩套常开,约定见 TeamViewRelay-Protocol
+    // "传输层/应用层分层与 door-control 流"):客户端第 1 条单向流承载门控
+    // 帧。分层铁律:解析失败即混用/损坏 → 协议违规断连(未知 oneof 成员
+    // 仍前向兼容容忍);字典回执仍只作用于 +zstd-dict 套。
+    {
         let control_connection = connection.clone();
         tokio::spawn(async move {
             let Ok(mut stream) = control_connection.accept_uni().await else {
                 return;
             };
-            let _ = frame::read_frames(&mut stream, |door_frame| {
+            let violation_connection = control_connection.clone();
+            let framing = frame::read_frames(&mut stream, |door_frame| {
                 let dict_ready_tx = dict_ready_tx.clone();
+                let violation_connection = violation_connection.clone();
                 async move {
-                    match door_control::dict_ready_id(&door_frame) {
-                        Some(id) => dict_ready_tx.send(id).await.is_ok(),
-                        // 未知门控制载荷忽略(前向兼容),不算协议违规
-                        None => true,
+                    match door_control::decode_frame(&door_frame) {
+                        Some(frame) => match frame.payload {
+                            Some(DoorControlPayload::DictReady(ready)) => {
+                                dict_ready_tx.send(ready.dictionary_id).await.is_ok()
+                            }
+                            // 未知 oneof 成员(前向兼容)与其他门控载荷:无害,继续读
+                            Some(_) => true,
+                            // protobuf 合法但没有任何已知门控成员 = 应用层帧混入
+                            // (envelope 解出门控流时 payload 恒为 None),违规断连
+                            None => {
+                                door_violation(&violation_connection, "door frame without payload");
+                                false
+                            }
+                        },
+                        // 门控流上的非法 protobuf(混用/损坏),违规断连
+                        None => {
+                            door_violation(&violation_connection, "door frame undecodable");
+                            false
+                        }
                     }
                 }
             })
             .await;
+            if framing.is_err() {
+                door_violation(&control_connection, "door framing violation");
+                return;
+            }
+            // 合同外流:客户端第 2 条起单向流一律违规断连
+            while let Ok(mut extra) = control_connection.accept_uni().await {
+                door_violation(&control_connection, "unexpected client uni stream");
+                extra.stop(0u32.into()).ok();
+            }
+        });
+    }
+
+    // bulk 传输通道(proto 0.9.0-alpha.4):door-control 流就绪后,按请求
+    // 通告 + 开专用单向流,小块写入让应用流自然交错(低优先级是写方约定,
+    // 不引入任何带宽假设)。bulk 期间并行发门控心跳 datagram,供突发压测
+    // 统计 datagram 送达率。
+    {
+        let bulk_connection = connection.clone();
+        tokio::spawn(async move {
+            // door-control 下行流(uni #2)必须先于 bulk 流(uni #3+)开启
+            if door_ready_rx.await.is_err() {
+                return;
+            }
+            while let Some(request) = bulk_rx.recv().await {
+                let transfer_id = bulk::transfer_id(&request.content);
+                let announce = door_control::bulk_start_frame(
+                    &transfer_id,
+                    request.content.len() as u64,
+                    &request.content_type,
+                );
+                if bulk_door_tx.send(announce).await.is_err() {
+                    break;
+                }
+                let Ok(mut stream) = bulk_connection.open_uni().await else {
+                    break;
+                };
+                // 心跳随 bulk 启停:独立任务,不被 bulk 写阻塞
+                let stop = Arc::new(AtomicBool::new(false));
+                let heartbeat_task = spawn_bulk_heartbeat(&bulk_connection, Arc::clone(&stop));
+                let prefix = bulk::stream_prefix(&transfer_id);
+                let mut failed = stream.write_all(&prefix).await.is_err();
+                for chunk in request.content.chunks(bulk::CHUNK) {
+                    if failed || stream.write_all(chunk).await.is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                let _ = stream.finish();
+                stop.store(true, Ordering::Relaxed);
+                let _ = heartbeat_task.await;
+                debug!(%transfer_id, len = request.content.len(), "QUIC bulk transfer done");
+            }
         });
     }
 
@@ -259,6 +351,17 @@ fn stream_bridge(
             return;
         };
         debug!("QUIC control stream accepted");
+        // 合同外流:客户端第 2 条起双向流一律违规断连。必须在首条 bi 接收
+        // 成功之后再启动消化任务,否则本任务与消化任务会竞抢首条流
+        {
+            let bi_connection = read_connection.clone();
+            tokio::spawn(async move {
+                while let Ok((_send, recv)) = bi_connection.accept_bi().await {
+                    door_violation(&bi_connection, "unexpected client bi stream");
+                    drop(recv);
+                }
+            });
+        }
         // 控制流只承载 client→server;服务端→客户端的数据必须写服务端单向流,
         // mod 端只从 incoming unidirectional streams 读取
         drop(send);
@@ -276,26 +379,27 @@ fn stream_bridge(
         debug!("QUIC state stream opened");
 
         // door-control 下行流:服务端第 2 条单向流,必须在状态流之后开启
-        // (流识别按开启序);仅 +zstd-dict 套存在。开不出来时字典永不激活,
-        // datagram 维持独立压缩,链路照常。
-        if suite == compress::Suite::ZstdDict {
-            match write_connection.open_uni().await {
-                Ok(mut offer_stream) => {
-                    tokio::spawn(async move {
-                        let mut dict_offer_rx = dict_offer_rx;
-                        while let Some(offer_frame) = dict_offer_rx.recv().await {
-                            if let Err(error) =
-                                frame::write_frame(&mut offer_stream, &offer_frame).await
-                            {
-                                debug!(%error, "QUIC door-control write failed");
-                                break;
-                            }
+        // (流识别按开启序);全部压缩套常开(空闲零开销),字典载荷仍只在
+        // +zstd-dict 套产生。开不出来时字典永不激活、bulk 不启动,datagram
+        // 维持独立压缩,链路照常。
+        match write_connection.open_uni().await {
+            Ok(mut door_stream) => {
+                tokio::spawn(async move {
+                    let mut door_frame_rx = door_frame_rx;
+                    while let Some(door_frame) = door_frame_rx.recv().await {
+                        if let Err(error) =
+                            frame::write_frame(&mut door_stream, &door_frame).await
+                        {
+                            debug!(%error, "QUIC door-control write failed");
+                            break;
                         }
-                    });
-                }
-                Err(error) => {
-                    debug!(%error, "QUIC door-control stream unavailable");
-                }
+                    }
+                });
+                // bulk 流(uni #3+)自此放行
+                let _ = door_ready_tx.send(());
+            }
+            Err(error) => {
+                debug!(%error, "QUIC door-control stream unavailable");
             }
         }
 
@@ -356,7 +460,33 @@ fn stream_bridge(
         reader.abort();
     });
 
-    (incoming_rx, outgoing_tx)
+    (incoming_rx, outgoing_tx, bulk_tx)
+}
+
+/// 门合同违规的唯一出口:当场断连,绝不静默容忍(合同真相源 README
+/// "传输层/应用层分层与 door-control 流")。
+fn door_violation(connection: &Connection, reason: &str) {
+    debug!(%reason, "QUIC door contract violation; closing connection");
+    connection.close(DOOR_VIOLATION_CODE.into(), reason.as_bytes());
+}
+
+/// bulk 期间的门控心跳:每 `bulk::HEARTBEAT_INTERVAL` 发一枚固定魔数
+/// datagram,供接收端统计饱和期送达率。`stop` 置位或连接死亡即退出。
+fn spawn_bulk_heartbeat(connection: &Connection, stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+    let connection = connection.clone();
+    tokio::spawn(async move {
+        let mut seq: u32 = 0;
+        let mut interval = tokio::time::interval(bulk::HEARTBEAT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        while !stop.load(Ordering::Relaxed) {
+            interval.tick().await;
+            // 对端未协商 datagram 扩展或连接已死:静默停发(心跳是纯观测)
+            if connection.send_datagram(bulk::heartbeat(seq)).is_err() {
+                break;
+            }
+            seq = seq.wrapping_add(1);
+        }
+    })
 }
 
 #[cfg(test)]
@@ -524,7 +654,7 @@ mod tests {
 
         // bridge 建立(镜像 accept_connection 装配,movement 关闭)
         let (_movement_tx, movement_rx) = watch::channel(None);
-        let (mut incoming_rx, outgoing_tx) =
+        let (mut incoming_rx, outgoing_tx, _bulk_tx) =
             stream_bridge(server_conn, movement_rx, crate::compress::Suite::Plain);
 
         // 客户端打开控制流并发送一帧
@@ -584,7 +714,7 @@ mod tests {
         let server_conn = server_rx.recv().await.expect("server accepted");
 
         let (_movement_tx, movement_rx) = watch::channel(None);
-        let (mut incoming_rx, outgoing_tx) =
+        let (mut incoming_rx, outgoing_tx, _bulk_tx) =
             stream_bridge(server_conn, movement_rx, crate::compress::Suite::Zstd);
 
         // 上行恒为 plain:envelope 原样 varint 分帧写控制流(zstd 套仅压缩下行)
@@ -649,7 +779,7 @@ mod tests {
         let server_conn = server_rx.recv().await.expect("server accepted");
 
         let (movement_tx, movement_rx) = watch::channel(None);
-        let (_incoming_rx, _outgoing_tx) =
+        let (_incoming_rx, _outgoing_tx, _bulk_tx) =
             stream_bridge(server_conn, movement_rx, crate::compress::Suite::Plain);
 
         let chunk_a: Arc<[u8]> = Bytes::from_static(b"abc").to_vec().into();

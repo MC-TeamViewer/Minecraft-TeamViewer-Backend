@@ -3,6 +3,7 @@ use std::{collections::HashSet, env, net::SocketAddr, sync::Arc};
 use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use teamviewrelay_rust::{
+    bulk,
     config::RuntimeConfig,
     metrics::{Direction, Layer, Metrics, TrafficChannel, TrafficIncrement},
     quic_transport,
@@ -71,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         config,
         metrics,
         maintenance_rooms: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
+        bulk_hub: bulk::Hub::new(),
         #[cfg(feature = "memory-debug")]
         resource_debug,
     };

@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod bulk;
 pub mod cert;
 pub mod compress;
 pub mod config;

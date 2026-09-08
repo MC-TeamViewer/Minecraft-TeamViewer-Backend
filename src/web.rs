@@ -99,6 +99,8 @@ pub struct AppState {
     pub config: Arc<RuntimeConfig>,
     pub metrics: Arc<Metrics>,
     pub maintenance_rooms: Arc<RwLock<HashSet<String>>>,
+    /// bulk 传输通道触发表(QUIC/WT 门会话注册;debug 端点投递用)
+    pub bulk_hub: Arc<crate::bulk::Hub>,
     #[cfg(feature = "memory-debug")]
     pub resource_debug: Option<crate::resource_debug::ResourceDebugHandle>,
 }
@@ -163,7 +165,8 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/admin/api/debug/resources/profiles/{name}",
             post(admin::trigger_debug_resource_profile).get(admin::download_debug_resource_profile),
-        );
+        )
+        .route("/admin/api/debug/bulk-push", post(admin::bulk_push));
     router.layer(TraceLayer::new_for_http()).with_state(state)
 }
 
@@ -2369,6 +2372,7 @@ mod tests {
             config,
             metrics: Arc::new(Metrics::default()),
             maintenance_rooms: Arc::new(RwLock::new(HashSet::new())),
+            bulk_hub: crate::bulk::Hub::new(),
             #[cfg(feature = "memory-debug")]
             resource_debug: None,
         };

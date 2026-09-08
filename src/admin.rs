@@ -226,6 +226,68 @@ pub async fn trigger_debug_resource_profile(
     }
 }
 
+/// debug:向当前 QUIC/WT 门会话发起 bulk 传输(突发流量压测触发器)。
+/// 内容为确定性图案 `byte[i] = (i*31 + seed) & 0xFF`,seed 附在
+/// `contentType` 尾部回传,接收端据此重生成期望字节核对完整性。
+#[cfg(feature = "memory-debug")]
+pub async fn bulk_push(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Response {
+    if authenticate(&state, &headers).await.is_none() {
+        return unauthorized();
+    }
+    let bytes = request.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+    if bytes == 0 || bytes as usize > crate::bulk::MAX_BULK_BYTES {
+        return invalid_parameter("bytes_out_of_range");
+    }
+    let bytes = bytes as usize;
+    let content_type = request
+        .get("contentType")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    let target = request
+        .get("target")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let seed = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_millis()
+        .max(1)) as u32;
+    let content: bytes::Bytes = (0..bytes)
+        .map(|index| ((index as u32).wrapping_mul(31).wrapping_add(seed) & 0xFF) as u8)
+        .collect::<Vec<u8>>()
+        .into();
+    let content_type = format!("{content_type};seed={seed}");
+    let (accepted, rejected) = state
+        .bulk_hub
+        .push(
+            target.as_deref(),
+            crate::bulk::BulkRequest {
+                content,
+                content_type,
+            },
+        )
+        .await;
+    if accepted.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"accepted": accepted, "rejected": rejected, "detail": "no_bulk_capable_session"})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"accepted": accepted, "rejected": rejected})),
+    )
+        .into_response()
+}
+
 #[cfg(feature = "memory-debug")]
 pub async fn download_debug_resource_profile(
     State(state): State<AppState>,
@@ -1999,6 +2061,7 @@ mod tests {
             config,
             metrics: Arc::new(Metrics::default()),
             maintenance_rooms: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
+            bulk_hub: crate::bulk::Hub::new(),
             #[cfg(feature = "memory-debug")]
             resource_debug: None,
         };

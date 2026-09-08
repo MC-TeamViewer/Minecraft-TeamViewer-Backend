@@ -22,8 +22,10 @@ use bytes::Bytes;
 use tracing::debug;
 
 use crate::compress::{STREAM_COMPRESSION_LEVEL, Suite};
-use crate::proto::teamviewer::v1::{
-    DatagramDictOffer, DatagramDictReady, DoorControlFrame,
+// 门控帧自 proto 0.9.0-alpha.4 起归属传输层包 teamviewer.door.v1
+// (字段号与应用层迁移前逐一不变,线上字节零变化)。
+use crate::proto::teamviewer::door::v1::{
+    BulkTransferStart, DatagramDictOffer, DoorControlFrame,
     door_control_frame::Payload as DoorControlPayload,
 };
 use crate::relay::MovementBatch;
@@ -233,13 +235,22 @@ pub(crate) fn dict_offer_frame(id: &str, content: &[u8]) -> Option<Bytes> {
     }))
 }
 
-/// 解析 door-control 上行帧,提取 `dict_ready` 的字典 ID;其余载荷(含
-/// 未知 oneof 成员——前向兼容)返回 None。
-pub(crate) fn dict_ready_id(payload: &[u8]) -> Option<String> {
-    match decode_frame(payload)?.payload? {
-        DoorControlPayload::DictReady(DatagramDictReady { dictionary_id }) => Some(dictionary_id),
-        _ => None,
-    }
+/// 通告一次 bulk 传输(经 door-control 下行流下发)。
+pub(crate) fn bulk_start_frame(transfer_id: &str, total_len: u64, content_type: &str) -> Bytes {
+    encode_frame(&DoorControlFrame {
+        payload: Some(DoorControlPayload::BulkTransferStart(BulkTransferStart {
+            transfer_id: transfer_id.to_owned(),
+            total_len,
+            content_type: content_type.to_owned(),
+        })),
+    })
+}
+
+/// 门控帧严格解析:非法 protobuf 返回 None(调用方按协议违规断连)。
+/// 解析成功但携带未知 oneof 成员属前向兼容,返回 Some。
+pub(crate) fn decode_frame(payload: &[u8]) -> Option<DoorControlFrame> {
+    use prost::Message as _;
+    DoorControlFrame::decode(payload).ok()
 }
 
 fn encode_frame(frame: &DoorControlFrame) -> Bytes {
@@ -251,14 +262,10 @@ fn encode_frame(frame: &DoorControlFrame) -> Bytes {
     Bytes::from(buf)
 }
 
-fn decode_frame(payload: &[u8]) -> Option<DoorControlFrame> {
-    use prost::Message as _;
-    DoorControlFrame::decode(payload).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::teamviewer::door::v1::DatagramDictReady;
     use std::sync::Arc;
 
     fn batch_of(chunks: &[&[u8]]) -> MovementBatch {
@@ -442,10 +449,17 @@ mod tests {
                 dictionary_id: id.clone(),
             })),
         });
-        assert_eq!(dict_ready_id(&ready), Some(id));
-        // 未知 oneof 成员 / 非字典载荷不误读为 ready
-        assert_eq!(dict_ready_id(&wire), None);
-        assert_eq!(dict_ready_id(b"garbage"), None);
+        let ready_id = match decode_frame(&ready).and_then(|frame| frame.payload) {
+            Some(DoorControlPayload::DictReady(ready)) => Some(ready.dictionary_id),
+            _ => None,
+        };
+        assert_eq!(ready_id, Some(id.clone()));
+        // 未知 oneof 成员之外:非字典载荷不误读为 ready;非法 protobuf = None(违规)
+        assert!(matches!(
+            decode_frame(&wire).and_then(|frame| frame.payload),
+            Some(DoorControlPayload::DictOffer(_))
+        ));
+        assert!(decode_frame(b"garbage").is_none());
     }
 
     #[test]
@@ -453,5 +467,59 @@ mod tests {
         let id = "d-test";
         assert!(dict_offer_frame(id, &vec![0u8; MAX_DICT_CONTENT + 1]).is_none());
         assert!(dict_offer_frame(id, &vec![0u8; MAX_DICT_CONTENT]).is_some());
+    }
+
+    #[test]
+    fn bulk_start_frame_round_trip_and_field_numbers_unchanged() {
+        let frame = decode_frame(
+            &bulk_start_frame("babc", 10 * 1024 * 1024, "x-teamviewrelay-burst;seed=42"),
+        )
+        .expect("bulk frame decode");
+        match frame.payload.expect("bulk payload") {
+            DoorControlPayload::BulkTransferStart(start) => {
+                assert_eq!(start.transfer_id, "babc");
+                assert_eq!(start.total_len, 10 * 1024 * 1024);
+                assert_eq!(start.content_type, "x-teamviewrelay-burst;seed=42");
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    /// 分层兜底实证:跨层混用绝不会被误读为对侧合法载荷——要么解析
+    /// 当场报错(prost 对 oneof 成员 wire type 不匹配直接报错),要么
+    /// 解出"无载荷"壳子由对侧语义规则(10s 首帧握手)显式拒绝。
+    /// 防线是"解析失败或 payload 缺失即违规",不是单点解析错误。
+    #[test]
+    fn door_and_app_frames_are_mutually_unparseable() {
+        use crate::proto::teamviewer::v1::WireEnvelope;
+        use prost::Message as _;
+
+        // dict_offer(字段 1, length-delimited)撞上 WireEnvelope.channel
+        // (字段 1, varint)的 wire type:app 侧解析直接报错
+        let content = vec![7u8; 64];
+        let id = dict_id(&content);
+        let dict_frame = dict_offer_frame(&id, &content).expect("offer frame");
+        assert!(WireEnvelope::decode(dict_frame.as_ref()).is_err());
+
+        // bulk_start(字段 3)在 app 侧落入 unknown fields:解出的是
+        // "channel 未指定 + 无 payload"壳子,过不了 10s 首帧握手即断连
+        let bulk_frame = bulk_start_frame("babc", 1, "test");
+        let as_app = WireEnvelope::decode(bulk_frame.as_ref()).expect("unknown-field shell");
+        assert_eq!(
+            as_app.channel,
+            crate::proto::teamviewer::v1::WireChannel::Unspecified as i32
+        );
+        assert!(as_app.payload.is_none());
+
+        // 反向:envelope(字段 1 varint)撞上 DoorControlFrame oneof 成员
+        // dict_offer(字段 1, length-delimited)的 wire type:prost 对
+        // oneof 成员的 wire type 不匹配直接报错——door 侧解析当场失败
+        let app = WireEnvelope {
+            channel: crate::proto::teamviewer::v1::WireChannel::WebMap as i32,
+            payload: None,
+        };
+        let mut buf = Vec::with_capacity(app.encoded_len());
+        app.encode(&mut buf).expect("envelope encode");
+        assert!(decode_frame(&buf).is_none());
     }
 }
