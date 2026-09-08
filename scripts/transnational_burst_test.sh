@@ -112,6 +112,14 @@ if [[ ! -f "$CERT_DIR/fullchain.pem" ]]; then
 fi
 CERT_SHA256=$(openssl x509 -in "$CERT_DIR/fullchain.pem" -outform DER | sha256sum | cut -d' ' -f1)
 
+# 端口防竞态:前一压测脚本的后端可能尚未完全退出,bind 会失败
+for port in $WS_PORT $WT_PORT $QUIC_PORT; do
+    for _ in $(seq 1 30); do
+        ss -tlnp 2>/dev/null | grep -q ":$port " || ss -ulnp 2>/dev/null | grep -q ":$port " || break
+        sleep 0.5
+    done
+done
+
 echo "启动后端(WS $WS_PORT / QUIC $QUIC_PORT / WT $WT_PORT)..."
 TEAMVIEWER_PORT=$WS_PORT \
 TEAMVIEWER_DB_PATH="$LOG_DIR/exp.db" \
