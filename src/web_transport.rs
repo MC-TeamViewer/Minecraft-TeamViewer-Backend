@@ -19,7 +19,7 @@ use wtransport::{Endpoint, ServerConfig, endpoint::IncomingSession};
 use crate::{
     cert::CertRuntime,
     config::WebTransportConfig,
-    frame,
+    door_control, frame,
     relay::{MOVEMENT_CHUNK_MAX_BYTES, MovementBatch},
     web::{self, WebMapFrameStream},
 };
@@ -195,40 +195,74 @@ fn stream_bridge(
     let write_connection = connection.clone();
 
     // 位置 datagram 发送任务:relay 每 dirty tick 经 movement watch 发布
-    // 预切好的 movement 批,这里逐块装入单个 datagram——裸 WireEnvelope,
-    // 无应用层长度前缀(datagram 自带报文边界,alpha.5 起,与流分帧解耦)。
-    // 块在编码侧已按 ≤MOVEMENT_CHUNK_MAX_BYTES 切好;
-    // 路径 MTU 收缩触发 TooLarge 时重查预算,装不下的块跳过——下个 dirty tick
-    // 全量重发,不需要重传。
+    // 预切好的 movement 批,这里逐块压缩后装入单个 datagram——plain 套裸
+    // WireEnvelope、+zstd* 套单帧自包含压缩,均无应用层长度前缀(datagram
+    // 自带报文边界,alpha.5 起,与流分帧解耦)。同一 select! 消化 door-control
+    // 上行的 dict_ready(+zstd-dict 套):激活就发生在本任务独占的编码器上,
+    // 与编码天然串行,无锁。
     let send_connection = connection.clone();
+    let (dict_offer_tx, dict_offer_rx) = mpsc::channel::<Bytes>(8);
+    let (dict_ready_tx, mut dict_ready_rx) = mpsc::channel::<String>(8);
+    let mut dict_encoder = door_control::DatagramDictEncoder::for_suite(suite);
     tokio::spawn(async move {
         loop {
-            if movement_rx.changed().await.is_err() {
-                return;
-            }
-            let Some(batch) = movement_rx.borrow_and_update().clone() else {
-                continue;
-            };
-            let mut max_size = send_connection.max_datagram_size();
-            for chunk in batch.chunks.iter() {
-                let frame_len = chunk.len();
-                if !max_size.is_some_and(|size| frame_len <= size) {
-                    max_size = send_connection.max_datagram_size();
-                    if !max_size.is_some_and(|size| frame_len <= size) {
-                        continue;
-                    }
-                }
-                let datagram = Bytes::copy_from_slice(chunk);
-                match send_connection.send_datagram(datagram) {
-                    Ok(()) => {}
-                    // 握手时已确认对端支持 datagram;UnsupportedByPeer/NotConnected
-                    // 意味着会话已死,停发即可——可靠流的低频位置刷新兜底
-                    Err(SendDatagramError::TooLarge) => continue,
-                    Err(error) => {
-                        debug!(%error, "WebTransport datagram send stopped");
+            tokio::select! {
+                changed = movement_rx.changed() => {
+                    if changed.is_err() {
                         return;
                     }
+                    let Some(batch) = movement_rx.borrow_and_update().clone() else {
+                        continue;
+                    };
+                    // 字典训练(+zstd-dict 套独有):样本攒够且过了最小重训
+                    // 间隔即训练,offer 经 door-control 下行流下发,ready 回执
+                    // 后才激活切换
+                    if let Some(offer) =
+                        dict_encoder.observe(&batch, std::time::Instant::now())
+                    {
+                        match door_control::dict_offer_frame(&offer.id, &offer.content) {
+                            Some(offer_frame) => {
+                                if dict_offer_tx.try_send(offer_frame).is_err() {
+                                    // 下行控制流死透或堆积:字典保持不激活,
+                                    // datagram 维持独立压缩,语义自愈,不阻塞
+                                    // movement 主路径
+                                    debug!("door-control offer queue full; offer skipped");
+                                }
+                            }
+                            None => debug!("dictionary content rejected by size limit"),
+                        }
+                    }
+                    let mut max_size = send_connection.max_datagram_size();
+                    for chunk in batch.chunks.iter() {
+                        let Some(datagram) = dict_encoder.encode(chunk) else {
+                            continue;
+                        };
+                        let frame_len = datagram.len();
+                        if !max_size.is_some_and(|size| frame_len <= size) {
+                            max_size = send_connection.max_datagram_size();
+                            if !max_size.is_some_and(|size| frame_len <= size) {
+                                continue;
+                            }
+                        }
+                        match send_connection.send_datagram(datagram) {
+                            Ok(()) => {}
+                            // 握手时已确认对端支持 datagram;UnsupportedByPeer/NotConnected
+                            // 意味着会话已死,停发即可——可靠流的低频位置刷新兜底
+                            Err(SendDatagramError::TooLarge) => continue,
+                            Err(error) => {
+                                debug!(%error, "WebTransport datagram send stopped");
+                                return;
+                            }
+                        }
+                    }
                 }
+                // door-control 上行:dict_ready(ID) → 激活压缩字典。守卫兼防
+                // 对端早退后通道关闭的热轮询(非 +zstd-dict 套恒关)
+                Some(id) = dict_ready_rx.recv(), if dict_encoder.dict_enabled() => {
+                    dict_encoder.activate(&id);
+                    debug!(dictionary_id = %id, "WebTransport datagram dictionary activated");
+                }
+                else => return,
             }
         }
     });
@@ -241,6 +275,29 @@ fn stream_bridge(
             drop(datagram);
         }
     });
+
+    // door-control 上行(仅 +zstd-dict 套,约定见 TeamViewRelay-Protocol):
+    // 客户端第 1 条单向流,承载 dict_ready 回执。plain/+zstd 套两端都不得
+    // 开启 door-control 流,这里直接不建任务。
+    if suite == crate::compress::Suite::ZstdDict {
+        let control_connection = connection.clone();
+        tokio::spawn(async move {
+            let Ok(mut stream) = control_connection.accept_uni().await else {
+                return;
+            };
+            let _ = frame::read_frames(&mut stream, |door_frame| {
+                let dict_ready_tx = dict_ready_tx.clone();
+                async move {
+                    match door_control::dict_ready_id(&door_frame) {
+                        Some(id) => dict_ready_tx.send(id).await.is_ok(),
+                        // 未知门控制载荷忽略(前向兼容),不算协议违规
+                        None => true,
+                    }
+                }
+            })
+            .await;
+        });
+    }
 
     tokio::spawn(async move {
         let control = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_connection.accept_bi()).await;
@@ -275,6 +332,35 @@ fn stream_bridge(
                 return;
             }
         };
+
+        // door-control 下行流:服务端第 2 条单向流,必须在状态流之后开启
+        // (流识别按开启序);仅 +zstd-dict 套存在。开不出来时字典永不激活,
+        // datagram 维持独立压缩,链路照常。
+        if suite == crate::compress::Suite::ZstdDict {
+            match write_connection.open_uni().await {
+                Ok(opening) => match opening.await {
+                    Ok(mut offer_stream) => {
+                        tokio::spawn(async move {
+                            let mut dict_offer_rx = dict_offer_rx;
+                            while let Some(offer_frame) = dict_offer_rx.recv().await {
+                                if let Err(error) =
+                                    frame::write_frame(&mut offer_stream, &offer_frame).await
+                                {
+                                    debug!(%error, "WebTransport door-control write failed");
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        debug!(%error, "WebTransport door-control stream failed");
+                    }
+                },
+                Err(error) => {
+                    debug!(%error, "WebTransport door-control stream unavailable");
+                }
+            }
+        }
 
         let reader = tokio::spawn(async move {
             // 上行 zstd:压缩块 → 持久 DCtx → envelope;分块边界由对端
@@ -976,5 +1062,177 @@ mod tests {
                 .expect("decompress");
             assert_eq!(decoded, envelope);
         }
+    }
+
+    /// +zstd-dict 套全因果链:独立压缩 datagram → 样本攒满训练字典 →
+    /// dict_offer 经服务端第 2 条单向流下发(开序必须紧跟状态流)→ 客户端
+    /// 回 dict_ready(客户端第 1 条单向流)→ 服务端激活 → 后续 datagram
+    /// 换字典压缩。door-control 帧与流通道同款 varint 分帧,载荷为
+    /// DoorControlFrame protobuf。
+    #[tokio::test]
+    async fn zstd_dict_suite_trains_activates_datagram_dictionary() {
+        use crate::proto::teamviewer::v1::{
+            DatagramDictReady, DoorControlFrame, door_control_frame::Payload as DoorControlPayload,
+        };
+        use prost::Message as _;
+
+        let dir = temp_dir("bridge-zstd-dict");
+        let cert = write_test_cert(&dir, "a", &["a.example.com"]);
+        let config = wt_config(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            vec![cert_identity(&cert, true)],
+            7 * 24 * 60 * 60,
+        );
+        let (runtime, tls_config) = CertRuntime::load(&config).await.expect("load");
+        let server_config = ServerConfig::builder()
+            .with_bind_address(config.bind_address)
+            .with_custom_tls(tls_config)
+            .build();
+        let endpoint = Endpoint::server(server_config).expect("server endpoint");
+        let addr = endpoint.local_addr().expect("local addr");
+        let (bridges_tx, mut bridges_rx) = tokio::sync::mpsc::channel::<(
+            mpsc::Receiver<Result<Bytes, io::Error>>,
+            mpsc::Sender<Bytes>,
+            watch::Sender<Option<Arc<MovementBatch>>>,
+        )>(1);
+        tokio::spawn(async move {
+            let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, endpoint.accept().await)
+                .await
+                .expect("incoming timeout")
+                .expect("session request");
+            let connection = request.accept().await.expect("session accepted");
+            let (movement_tx, movement_rx) = watch::channel(None);
+            let bridge = stream_bridge(connection, movement_rx, crate::compress::Suite::ZstdDict);
+            bridges_tx
+                .send((bridge.0, bridge.1, movement_tx))
+                .await
+                .ok();
+        });
+        let _ = runtime;
+
+        let client_config = ClientConfig::builder()
+            .with_bind_default()
+            .with_server_certificate_hashes([cert.digest.clone()])
+            .dns_resolver(StaticDnsResolver)
+            .build();
+        let client = Endpoint::client(client_config).expect("client endpoint");
+        let url = format!("https://a.example.com:{}{WEB_TRANSPORT_PATH}", addr.port());
+        let session = client.connect(url).await.expect("connect");
+
+        // 客户端开控制流触发 bridge;服务端随即按开序开两条单向流:
+        // 第 1 条 = 应用层状态流,第 2 条 = door-control 下行
+        let control = session.open_bi().await.expect("open bi");
+        let (mut control_send, _control_recv) = control.await.expect("bi stream");
+        frame::write_frame(&mut control_send, b"h")
+            .await
+            .expect("control write");
+        let state_stream = tokio::time::timeout(Duration::from_secs(5), session.accept_uni())
+            .await
+            .expect("state uni timeout")
+            .expect("state uni");
+        let mut offer_stream = tokio::time::timeout(Duration::from_secs(5), session.accept_uni())
+            .await
+            .expect("door-control uni timeout")
+            .expect("door-control uni");
+        let (incoming_rx, _outgoing_tx, movement_tx) =
+            tokio::time::timeout(Duration::from_secs(5), bridges_rx.recv())
+                .await
+                .expect("bridge ready")
+                .expect("bridge channels");
+        drop(incoming_rx);
+        drop(state_stream);
+
+        // 第 1 批 movement:64 块恰好同时跨过生产训练阈值(条数 64、样本
+        // 字节 ≥16KiB),首个 dirty tick 即训练并经 door-control 下发 offer
+        let mut chunks: Vec<Arc<[u8]>> = Vec::new();
+        for index in 0..64 {
+            let mut chunk = format!(r#"{{"p":"uuid-{index}","x":{index}.25,"y":0.5,"#).into_bytes();
+            chunk.resize(270, b' ');
+            chunk.extend_from_slice(b"}");
+            chunks.push(chunk.into());
+        }
+        movement_tx.send_replace(Some(Arc::new(MovementBatch {
+            chunks: chunks.clone().into(),
+        })));
+
+        // 激活前:每个 datagram 都是独立(无字典)zstd 帧,可无字典解出
+        for expected in &chunks {
+            let datagram = tokio::time::timeout(Duration::from_secs(5), session.receive_datagram())
+                .await
+                .expect("datagram timeout")
+                .expect("datagram ok");
+            let decoded = zstd::stream::decode_all(datagram.payload().as_ref())
+                .expect("independent decode pre-activation");
+            assert_eq!(&decoded[..], &expected[..]);
+        }
+
+        // 读 dict_offer(内容 4KB+,varint 头 2 字节;read_frames 不做头长假设)
+        let mut offer_payload: Option<Bytes> = None;
+        frame::read_frames(&mut offer_stream, |door_frame| {
+            offer_payload = Some(door_frame);
+            async { false }
+        })
+        .await
+        .expect("door-control offer read");
+        let offer_frame =
+            DoorControlFrame::decode(offer_payload.expect("dict offer frame").as_ref())
+                .expect("dict offer decode");
+        let (dict_id, dict_content) = match offer_frame.payload.expect("offer payload") {
+            DoorControlPayload::DictOffer(offer) => (offer.dictionary_id, offer.content),
+            other => panic!("expected dict_offer, got {other:?}"),
+        };
+        assert!(!dict_id.is_empty() && !dict_content.is_empty());
+
+        // 客户端第 1 条单向流 = door-control 上行:完整收到即回 dict_ready
+        let ready_opening = session.open_uni().await.expect("open uni");
+        let mut ready_stream = ready_opening.await.expect("uni stream");
+        let ready = DoorControlFrame {
+            payload: Some(DoorControlPayload::DictReady(DatagramDictReady {
+                dictionary_id: dict_id,
+            })),
+        };
+        let mut ready_buf = Vec::with_capacity(ready.encoded_len());
+        ready.encode(&mut ready_buf).expect("ready encode");
+        frame::write_frame(&mut ready_stream, &ready_buf)
+            .await
+            .expect("ready write");
+        drop(ready_stream); // fin:door-control 上行帧到此为止
+
+        // 激活后:重发同批,datagram 应换字典压缩(独立解码失败、字典解码
+        // 成功才算数)。ready 回执与新批之间是回环 UDP,激活先于批到达是
+        // 常态,但 movement 任务的 select! 分支次序不作保证——重发最多
+        // 10 批,出现字典帧即证激活
+        let mut dctx = zstd_safe::DCtx::create();
+        let ddict = zstd_safe::DDict::create(&dict_content);
+        let batch = Arc::new(MovementBatch {
+            chunks: chunks.clone().into(),
+        });
+        let mut activated = false;
+        for _ in 0..10 {
+            movement_tx.send_replace(Some(batch.clone()));
+            for expected in &chunks {
+                let datagram =
+                    tokio::time::timeout(Duration::from_secs(5), session.receive_datagram())
+                        .await
+                        .expect("datagram timeout")
+                        .expect("datagram ok");
+                let payload = datagram.payload();
+                let decoded = if let Ok(independent) = zstd::stream::decode_all(payload.as_ref()) {
+                    independent
+                } else {
+                    let mut out = vec![0u8; expected.len()];
+                    let written = dctx
+                        .decompress_using_ddict(&mut out, payload.as_ref(), &ddict)
+                        .expect("dict decode");
+                    activated = true;
+                    out[..written].to_vec()
+                };
+                assert_eq!(&decoded[..], &expected[..]);
+            }
+            if activated {
+                break;
+            }
+        }
+        assert!(activated, "dictionary never activated");
     }
 }

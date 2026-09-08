@@ -59,6 +59,12 @@ impl Suite {
     pub(crate) fn stream_zstd(self) -> bool {
         matches!(self, Suite::Zstd | Suite::ZstdDict)
     }
+
+    /// datagram 通道是否走 zstd(QUIC/WT 门):`+zstd` 套单帧独立压缩,
+    /// `+zstd-dict` 套字典模式;`plain` 套原样裸 envelope。
+    pub(crate) fn datagram_zstd(self) -> bool {
+        !matches!(self, Suite::Plain)
+    }
 }
 
 /// WS 门子协议(压缩套协商载体):`teamviewrelay.{plain,zstd,zstd-dict}.v1`。

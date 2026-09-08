@@ -8,7 +8,11 @@
 //! 裸 QUIC 没有 WT 的 path 路由——首个 WireEnvelope 的 channel 自识别
 //! Player/WebMap(web.rs 握手逻辑天然支持)。
 
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context as AnyhowContext;
 use bytes::Bytes;
@@ -18,8 +22,9 @@ use tracing::{debug, info};
 
 use crate::{
     cert::CertRuntime,
+    compress,
     config::WebTransportConfig,
-    frame,
+    door_control, frame,
     relay::{MOVEMENT_CHUNK_MAX_BYTES, MovementBatch},
     web::{self, WebMapFrameStream},
     web_transport::{MpscReceiver, MpscSink},
@@ -142,37 +147,72 @@ fn stream_bridge(
     let write_connection = connection.clone();
 
     // 位置 datagram 发送任务:与 WT 门语义一致——relay 每 dirty tick 发布
-    // 预切好的 movement 批,逐块装入单个 datagram(裸 WireEnvelope,无前缀);
-    // TooLarge 时重查预算,装不下的块跳过——下个 dirty tick 全量重发。
+    // 预切好的 movement 批,逐块压缩后装入单个 datagram(plain 套原样,
+    // +zstd* 套单帧自包含压缩);TooLarge 时重查预算,装不下的块跳过——
+    // 下个 dirty tick 全量重发。同一 select! 消化 door-control 上行的
+    // dict_ready(+zstd-dict 套):激活就发生在本任务独占的编码器上,与
+    // 编码天然串行,无锁。
     let send_connection = connection.clone();
+    let (dict_offer_tx, dict_offer_rx) = mpsc::channel::<Bytes>(8);
+    let (dict_ready_tx, mut dict_ready_rx) = mpsc::channel::<String>(8);
+    let mut dict_encoder = door_control::DatagramDictEncoder::for_suite(suite);
     tokio::spawn(async move {
         loop {
-            if movement_rx.changed().await.is_err() {
-                return;
-            }
-            let Some(batch) = movement_rx.borrow_and_update().clone() else {
-                continue;
-            };
-            let mut max_size = send_connection.max_datagram_size();
-            for chunk in batch.chunks.iter() {
-                let frame_len = chunk.len();
-                if !max_size.is_some_and(|size| frame_len <= size) {
-                    max_size = send_connection.max_datagram_size();
-                    if !max_size.is_some_and(|size| frame_len <= size) {
-                        continue;
-                    }
-                }
-                let datagram = Bytes::copy_from_slice(chunk);
-                match send_connection.send_datagram(datagram) {
-                    Ok(()) => {}
-                    // 握手时已确认对端支持 datagram;其余错误意味着连接已死,
-                    // 停发即可——可靠流的低频位置刷新兜底
-                    Err(quinn::SendDatagramError::TooLarge) => continue,
-                    Err(error) => {
-                        debug!(%error, "QUIC datagram send stopped");
+            tokio::select! {
+                changed = movement_rx.changed() => {
+                    if changed.is_err() {
                         return;
                     }
+                    let Some(batch) = movement_rx.borrow_and_update().clone() else {
+                        continue;
+                    };
+                    // 字典训练(+zstd-dict 套独有):样本攒够且过了最小重训
+                    // 间隔即训练,offer 经 door-control 下行流下发,ready 回执
+                    // 后才激活切换
+                    if let Some(offer) = dict_encoder.observe(&batch, Instant::now()) {
+                        match door_control::dict_offer_frame(&offer.id, &offer.content) {
+                            Some(offer_frame) => {
+                                if dict_offer_tx.try_send(offer_frame).is_err() {
+                                    // 下行控制流死透或堆积:字典保持不激活,
+                                    // datagram 维持独立压缩,语义自愈,不阻塞
+                                    // movement 主路径
+                                    debug!("door-control offer queue full; offer skipped");
+                                }
+                            }
+                            None => debug!("dictionary content rejected by size limit"),
+                        }
+                    }
+                    let mut max_size = send_connection.max_datagram_size();
+                    for chunk in batch.chunks.iter() {
+                        let Some(datagram) = dict_encoder.encode(chunk) else {
+                            continue;
+                        };
+                        let frame_len = datagram.len();
+                        if !max_size.is_some_and(|size| frame_len <= size) {
+                            max_size = send_connection.max_datagram_size();
+                            if !max_size.is_some_and(|size| frame_len <= size) {
+                                continue;
+                            }
+                        }
+                        match send_connection.send_datagram(datagram) {
+                            Ok(()) => {}
+                            // 握手时已确认对端支持 datagram;其余错误意味着连接已死,
+                            // 停发即可——可靠流的低频位置刷新兜底
+                            Err(quinn::SendDatagramError::TooLarge) => continue,
+                            Err(error) => {
+                                debug!(%error, "QUIC datagram send stopped");
+                                return;
+                            }
+                        }
+                    }
                 }
+                // door-control 上行:dict_ready(ID) → 激活压缩字典。守卫兼防
+                // 对端早退后通道关闭的热轮询(非 +zstd-dict 套恒关)
+                Some(id) = dict_ready_rx.recv(), if dict_encoder.dict_enabled() => {
+                    dict_encoder.activate(&id);
+                    debug!(dictionary_id = %id, "QUIC datagram dictionary activated");
+                }
+                else => return,
             }
         }
     });
@@ -185,6 +225,29 @@ fn stream_bridge(
             drop(datagram);
         }
     });
+
+    // door-control 上行(仅 +zstd-dict 套,约定见 TeamViewRelay-Protocol):
+    // 客户端第 1 条单向流,承载 dict_ready 回执。plain/+zstd 套两端都不得
+    // 开启 door-control 流,这里直接不建任务。
+    if suite == compress::Suite::ZstdDict {
+        let control_connection = connection.clone();
+        tokio::spawn(async move {
+            let Ok(mut stream) = control_connection.accept_uni().await else {
+                return;
+            };
+            let _ = frame::read_frames(&mut stream, |door_frame| {
+                let dict_ready_tx = dict_ready_tx.clone();
+                async move {
+                    match door_control::dict_ready_id(&door_frame) {
+                        Some(id) => dict_ready_tx.send(id).await.is_ok(),
+                        // 未知门控制载荷忽略(前向兼容),不算协议违规
+                        None => true,
+                    }
+                }
+            })
+            .await;
+        });
+    }
 
     tokio::spawn(async move {
         let control = tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_connection.accept_bi()).await;
@@ -211,6 +274,30 @@ fn stream_bridge(
                 }
             };
         debug!("QUIC state stream opened");
+
+        // door-control 下行流:服务端第 2 条单向流,必须在状态流之后开启
+        // (流识别按开启序);仅 +zstd-dict 套存在。开不出来时字典永不激活,
+        // datagram 维持独立压缩,链路照常。
+        if suite == compress::Suite::ZstdDict {
+            match write_connection.open_uni().await {
+                Ok(mut offer_stream) => {
+                    tokio::spawn(async move {
+                        let mut dict_offer_rx = dict_offer_rx;
+                        while let Some(offer_frame) = dict_offer_rx.recv().await {
+                            if let Err(error) =
+                                frame::write_frame(&mut offer_stream, &offer_frame).await
+                            {
+                                debug!(%error, "QUIC door-control write failed");
+                                break;
+                            }
+                        }
+                    });
+                }
+                Err(error) => {
+                    debug!(%error, "QUIC door-control stream unavailable");
+                }
+            }
+        }
 
         let reader = tokio::spawn(async move {
             // 上行 zstd:压缩块 → 持久 DCtx → envelope;分块边界由对端

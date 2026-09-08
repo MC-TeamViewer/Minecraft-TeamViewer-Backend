@@ -2,6 +2,7 @@ pub mod admin;
 pub mod cert;
 pub mod compress;
 pub mod config;
+pub(crate) mod door_control;
 pub mod frame;
 pub mod metrics;
 pub mod proto;

@@ -30,13 +30,27 @@
   WT 门有 datagram，两套语义有别）。当前浏览器尚未实现该头
   （Chromium issue 435589295、Firefox bug 1981483），不发即 plain 行为，与
   `1.2.0-alpha.5` 完全一致；浏览器实现后自动激活，服务端无需再改动。
-- datagram 通道暂不参与流压缩（自包含单元，`+zstd-dict` 的字典模式由后续切片经
-  door-control 流接入）。
+- datagram 通道压缩落地 QUIC/WT 门（`+zstd`/`+zstd-dict` 套）：每块 movement 压缩为
+  一个自包含 zstd 单帧（无跨 datagram 上下文，丢一块不影响后续），预算按压缩后长度
+  校验；`plain` 套维持裸 envelope 零变化。
+- datagram 字典模式（`+zstd-dict` 套独有，proto/v0.9.0-alpha.2 `DoorControlFrame`）：
+  服务端用近期 movement 批训练 4 KiB 字典，经门专用 door-control 下行流（服务端第 2 条
+  单向流，开序紧跟状态流）下发 `dict_offer(ID, 内容)`；客户端完整安装后经自己的第 1 条
+  单向流回 `dict_ready(ID)`；服务端收到 ready 才激活该字典——激活前按独立 zstd 压缩，
+  因果屏障保证字典字节必然先于用它压缩的任何 datagram 过线，door-control 流绝不承载
+  应用层 `WireEnvelope`。新模块 `src/door_control.rs`：`DatagramDictEncoder`（训练/
+  激活/编码状态机）、激活门控、current+previous 字典生命周期（≤8 KiB/连接，新 ID 激活
+  即逐出更旧，连接关闭全释放）、训练策略（条数阈值 64 + 样本字节 ≥16 KiB + 最小重训
+  间隔 60 秒，zstd 训练器对样本量不足报错时按一次尝试计并丢最旧样本重试）。唯一理论
+  竞态（客户端安装任务滞后于 datagram 接收）表现为响亮的 zstd 错误，按丢包丢帧自愈。
+  WT 门全因果链集成测试覆盖开序约定、offer/ready 握手与激活门控。
 
 ### 变更
 
 - QUIC 门在 `+zstd`/`+zstd-dict` 套下流链路（客户端 bi 上行、服务端 uni 下行）自动启用
   zstd；plain 套与 `1.2.0-alpha.5` 线路行为完全一致。
+- QUIC/WT 门 datagram 发送路径按套分流：`+zstd`/`+zstd-dict` 套逐块压缩后装入
+  datagram，`plain` 套裸块直发（与 `1.2.0-alpha.5` 一致）。
 - WS 门选定 zstd 套后不再协商 permessage-deflate 扩展；旧客户端（无 teamviewrelay 子协议）
   的 deflate 协商行为与 `1.2.0-alpha.5` 完全一致。
 

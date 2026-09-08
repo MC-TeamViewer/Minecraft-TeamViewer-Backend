@@ -234,9 +234,8 @@ WebSocket。证书更新成功只影响新 QUIC 连接，已有连接保留旧 T
 握手便车，不做应用层协商：
 
 - `plain`：流与 datagram 均不压缩；
-- `zstd`：可靠流走连续 zstd 分块流（见下），datagram 暂按独立单元处理；
-- `zstd-dict`：可靠流同 `zstd`，datagram 另有字典模式（经门专用 door-control 流下发，
-  后续切片接入）。
+- `zstd`：可靠流走连续 zstd 分块流（见下），datagram 逐块单帧独立压缩；
+- `zstd-dict`：可靠流同 `zstd`，datagram 走字典模式（见下）。
 
 各门的协商载体与当前落地状态：
 
@@ -259,6 +258,19 @@ envelope `write + flush` 保证即时可解码，压缩块作为一帧 payload �
 DCtx——压缩块边界与 envelope 一一对应，跨帧共享压缩上下文（等效 permessage-deflate
 的 context takeover）。解压窗口上限 8 MiB。datagram 不适用该模型（自包含单元，丢弃互
 不影响）。
+
+datagram 的压缩语义（QUIC/WT 门，`+zstd`/`+zstd-dict` 套）：每块压缩为**一个自包含
+zstd 单帧**（无跨 datagram 上下文，丢一块不影响后续），无应用层长度前缀。
+`+zstd-dict` 套叠加**字典模式**：服务端用近期 movement 批训练 4 KiB 字典，经门专用
+door-control 下行流（服务端第 2 条单向流，开序紧跟状态流）下发 `dict_offer(ID, 内容)`；
+客户端完整安装后经自己的第 1 条单向流回 `dict_ready(ID)`；服务端收到 ready 才把该字典
+切为压缩当前字典（**激活**）——激活前按独立 zstd 压缩，因果屏障保证字典字节必然先于
+用它压缩的任何 datagram 过线。唯一理论竞态（客户端 door-control 安装任务滞后于
+datagram 接收）表现为响亮的 zstd 错误，按普通丢包丢帧自愈——movement 下一 tick 全量
+重发兜底。字典生命周期防泄漏：每连接只保留 current + previous 两个字典（≤8 KiB），
+新 ID 激活即逐出更旧，连接关闭全部释放；字典按连接独立训练，不跨连接共享；重训设
+最小间隔（60 秒）+ 条数/字节样本阈值，防重训风暴。`plain`/`+zstd` 套不开启
+door-control 流。
 
 ## 源码开发
 
