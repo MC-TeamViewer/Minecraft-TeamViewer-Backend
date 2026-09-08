@@ -115,12 +115,17 @@ class Server(asyncio.DatagramProtocol):
         self.transport = transport
 
     def relay(self, send) -> None:
-        delay = max(
-            0.0,
-            self.args.delay_ms + random.uniform(-self.args.jitter_ms, self.args.jitter_ms),
-        ) / 1000.0
+        if self.args.delay_jitter_mode == "plus":
+            # 单边抖动:delay ∈ [delay_ms, delay_ms + jitter_ms](延迟保底)
+            delay = self.args.delay_ms + random.uniform(0, self.args.jitter_ms)
+        else:
+            # 对称抖动:delay ∈ [delay_ms - jitter_ms, delay_ms + jitter_ms](下限钳 0)
+            delay = max(
+                0.0,
+                self.args.delay_ms + random.uniform(-self.args.jitter_ms, self.args.jitter_ms),
+            )
         if delay > 0:
-            self.loop.call_later(delay, send)
+            self.loop.call_later(delay / 1000.0, send)
         else:
             send()
 
@@ -150,6 +155,12 @@ async def main():
         type=float,
         default=0.0,
         help="上游→客户端方向令牌桶限速(KiB/s);0 = 不限速",
+    )
+    parser.add_argument(
+        "--delay-jitter-mode",
+        choices=["symmetric", "plus"],
+        default="symmetric",
+        help="plus = 抖动只向上叠加(延迟保底 delay_ms);symmetric = 双向抖动",
     )
     args = parser.parse_args()
     listen_host, listen_port = args.listen.rsplit(":", 1)

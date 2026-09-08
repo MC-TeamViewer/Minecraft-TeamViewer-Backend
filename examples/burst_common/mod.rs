@@ -21,8 +21,18 @@ pub const ALPN_ZSTD_DICT: &str = "teamviewrelay/v1+zstd-dict";
 pub const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 pub const HEARTBEAT_MAGIC: &[u8] = b"tvbulk-hb";
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
-/// bulk 到齐的整体超时:100KiB/s 下 10MiB ≈ 105s,放宽到 5 分钟。
-pub const BULK_TIMEOUT: Duration = Duration::from_secs(300);
+/// bulk 到齐的整体超时:100KiB/s 下 10MiB ≈ 105s;跨国极端档
+/// (15% 丢 + 300-600ms RTT)重传开销翻倍以上,放宽到 10 分钟。
+pub const BULK_TIMEOUT: Duration = Duration::from_secs(600);
+/// 心跳 datagram 丢包容忍(比例):弱网档经环境变量放宽。
+/// 默认 1%——好路 datagram 损耗应近零;跨国档按线路丢包率 + 裕度设置。
+pub fn dgram_loss_tolerance() -> f64 {
+    std::env::var("TEAMVIEWER_BURST_DGRAM_LOSS_TOLERANCE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.01)
+        .clamp(0.0, 0.9)
+}
 /// 基线/收尾 RTT 采样窗口。
 pub const QUIET_PHASE: Duration = Duration::from_secs(3);
 

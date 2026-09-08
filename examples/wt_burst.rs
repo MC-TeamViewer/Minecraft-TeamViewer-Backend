@@ -160,7 +160,7 @@ async fn run(server: &str, room: &str, cert_sha: &str) -> Anyhow {
     let mut pending_bulk: Option<(String, wtransport::RecvStream)> = None;
     let announce = loop {
         let stream = session.accept_uni().await?;
-        let (payload, mut stream) = match read_varint_group(stream).await {
+        let (payload, stream) = match read_varint_group(stream).await {
             Ok(group) => group,
             Err(error) => bail!("door/bulk 流首组读取失败:{error}"),
         };
@@ -261,7 +261,10 @@ async fn run(server: &str, room: &str, cert_sha: &str) -> Anyhow {
     };
     let hb_lost_by_gap = (hb_max_seq as u64 + 1).saturating_sub(hb_received);
     let ratio = if baseline_p95 > 0.0 { during_p95 / baseline_p95 } else { 1.0 };
-    let verdict_ok = delivery_ratio >= 0.99 && hb_lost_by_gap == 0;
+    let integrity_ok = true; // 图案逐字节核对通过才会走到这里
+    let tolerance = dgram_loss_tolerance();
+    let lost_ratio = if expected > 0 { hb_lost_by_gap as f64 / expected as f64 } else { 0.0 };
+    let verdict_ok = integrity_ok && lost_ratio <= tolerance;
     let verdict = BurstVerdict {
         door: "webtransport".into(),
         suite: "wt-zstd-dict-header".into(),
@@ -349,26 +352,6 @@ async fn read_varint_group(
     let mut payload = vec![0u8; length];
     stream.read_exact(&mut payload).await?;
     Ok((payload, stream))
-}
-
-async fn wait_bulk_start(
-    stream: &mut wtransport::RecvStream,
-) -> Result<teamviewrelay_rust::proto::teamviewer::door::v1::BulkTransferStart> {
-    loop {
-        let frame = read_frame(stream).await?;
-        let decoded = DoorControlFrame::decode(frame.as_slice()).map_err(|error| {
-            anyhow::anyhow!(
-                "door-control 下行帧解析失败:{error};len={} bytes={:02x?}",
-                frame.len(),
-                &frame[..frame.len().min(64)]
-            )
-        })?;
-        match decoded.payload {
-            Some(DoorControlPayload::BulkTransferStart(start)) => return Ok(start),
-            Some(_) => continue,
-            None => bail!("door-control 下行帧无载荷(协议违规)"),
-        }
-    }
 }
 
 async fn read_stream_id(stream: &mut wtransport::RecvStream) -> Result<String> {

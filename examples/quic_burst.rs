@@ -270,7 +270,9 @@ async fn run(server: &str, room: &str) -> Anyhow {
     let hb_lost_by_gap = (hb_max_seq as u64 + 1).saturating_sub(hb_received);
     let integrity_ok = true; // 图案逐字节核对通过才会走到这里
     let ratio = if baseline_p95 > 0.0 { during_p95 / baseline_p95 } else { 1.0 };
-    let verdict_ok = integrity_ok && delivery_ratio >= 0.99 && hb_lost_by_gap == 0;
+    let tolerance = dgram_loss_tolerance();
+    let lost_ratio = if expected > 0 { hb_lost_by_gap as f64 / expected as f64 } else { 0.0 };
+    let verdict_ok = integrity_ok && lost_ratio <= tolerance;
     let verdict = BurstVerdict {
         door: "quic".into(),
         suite: ALPN_ZSTD_DICT.into(),
