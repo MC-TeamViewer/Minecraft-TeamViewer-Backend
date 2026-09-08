@@ -1197,95 +1197,353 @@ async fn wt_reader_loop(first_frame: Bytes, mut stream: WebMapFrameStream, conte
             profile,
             complete_online_roster,
         };
-        if !wt_handle_envelope(envelope, &mut ctx).await {
+        if !handle_envelope(envelope, &mut ctx).await {
             break;
         }
     }
 }
 
-async fn wt_handle_envelope(envelope: WireEnvelope, context: &mut ReaderContext) -> bool {
+async fn handle_envelope(envelope: WireEnvelope, context: &mut ReaderContext) -> bool {
+    // 三门共享的入站载荷分发(桥接模式):WS reader 与 WT/QUIC 门桥的
+    // reader 都委托到这里,任何载荷臂的行为差异都是缺陷。
+    // 返回 false = 会话应当终止(对端通道已死)。
+    let ReaderContext {
+        id,
+        room,
+        control,
+        events,
+        channel,
+        kind,
+        tab_history,
+        relationships,
+        profile,
+        complete_online_roster,
+        ..
+    } = context;
+    let id = id.clone();
+    let room = room.clone();
     match envelope.payload {
-        Some(wire_envelope::Payload::ResyncRequest(_)) => context
-            .events
-            .send(RelayEvent::Resync {
-                id: context.id.clone(),
-            })
+        Some(wire_envelope::Payload::PlayerReportBundle(mut report))
+            if report.submit_player_id == id =>
+        {
+            sanitize_player_report(*profile, &mut report);
+            if *kind == ConnectionKind::ExternalSource
+                && *complete_online_roster
+                && let Some(status) = &report.external_source_status
+            {
+                let healthy = status.health
+                    == crate::proto::teamviewer::v1::ExternalSourceHealth::Healthy as i32;
+                let _ = events
+                    .send(RelayEvent::ReportPolicyUpdate {
+                        room: room.clone(),
+                        policy: report_policy(healthy),
+                    })
+                    .await;
+            }
+            let tab_players = report
+                .tab_players_replace
+                .as_ref()
+                .map(|replace| replace.tab_players.clone())
+                .or_else(|| {
+                    report.tab_players_patch.as_ref().map(|patch| {
+                        patch
+                            .upsert
+                            .iter()
+                            .filter_map(|upsert| upsert.data.clone())
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+            let changed_history_head =
+                if !profile.supports_tab_history() || tab_players.is_empty() {
+                    None
+                } else if matches!(
+                    tab_history
+                        .upsert_players(&room, &tab_players, unix_millis())
+                        .await,
+                    Ok(true)
+                ) {
+                    tab_history.head(&room).await.ok()
+                } else {
+                    None
+                };
+            if events
+                .send(RelayEvent::PlayerReport {
+                    id: id.clone(),
+                    report: Box::new(report),
+                })
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            if let Some(head) = changed_history_head {
+                let _ = events
+                    .send(RelayEvent::TabHistoryChanged { room, head })
+                    .await;
+            }
+            true
+        }
+        Some(wire_envelope::Payload::ResyncRequest(_)) => events
+            .send(RelayEvent::Resync { id })
             .await
             .is_ok(),
         Some(wire_envelope::Payload::WebMapCommand(command))
-            if context.channel == WireChannel::WebMap =>
+            if *channel == WireChannel::WebMap =>
         {
-            context
-                .events
-                .send(RelayEvent::WebMapCommand {
-                    id: context.id.clone(),
-                    command,
-                })
+            events
+                .send(RelayEvent::WebMapCommand { id, command })
                 .await
                 .is_ok()
         }
-        Some(wire_envelope::Payload::BattleChunkMetaRequest(request)) => context
-            .events
+        Some(wire_envelope::Payload::BattleChunkMetaRequest(request)) => events
             .send(RelayEvent::BattleChunkMeta {
-                id: context.id.clone(),
+                id,
                 battle_chunks: request.battle_chunks.into_iter().take(256).collect(),
             })
             .await
             .is_ok(),
         Some(wire_envelope::Payload::TabHistorySubscribeRequest(request)) => {
-            if !context.profile.supports_tab_history() {
+            if !profile.supports_tab_history() {
                 return true;
             }
-            context
-                .events
+            let _ = events
                 .send(RelayEvent::TabHistorySubscription {
-                    id: context.id.clone(),
+                    id,
                     enabled: request.enabled,
                 })
+                .await;
+            if request.enabled
+                && let Ok(head) = tab_history.head(&room).await
+            {
+                let bytes = encode_payload(
+                    *channel,
+                    wire_envelope::Payload::TabHistoryDigest(TabHistoryDigest {
+                        head: Some(head),
+                    }),
+                );
+                control.send(bytes).await.is_ok()
+            } else {
+                true
+            }
+        }
+        Some(wire_envelope::Payload::TabHistorySyncRequest(request)) => {
+            let result = if profile.supports_tab_history() {
+                send_tab_sync(tab_history, control, *channel, &room, request).await
+            } else {
+                send_tab_sync_error(
+                    control,
+                    *channel,
+                    request.request_id,
+                    TabHistoryErrorCode::Unsupported,
+                )
+                .await
+            };
+            result.is_ok()
+        }
+        Some(wire_envelope::Payload::TabHistoryLookupRequest(request)) => {
+            let result = if profile.supports_tab_history() {
+                send_tab_lookup(tab_history, control, *channel, &room, request).await
+            } else {
+                send_tab_lookup_error(
+                    control,
+                    *channel,
+                    request.request_id,
+                    TabHistoryErrorCode::Unsupported,
+                )
+                .await
+            };
+            result.is_ok()
+        }
+        Some(wire_envelope::Payload::ExternalDatasetPublish(publish))
+            if kind == &ConnectionKind::ExternalSource =>
+        {
+            if !profile.supports_relationships() {
+                return true;
+            }
+            let Some(descriptor) = publish.descriptor.clone() else {
+                return true;
+            };
+            if descriptor.realm_id != room {
+                return true;
+            }
+            let mut accepted = false;
+            let mut error_detail = None;
+            match publish.update {
+                Some(crate::proto::teamviewer::v1::external_dataset_publish::Update::Status(status)) => {
+                    let health = status.health;
+                    if let Err(error) = relationships.set_health(&descriptor, health, unix_millis()).await {
+                        error_detail = Some(error.to_string());
+                    } else {
+                        accepted = true;
+                    }
+                }
+                Some(crate::proto::teamviewer::v1::external_dataset_publish::Update::RelationshipSnapshotChunk(chunk)) => {
+                    if chunk.head.is_some() {
+                        let compatibility_tabs = chunk.players.iter().filter_map(|player| player.compatibility_tab_entry.clone()).collect::<Vec<_>>();
+                        if let Err(error) = relationships.upsert_chunk(&descriptor, &chunk, unix_millis()).await {
+                            error_detail = Some(error.to_string());
+                        } else {
+                            accepted = true;
+                            if !compatibility_tabs.is_empty()
+                                && matches!(tab_history.upsert_authoritative_players(&room, &compatibility_tabs, unix_millis()).await, Ok(true))
+                                && let Ok(head) = tab_history.head(&room).await
+                            {
+                                let _ = events.send(RelayEvent::TabHistoryChanged { room: room.clone(), head }).await;
+                            }
+                        }
+                    }
+                }
+                _ => error_detail = Some("missing_dataset_update".to_owned()),
+            }
+            let ack = ExternalDatasetPublishAck {
+                request_id: publish.request_id,
+                dataset_id: descriptor.dataset_id,
+                accepted,
+                accepted_revision: None,
+                error_code: (!accepted).then_some(
+                    crate::proto::teamviewer::v1::ExternalDatasetPublishErrorCode::Internal
+                        as i32,
+                ),
+                error_detail,
+            };
+            control
+                .send(encode_payload(
+                    *channel,
+                    wire_envelope::Payload::ExternalDatasetPublishAck(ack),
+                ))
                 .await
                 .is_ok()
         }
-        Some(wire_envelope::Payload::TabHistorySyncRequest(request)) => {
-            if !context.profile.supports_tab_history() {
+        Some(wire_envelope::Payload::PlayerDirectoryLookupRequest(request))
+            if profile.supports_relationships() =>
+        {
+            if request.selectors.len() > 256 {
                 return true;
             }
-            send_tab_sync(
-                &context.tab_history,
-                &context.control,
-                context.channel,
-                &context.room,
-                request,
-            )
-            .await
-            .is_ok()
+            let entries = relationships
+                .lookup(
+                    &room,
+                    request.dataset_id.as_deref(),
+                    &request.selectors,
+                    unix_millis(),
+                )
+                .await
+                .unwrap_or_default();
+            let results = entries
+                .into_iter()
+                .enumerate()
+                .map(|(index, entries)| PlayerDirectoryLookupResult {
+                    selector_index: index as u32,
+                    entries,
+                    error_code: None,
+                })
+                .collect::<Vec<_>>();
+            let limit = request.max_chunk_entries.unwrap_or(256).clamp(1, 256) as usize;
+            let chunk_count = results.len().max(1).div_ceil(limit) as u32;
+            for index in 0..chunk_count {
+                let start = index as usize * limit;
+                let end = (start + limit).min(results.len());
+                let chunk = PlayerDirectoryLookupChunk {
+                    request_id: request.request_id.clone(),
+                    results: results.get(start..end).unwrap_or_default().to_vec(),
+                    chunk_index: index,
+                    chunk_count,
+                    r#final: index + 1 == chunk_count,
+                    error_code: None,
+                    error_detail: None,
+                };
+                if control
+                    .send(encode_payload(
+                        *channel,
+                        wire_envelope::Payload::PlayerDirectoryLookupChunk(chunk),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            true
         }
-        Some(wire_envelope::Payload::TabHistoryLookupRequest(request)) => {
-            if !context.profile.supports_tab_history() {
-                return true;
+        Some(wire_envelope::Payload::PlayerRelationQueryRequest(request))
+            if profile.supports_relationships() =>
+        {
+            let (subjects, results) = relationships
+                .relations(
+                    &room,
+                    request.dataset_id.as_deref(),
+                    request.subject.as_ref().unwrap_or(
+                        &crate::proto::teamviewer::v1::PlayerSelector { selector: None },
+                    ),
+                    &request.targets,
+                    unix_millis(),
+                )
+                .await
+                .unwrap_or_default();
+            let limit = request.max_chunk_entries.unwrap_or(256).clamp(1, 256) as usize;
+            let filtered = results
+                .into_iter()
+                .filter(|result| {
+                    request.include_relations.is_empty()
+                        || request.include_relations.contains(&result.relation)
+                })
+                .collect::<Vec<_>>();
+            let chunk_count = filtered.len().max(1).div_ceil(limit) as u32;
+            for index in 0..chunk_count {
+                let start = index as usize * limit;
+                let end = (start + limit).min(filtered.len());
+                let chunk = PlayerRelationQueryChunk {
+                    request_id: request.request_id.clone(),
+                    subjects: if index == 0 {
+                        subjects.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    results: filtered.get(start..end).unwrap_or_default().to_vec(),
+                    chunk_index: index,
+                    chunk_count,
+                    r#final: index + 1 == chunk_count,
+                    error_code: if subjects.len() > 1 {
+                        Some(
+                            crate::proto::teamviewer::v1::RelationshipQueryErrorCode::Ambiguous
+                                as i32,
+                        )
+                    } else if subjects.is_empty() {
+                        Some(
+                            crate::proto::teamviewer::v1::RelationshipQueryErrorCode::NotFound
+                                as i32,
+                        )
+                    } else {
+                        None
+                    },
+                    error_detail: None,
+                };
+                if control
+                    .send(encode_payload(
+                        *channel,
+                        wire_envelope::Payload::PlayerRelationQueryChunk(chunk),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
             }
-            send_tab_lookup(
-                &context.tab_history,
-                &context.control,
-                context.channel,
-                &context.room,
-                request,
-            )
-            .await
-            .is_ok()
+            true
         }
         Some(wire_envelope::Payload::Ping(_)) => {
             let pong = encode_payload(
-                context.channel,
+                *channel,
                 wire_envelope::Payload::Pong(Pong {
                     server_time: unix_seconds(),
                 }),
             );
-            context.control.send(pong).await.is_ok()
+            control.send(pong).await.is_ok()
         }
         _ => true,
     }
 }
-
 struct ReaderContext {
     id: String,
     room: String,
@@ -1303,22 +1561,12 @@ struct ReaderContext {
 
 async fn reader_loop(
     mut stream: futures_util::stream::SplitStream<HttpWebSocket>,
-    context: ReaderContext,
+    mut context: ReaderContext,
 ) {
-    let ReaderContext {
-        id,
-        room,
-        control,
-        events,
-        channel,
-        kind,
-        tab_history,
-        relationships,
-        metrics,
-        traffic_channel,
-        profile,
-        complete_online_roster,
-    } = context;
+    // 入站字节计量是 WS 门特有视角(桥接抽象未覆盖的传输层观测),
+    // 载荷分发统一走 handle_envelope(与 WT/QUIC 门桥同一路径)
+    let metrics = context.metrics.clone();
+    let traffic_channel = context.traffic_channel;
     while let Some(frame) = stream.next().await {
         if frame.opcode() != OpCode::Binary {
             if frame.opcode() == OpCode::Close {
@@ -1337,337 +1585,8 @@ async fn reader_loop(
         let Ok(envelope) = WireEnvelope::decode(payload) else {
             continue;
         };
-        match envelope.payload {
-            Some(wire_envelope::Payload::PlayerReportBundle(mut report))
-                if report.submit_player_id == id =>
-            {
-                sanitize_player_report(profile, &mut report);
-                if kind == ConnectionKind::ExternalSource
-                    && complete_online_roster
-                    && let Some(status) = &report.external_source_status
-                {
-                    let healthy = status.health
-                        == crate::proto::teamviewer::v1::ExternalSourceHealth::Healthy as i32;
-                    let _ = events
-                        .send(RelayEvent::ReportPolicyUpdate {
-                            room: room.clone(),
-                            policy: report_policy(healthy),
-                        })
-                        .await;
-                }
-                let tab_players = report
-                    .tab_players_replace
-                    .as_ref()
-                    .map(|replace| replace.tab_players.clone())
-                    .or_else(|| {
-                        report.tab_players_patch.as_ref().map(|patch| {
-                            patch
-                                .upsert
-                                .iter()
-                                .filter_map(|upsert| upsert.data.clone())
-                                .collect()
-                        })
-                    })
-                    .unwrap_or_default();
-                let changed_history_head =
-                    if !profile.supports_tab_history() || tab_players.is_empty() {
-                        None
-                    } else if matches!(
-                        tab_history
-                            .upsert_players(&room, &tab_players, unix_millis())
-                            .await,
-                        Ok(true)
-                    ) {
-                        tab_history.head(&room).await.ok()
-                    } else {
-                        None
-                    };
-                if events
-                    .send(RelayEvent::PlayerReport {
-                        id: id.clone(),
-                        report: Box::new(report),
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                if let Some(head) = changed_history_head {
-                    let _ = events
-                        .send(RelayEvent::TabHistoryChanged {
-                            room: room.clone(),
-                            head,
-                        })
-                        .await;
-                }
-            }
-            Some(wire_envelope::Payload::ResyncRequest(_)) => {
-                let _ = events.send(RelayEvent::Resync { id: id.clone() }).await;
-            }
-            Some(wire_envelope::Payload::WebMapCommand(command))
-                if channel == WireChannel::WebMap =>
-            {
-                let _ = events
-                    .send(RelayEvent::WebMapCommand {
-                        id: id.clone(),
-                        command,
-                    })
-                    .await;
-            }
-            Some(wire_envelope::Payload::BattleChunkMetaRequest(request)) => {
-                let _ = events
-                    .send(RelayEvent::BattleChunkMeta {
-                        id: id.clone(),
-                        battle_chunks: request.battle_chunks.into_iter().take(256).collect(),
-                    })
-                    .await;
-            }
-            Some(wire_envelope::Payload::TabHistorySubscribeRequest(request)) => {
-                if !profile.supports_tab_history() {
-                    continue;
-                }
-                let _ = events
-                    .send(RelayEvent::TabHistorySubscription {
-                        id: id.clone(),
-                        enabled: request.enabled,
-                    })
-                    .await;
-                if request.enabled
-                    && let Ok(head) = tab_history.head(&room).await
-                {
-                    let bytes = encode_payload(
-                        channel,
-                        wire_envelope::Payload::TabHistoryDigest(TabHistoryDigest {
-                            head: Some(head),
-                        }),
-                    );
-                    if control.send(bytes).await.is_err() {
-                        break;
-                    }
-                }
-            }
-            Some(wire_envelope::Payload::TabHistorySyncRequest(request)) => {
-                let result = if profile.supports_tab_history() {
-                    send_tab_sync(&tab_history, &control, channel, &room, request).await
-                } else {
-                    send_tab_sync_error(
-                        &control,
-                        channel,
-                        request.request_id,
-                        TabHistoryErrorCode::Unsupported,
-                    )
-                    .await
-                };
-                if result.is_err() {
-                    break;
-                }
-            }
-            Some(wire_envelope::Payload::TabHistoryLookupRequest(request)) => {
-                let result = if profile.supports_tab_history() {
-                    send_tab_lookup(&tab_history, &control, channel, &room, request).await
-                } else {
-                    send_tab_lookup_error(
-                        &control,
-                        channel,
-                        request.request_id,
-                        TabHistoryErrorCode::Unsupported,
-                    )
-                    .await
-                };
-                if result.is_err() {
-                    break;
-                }
-            }
-            Some(wire_envelope::Payload::ExternalDatasetPublish(publish))
-                if kind == ConnectionKind::ExternalSource =>
-            {
-                if !profile.supports_relationships() {
-                    continue;
-                }
-                let Some(descriptor) = publish.descriptor.clone() else {
-                    continue;
-                };
-                if descriptor.realm_id != room {
-                    continue;
-                }
-                let mut accepted = false;
-                let mut error_detail = None;
-                match publish.update {
-                    Some(crate::proto::teamviewer::v1::external_dataset_publish::Update::Status(status)) => {
-                        let health = status.health;
-                        if let Err(error) = relationships.set_health(&descriptor, health, unix_millis()).await {
-                            error_detail = Some(error.to_string());
-                        } else {
-                            accepted = true;
-                        }
-                    }
-                    Some(crate::proto::teamviewer::v1::external_dataset_publish::Update::RelationshipSnapshotChunk(chunk)) => {
-                        if chunk.head.is_some() {
-                            let compatibility_tabs = chunk.players.iter().filter_map(|player| player.compatibility_tab_entry.clone()).collect::<Vec<_>>();
-                            if let Err(error) = relationships.upsert_chunk(&descriptor, &chunk, unix_millis()).await {
-                                error_detail = Some(error.to_string());
-                            } else {
-                                accepted = true;
-                                if !compatibility_tabs.is_empty()
-                                    && matches!(tab_history.upsert_authoritative_players(&room, &compatibility_tabs, unix_millis()).await, Ok(true))
-                                    && let Ok(head) = tab_history.head(&room).await
-                                {
-                                    let _ = events.send(RelayEvent::TabHistoryChanged { room: room.clone(), head }).await;
-                                }
-                            }
-                        }
-                    }
-                    _ => error_detail = Some("missing_dataset_update".to_owned()),
-                }
-                let ack = ExternalDatasetPublishAck {
-                    request_id: publish.request_id,
-                    dataset_id: descriptor.dataset_id,
-                    accepted,
-                    accepted_revision: None,
-                    error_code: (!accepted).then_some(
-                        crate::proto::teamviewer::v1::ExternalDatasetPublishErrorCode::Internal
-                            as i32,
-                    ),
-                    error_detail,
-                };
-                if control
-                    .send(encode_payload(
-                        channel,
-                        wire_envelope::Payload::ExternalDatasetPublishAck(ack),
-                    ))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            Some(wire_envelope::Payload::PlayerDirectoryLookupRequest(request))
-                if profile.supports_relationships() =>
-            {
-                if request.selectors.len() > 256 {
-                    continue;
-                }
-                let entries = relationships
-                    .lookup(
-                        &room,
-                        request.dataset_id.as_deref(),
-                        &request.selectors,
-                        unix_millis(),
-                    )
-                    .await
-                    .unwrap_or_default();
-                let results = entries
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, entries)| PlayerDirectoryLookupResult {
-                        selector_index: index as u32,
-                        entries,
-                        error_code: None,
-                    })
-                    .collect::<Vec<_>>();
-                let limit = request.max_chunk_entries.unwrap_or(256).clamp(1, 256) as usize;
-                let chunk_count = results.len().max(1).div_ceil(limit) as u32;
-                for index in 0..chunk_count {
-                    let start = index as usize * limit;
-                    let end = (start + limit).min(results.len());
-                    let chunk = PlayerDirectoryLookupChunk {
-                        request_id: request.request_id.clone(),
-                        results: results.get(start..end).unwrap_or_default().to_vec(),
-                        chunk_index: index,
-                        chunk_count,
-                        r#final: index + 1 == chunk_count,
-                        error_code: None,
-                        error_detail: None,
-                    };
-                    if control
-                        .send(encode_payload(
-                            channel,
-                            wire_envelope::Payload::PlayerDirectoryLookupChunk(chunk),
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-            Some(wire_envelope::Payload::PlayerRelationQueryRequest(request))
-                if profile.supports_relationships() =>
-            {
-                let (subjects, results) = relationships
-                    .relations(
-                        &room,
-                        request.dataset_id.as_deref(),
-                        request.subject.as_ref().unwrap_or(
-                            &crate::proto::teamviewer::v1::PlayerSelector { selector: None },
-                        ),
-                        &request.targets,
-                        unix_millis(),
-                    )
-                    .await
-                    .unwrap_or_default();
-                let limit = request.max_chunk_entries.unwrap_or(256).clamp(1, 256) as usize;
-                let filtered = results
-                    .into_iter()
-                    .filter(|result| {
-                        request.include_relations.is_empty()
-                            || request.include_relations.contains(&result.relation)
-                    })
-                    .collect::<Vec<_>>();
-                let chunk_count = filtered.len().max(1).div_ceil(limit) as u32;
-                for index in 0..chunk_count {
-                    let start = index as usize * limit;
-                    let end = (start + limit).min(filtered.len());
-                    let chunk = PlayerRelationQueryChunk {
-                        request_id: request.request_id.clone(),
-                        subjects: if index == 0 {
-                            subjects.clone()
-                        } else {
-                            Vec::new()
-                        },
-                        results: filtered.get(start..end).unwrap_or_default().to_vec(),
-                        chunk_index: index,
-                        chunk_count,
-                        r#final: index + 1 == chunk_count,
-                        error_code: if subjects.len() > 1 {
-                            Some(
-                                crate::proto::teamviewer::v1::RelationshipQueryErrorCode::Ambiguous
-                                    as i32,
-                            )
-                        } else if subjects.is_empty() {
-                            Some(
-                                crate::proto::teamviewer::v1::RelationshipQueryErrorCode::NotFound
-                                    as i32,
-                            )
-                        } else {
-                            None
-                        },
-                        error_detail: None,
-                    };
-                    if control
-                        .send(encode_payload(
-                            channel,
-                            wire_envelope::Payload::PlayerRelationQueryChunk(chunk),
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-            Some(wire_envelope::Payload::Ping(_)) => {
-                let pong = encode_payload(
-                    channel,
-                    wire_envelope::Payload::Pong(Pong {
-                        server_time: unix_seconds(),
-                    }),
-                );
-                if control.send(pong).await.is_err() {
-                    break;
-                }
-            }
-            _ => {}
+        if !handle_envelope(envelope, &mut context).await {
+            break;
         }
     }
 }
