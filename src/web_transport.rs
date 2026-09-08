@@ -208,7 +208,9 @@ fn stream_bridge(
     let (bulk_tx, mut bulk_rx) = mpsc::channel::<bulk::BulkRequest>(1);
     // bulk 流必须在 door-control 下行流之后开启(流识别按开启序),
     // door_ready 由 bi 接收任务在开出 door-control 流后放行
+    // Option 包装:仅首个 bulk 需要等门控流实体化,之后置空
     let (door_ready_tx, door_ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut door_ready_rx = Some(door_ready_rx);
     let read_connection = connection.clone();
     let write_connection = connection.clone();
 
@@ -356,10 +358,6 @@ fn stream_bridge(
     {
         let bulk_connection = connection.clone();
         tokio::spawn(async move {
-            // door-control 下行流(uni #2)必须先于 bulk 流(uni #3+)开启
-            if door_ready_rx.await.is_err() {
-                return;
-            }
             while let Some(request) = bulk_rx.recv().await {
                 let transfer_id = bulk::transfer_id(&request.content);
                 let announce = door_control::bulk_start_frame(
@@ -367,8 +365,16 @@ fn stream_bridge(
                     request.content.len() as u64,
                     &request.content_type,
                 );
+                // 通告先进门控帧通道:门控泵收到首帧才实体化门控流
+                // (服务端第 2 条单向流),写完首帧后放行 door_ready,
+                // bulk 流自此可开(恒为第 3 条)——流序由此保证
                 if bulk_door_tx.send(announce).await.is_err() {
                     break;
+                }
+                if let Some(door_ready) = door_ready_rx.as_mut() {
+                    if door_ready.await.is_err() {
+                        break;
+                    }
                 }
                 let Ok(opening) = bulk_connection.open_uni().await else {
                     break;
@@ -376,13 +382,21 @@ fn stream_bridge(
                 let Ok(mut stream) = opening.await else {
                     break;
                 };
+                // 低优先级主实现:门控/应用流(默认 0)永远先于 bulk 出队
+                stream.set_priority(bulk::STREAM_PRIORITY);
                 // 心跳随 bulk 启停:独立任务,不被 bulk 写阻塞
                 let stop = Arc::new(AtomicBool::new(false));
                 let heartbeat_task = spawn_bulk_heartbeat(&bulk_connection, Arc::clone(&stop));
                 let prefix = bulk::stream_prefix(&transfer_id);
                 let mut failed = stream.write_all(&prefix).await.is_err();
+                let mut pacer = bulk::Pacer::default();
                 for chunk in request.content.chunks(bulk::CHUNK) {
-                    if failed || stream.write_all(chunk).await.is_err() {
+                    if failed {
+                        break;
+                    }
+                    // 在途字节钉底节流:RTT 来自运行时观测,无带宽假设
+                    pacer.wait(chunk.len(), bulk_connection.rtt()).await;
+                    if stream.write_all(chunk).await.is_err() {
                         failed = true;
                         break;
                     }
@@ -440,35 +454,38 @@ fn stream_bridge(
             }
         };
 
-        // door-control 下行流:服务端第 2 条单向流,必须在状态流之后开启
-        // (流识别按开启序);全部压缩套常开(空闲零开销),字典载荷仍只在
-        // +zstd-dict 套产生。开不出来时字典永不激活、bulk 不启动,datagram
-        // 维持独立压缩,链路照常。
-        match write_connection.open_uni().await {
-            Ok(opening) => match opening.await {
-                Ok(mut door_stream) => {
-                    tokio::spawn(async move {
-                        let mut door_frame_rx = door_frame_rx;
-                        while let Some(door_frame) = door_frame_rx.recv().await {
-                            if let Err(error) =
-                                frame::write_frame(&mut door_stream, &door_frame).await
-                            {
-                                debug!(%error, "WebTransport door-control write failed");
-                                break;
-                            }
-                        }
-                    });
-                    // bulk 流(uni #3+)自此放行
-                    let _ = door_ready_tx.send(());
-                }
-                Err(error) => {
-                    debug!(%error, "WebTransport door-control stream failed");
-                }
-            },
-            Err(error) => {
-                debug!(%error, "WebTransport door-control stream unavailable");
+        // door-control 下行流:服务端第 2 条单向流,按需实体化——首帧需要
+        // 时才开启(流序仍为第 2 条:应用下行流的首帧 ack 必然先于任何
+        // 门控帧,而 bulk 泵要等 door_ready 放行后才开第 3 条)。字典载荷
+        // 仍只在 +zstd-dict 套产生。开不出来时字典永不激活、bulk 不启动,
+        // datagram 维持独立压缩,链路照常。
+        let door_pump_connection = write_connection.clone();
+        tokio::spawn(async move {
+            let mut door_frame_rx = door_frame_rx;
+            let Some(first_frame) = door_frame_rx.recv().await else {
+                return;
+            };
+            let Ok(opening) = door_pump_connection.open_uni().await else {
+                debug!("WebTransport door-control stream unavailable");
+                return;
+            };
+            let Ok(mut door_stream) = opening.await else {
+                debug!("WebTransport door-control stream failed");
+                return;
+            };
+            if frame::write_frame(&mut door_stream, &first_frame).await.is_err() {
+                debug!("WebTransport door-control first frame write failed");
+                return;
             }
-        }
+            // 首帧已过线,流序 #2 已占,bulk 流(uni #3+)自此放行
+            let _ = door_ready_tx.send(());
+            while let Some(door_frame) = door_frame_rx.recv().await {
+                if let Err(error) = frame::write_frame(&mut door_stream, &door_frame).await {
+                    debug!(%error, "WebTransport door-control write failed");
+                    break;
+                }
+            }
+        });
 
         let reader = tokio::spawn(async move {
             // 上行恒为 plain varint 分帧:zstd 套只压缩下行(上行载荷小,
@@ -1282,8 +1299,9 @@ mod tests {
         let url = format!("https://a.example.com:{}{WEB_TRANSPORT_PATH}", addr.port());
         let session = client.connect(url).await.expect("connect");
 
-        // 客户端开控制流触发 bridge;服务端随即按开序开两条单向流:
-        // 第 1 条 = 应用层状态流,第 2 条 = door-control 下行
+        // 客户端开控制流触发 bridge;服务端第 1 条单向流 = 应用层状态流
+        // (door-control 按需实体化:首帧 dict_offer 写出时才过线,故先发
+        // movement 触发训练,再 accept 第 2 条单向流)
         let control = session.open_bi().await.expect("open bi");
         let (mut control_send, _control_recv) = control.await.expect("bi stream");
         frame::write_frame(&mut control_send, b"h")
@@ -1293,10 +1311,6 @@ mod tests {
             .await
             .expect("state uni timeout")
             .expect("state uni");
-        let mut offer_stream = tokio::time::timeout(Duration::from_secs(5), session.accept_uni())
-            .await
-            .expect("door-control uni timeout")
-            .expect("door-control uni");
         let (incoming_rx, _outgoing_tx, _bulk_tx, movement_tx) =
             tokio::time::timeout(Duration::from_secs(5), bridges_rx.recv())
                 .await
@@ -1317,6 +1331,12 @@ mod tests {
         movement_tx.send_replace(Some(Arc::new(MovementBatch {
             chunks: chunks.clone().into(),
         })));
+
+        // 首个门控帧(dict_offer)写出 → door-control 下行流此刻过线
+        let mut offer_stream = tokio::time::timeout(Duration::from_secs(5), session.accept_uni())
+            .await
+            .expect("door-control uni timeout")
+            .expect("door-control uni");
 
         // 激活前:每个 datagram 都是独立(无字典)zstd 帧,可无字典解出
         for expected in &chunks {

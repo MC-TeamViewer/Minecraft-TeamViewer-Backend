@@ -76,3 +76,11 @@ path = "examples/gencert_wt.rs"
 [[example]]
 name = "quic-smoke"
 path = "examples/quic_smoke.rs"
+
+[[example]]
+name = "quic-burst"
+path = "examples/quic_burst.rs"
+
+[[example]]
+name = "wt-burst"
+path = "examples/wt_burst.rs"

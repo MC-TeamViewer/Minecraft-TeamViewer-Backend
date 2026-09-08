@@ -14,16 +14,18 @@
 
 use std::collections::HashMap;
 use std::hash::Hasher;
+use std::time::Duration;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
 
-/// 单次写出让上限:小块写入让应用流自然交错,即"低优先级"的实现。
+/// 单次写出让上限:小块写入让应用流自然交错,与流优先级配合。
 pub(crate) const CHUNK: usize = 64 * 1024;
-/// 接收端"先于通告"缓冲上限建议值(README),发送端按此防御异常重放。
-#[cfg_attr(not(feature = "memory-debug"), allow(dead_code))]
-pub(crate) const PRE_ANNOUNCE_BUFFER_CAP: usize = 4 * 1024 * 1024;
+/// bulk 流的本地发送优先级:低于一切默认 0 优先级的流(quinn 语义为
+/// 数值越大越先发送),门控/应用流的数据永远先于 bulk 字节出队——
+/// 这是"低优先级"的主实现;小块写入 + CC 反馈节流兜底。
+pub(crate) const STREAM_PRIORITY: i32 = -10;
 /// debug 触发的内容防御上限(压测 10 MiB 量级,再翻倍留裕度)。
 #[cfg_attr(not(feature = "memory-debug"), allow(dead_code))]
 pub(crate) const MAX_BULK_BYTES: usize = 32 * 1024 * 1024;
@@ -90,6 +92,34 @@ impl Hub {
     }
 }
 
+/// 低优先级节流器:把 bulk 的在途字节数钉在 `INFLIGHT_TARGET`(约两个
+/// 块),使本地发送队列与链路队列都不被 bulk 灌满——高优流的数据由
+/// 流优先级保证先出队,且 cwnd 空间几乎总在。间隔公式
+/// `chunk × rtt / INFLIGHT_TARGET` 全部来自运行时观测(当前 RTT),
+/// 无任何配置带宽假设;RTT 未知(握手初期为 0)时不节流。
+#[derive(Default)]
+pub(crate) struct Pacer {
+    // 无状态化:间隔由当前 RTT 与块长直接决定,无需历史
+}
+
+impl Pacer {
+    pub(crate) async fn wait(&mut self, chunk_len: usize, rtt: Duration) {
+        if rtt.is_zero() {
+            return;
+        }
+        let gap = Duration::from_secs_f64(
+            chunk_len as f64 * rtt.as_secs_f64() / INFLIGHT_TARGET as f64,
+        );
+        if gap > Duration::ZERO {
+            tokio::time::sleep(gap).await;
+        }
+    }
+}
+
+/// bulk 在途字节目标:约两个块。超过它,bulk 的写入速率必然低于
+/// 当前 RTT 下的排队速率,既有队列得以排空而非维持(bufferbloat 防御)。
+pub(crate) const INFLIGHT_TARGET: usize = 2 * CHUNK;
+
 /// 连接内不透明的传输 ID(内容哈希前缀,与字典 ID 同风格但前缀不同)。
 pub(crate) fn transfer_id(content: &[u8]) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -130,6 +160,20 @@ mod tests {
         assert_eq!(prefix.len(), 1 + id.len());
         assert_eq!(prefix[0] as usize, id.len());
         assert_eq!(&prefix[1..], id.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn pacer_scales_gap_with_rtt() {
+        let mut pacer = Pacer::default();
+        // RTT 未知:不节流
+        let start = std::time::Instant::now();
+        pacer.wait(CHUNK, Duration::ZERO).await;
+        assert!(start.elapsed() < Duration::from_millis(20));
+        // gap = CHUNK * rtt / (2*CHUNK) = rtt/2:rtt=100ms 时应等约 50ms
+        let start = std::time::Instant::now();
+        pacer.wait(CHUNK, Duration::from_millis(100)).await;
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(45) && elapsed < Duration::from_millis(200));
     }
 
     #[test]
