@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tracing::debug;
 
-use crate::compress::{STREAM_COMPRESSION_LEVEL, Suite};
+use crate::compress::Suite;
+#[cfg(test)]
+use crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL;
 // 门控帧自 proto 0.9.0-alpha.4 起归属传输层包 teamviewer.door.v1
 // (字段号与应用层迁移前逐一不变,线上字节零变化)。
 use crate::proto::teamviewer::door::v1::{
@@ -78,6 +80,7 @@ struct ActiveDict {
 /// `plain` 套下完全惰性(不积累样本、不训练、原样透传)。
 pub(crate) struct DatagramDictEncoder {
     suite: Suite,
+    compression_level: i32,
     cctx: zstd_safe::CCtx<'static>,
     current: Option<ActiveDict>,
     previous: Option<ActiveDict>,
@@ -89,19 +92,24 @@ pub(crate) struct DatagramDictEncoder {
 
 impl DatagramDictEncoder {
     /// 生产构造:默认阈值与重训间隔。
-    pub(crate) fn for_suite(suite: Suite) -> DatagramDictEncoder {
-        Self::with_policy(suite, TrainingPolicy::production())
+    pub(crate) fn for_suite(suite: Suite, compression_level: i32) -> DatagramDictEncoder {
+        Self::with_policy(suite, TrainingPolicy::production(), compression_level)
     }
 
-    pub(crate) fn with_policy(suite: Suite, policy: TrainingPolicy) -> DatagramDictEncoder {
+    pub(crate) fn with_policy(
+        suite: Suite,
+        policy: TrainingPolicy,
+        compression_level: i32,
+    ) -> DatagramDictEncoder {
         let mut cctx = zstd_safe::CCtx::create();
         // 单帧独立压缩级别与流压缩同款;CDict 自带级别,此参数只作用于
         // 激活前的无字典路径
         let _ = cctx.set_parameter(zstd_safe::CParameter::CompressionLevel(
-            STREAM_COMPRESSION_LEVEL,
+            compression_level,
         ));
         DatagramDictEncoder {
             suite,
+            compression_level,
             cctx,
             current: None,
             previous: None,
@@ -173,7 +181,7 @@ impl DatagramDictEncoder {
         self.samples.clear();
         self.last_training = Some(now);
         let id = dict_id(&content);
-        let cdict = zstd_safe::CDict::create(&content, STREAM_COMPRESSION_LEVEL);
+        let cdict = zstd_safe::CDict::create(&content, self.compression_level);
         self.pending = Some(ActiveDict {
             id: id.clone(),
             _cdict: cdict,
@@ -310,7 +318,7 @@ mod tests {
 
     #[test]
     fn plain_suite_is_fully_inert() {
-        let mut encoder = DatagramDictEncoder::with_policy(Suite::Plain, small_policy());
+        let mut encoder = DatagramDictEncoder::with_policy(Suite::Plain, small_policy(), DEFAULT_STREAM_COMPRESSION_LEVEL);
         assert!(!encoder.compression_enabled() && !encoder.dict_enabled());
         // 不积累样本、不训练、原样透传
         assert!(encoder.observe(&batch_of(&[b"aaaa"]), t(0)).is_none());
@@ -323,7 +331,7 @@ mod tests {
 
     #[test]
     fn offer_ready_activation_gates_dictionary_compression() {
-        let mut encoder = DatagramDictEncoder::with_policy(Suite::ZstdDict, small_policy());
+        let mut encoder = DatagramDictEncoder::with_policy(Suite::ZstdDict, small_policy(), DEFAULT_STREAM_COMPRESSION_LEVEL);
         assert!(encoder.dict_enabled());
         // 阈值未到:不训练,datagram 走独立压缩(可无字典解出)
         let first = encoder
@@ -368,7 +376,7 @@ mod tests {
 
     #[test]
     fn lifecycle_keeps_only_current_and_previous() {
-        let mut encoder = DatagramDictEncoder::with_policy(Suite::ZstdDict, small_policy());
+        let mut encoder = DatagramDictEncoder::with_policy(Suite::ZstdDict, small_policy(), DEFAULT_STREAM_COMPRESSION_LEVEL);
         let train = |encoder: &mut DatagramDictEncoder, epoch: u64| {
             let mut samples = padded_samples(&format!("sample-{epoch}"), 10);
             samples.extend(padded_samples("shared-tail", 2));
@@ -398,6 +406,7 @@ mod tests {
                 min_sample_bytes: DICT_SIZE,
                 min_interval: Duration::from_secs(60),
             },
+            DEFAULT_STREAM_COMPRESSION_LEVEL,
         );
         let base = t(0);
         let batches: Vec<Vec<Vec<u8>>> = ["first", "second", "third", "fourth"]

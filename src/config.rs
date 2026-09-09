@@ -30,6 +30,9 @@ pub struct RuntimeConfig {
     pub tab_history_max_chunk_bytes: usize,
     pub tab_history_max_lookup_selectors: usize,
     pub tab_history_observation_update_interval_sec: u64,
+    /// 下行 zstd 压缩级别(可靠流与 datagram 独立压缩共用);`TEAMVIEWER_ZSTD_LEVEL`,
+    /// 默认 3,越界钳到 1..=22。纯发送端决策,zstd 帧自描述,无需协商。
+    pub zstd_compression_level: i32,
     pub web_transport: WebTransportConfig,
     pub quic_transport: WebTransportConfig,
 }
@@ -360,6 +363,13 @@ impl Default for TabHistoryConfig {
 }
 
 impl RuntimeConfig {
+    /// `TEAMVIEWER_ZSTD_LEVEL` 解析:非法值回默认,越界钳 1..=22。
+    fn resolve_zstd_level(env: Option<&str>) -> i32 {
+        env.and_then(|value| value.trim().parse::<i32>().ok())
+            .unwrap_or(crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL)
+            .clamp(1, 22)
+    }
+
     pub fn load() -> Self {
         let parsed = toml::from_str::<FileConfig>(STATE_CONFIG).unwrap_or_default();
         let mut congestion_levels = parsed.protocol.congestion_levels;
@@ -455,6 +465,9 @@ impl RuntimeConfig {
                 .tab_history
                 .observation_update_interval_sec
                 .clamp(1, 86_400),
+            zstd_compression_level: Self::resolve_zstd_level(
+                env_string("TEAMVIEWER_ZSTD_LEVEL").as_deref(),
+            ),
             web_transport,
             quic_transport,
         }
@@ -487,6 +500,18 @@ mod tests {
         CertIdentityFileConfig, FileConfig, MAX_WT_IDENTITIES, RuntimeConfig,
         WebTransportFileConfig, parse_identities_json, resolve_web_transport,
     };
+
+    #[test]
+    fn zstd_level_env_overrides_and_clamps() {
+        // 纯函数直测:非法回默认,越界钳 1..=22,合法值原样(不触碰进程环境)
+        assert_eq!(RuntimeConfig::resolve_zstd_level(None), 3);
+        assert_eq!(RuntimeConfig::resolve_zstd_level(Some("fast")), 3);
+        assert_eq!(RuntimeConfig::resolve_zstd_level(Some("9")), 9);
+        assert_eq!(RuntimeConfig::resolve_zstd_level(Some(" 7 ")), 7);
+        assert_eq!(RuntimeConfig::resolve_zstd_level(Some("99")), 22);
+        assert_eq!(RuntimeConfig::resolve_zstd_level(Some("0")), 1);
+        assert_eq!(RuntimeConfig::resolve_zstd_level(Some("-5")), 1);
+    }
 
     #[test]
     fn bundled_state_config_is_loaded() {

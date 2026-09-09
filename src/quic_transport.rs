@@ -113,7 +113,7 @@ async fn accept_connection(
         ?suite,
         "QUIC connection accepted"
     );
-    let mut session = stream_bridge(connection, suite);
+    let mut session = stream_bridge(connection, suite, state.config.zstd_compression_level);
     // bulk 触发通道入表(debug 端点按表投递;会话死透时发送失败自然逐出)
     if let Some(bulk_tx) = session.bulk.take() {
         let hub_id = state.bulk_hub.register(bulk_tx).await;
@@ -146,6 +146,7 @@ fn negotiated_alpn(connection: &Connection) -> Option<String> {
 fn stream_bridge(
     connection: Connection,
     suite: crate::compress::Suite,
+    compression_level: i32,
 ) -> crate::door::DoorSession {
     let (incoming_tx, incoming_rx) = mpsc::channel::<Result<Bytes, io::Error>>(256);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Bytes>(256);
@@ -176,7 +177,8 @@ fn stream_bridge(
     // bulk 任务的门控帧通道克隆(必须在 movement 任务 spawn 前建,它会把
     // door_frame_tx move 走)
     let bulk_door_tx = door_frame_tx.clone();
-    let mut dict_encoder = door_control::DatagramDictEncoder::for_suite(suite);
+    let mut dict_encoder =
+        door_control::DatagramDictEncoder::for_suite(suite, compression_level);
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -464,7 +466,7 @@ use crate::proto::teamviewer::v1::{WireChannel, WireEnvelope, wire_envelope};
 
         // 下行 zstd:envelope → 持久 CCtx flush 出压缩块 → `[varint][块]`
         let mut encoder = if suite.stream_zstd() {
-            match crate::compress::StreamEncoder::new() {
+            match crate::compress::StreamEncoder::new(compression_level) {
                 Ok(encoder) => Some(encoder),
                 Err(error) => {
                     debug!(%error, "QUIC downlink encoder unavailable");
@@ -711,7 +713,7 @@ mod tests {
         let server_conn = server_rx.recv().await.expect("server accepted");
 
         // bridge 建立(镜像 accept_connection 装配,movement 关闭)
-        let session = stream_bridge(server_conn, crate::compress::Suite::Plain);
+        let session = stream_bridge(server_conn, crate::compress::Suite::Plain, crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL);
         let mut incoming_rx = session.incoming;
         let mut outgoing_tx = session.outgoing;
 
@@ -771,7 +773,7 @@ mod tests {
         );
         let server_conn = server_rx.recv().await.expect("server accepted");
 
-        let session = stream_bridge(server_conn, crate::compress::Suite::Zstd);
+        let session = stream_bridge(server_conn, crate::compress::Suite::Zstd, crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL);
         let mut incoming_rx = session.incoming;
         let mut outgoing_tx = session.outgoing;
 
@@ -836,7 +838,7 @@ mod tests {
         let connection = connect(addr, leaf, &[ALPN_PLAIN.as_bytes()]).await;
         let server_conn = server_rx.recv().await.expect("server accepted");
 
-        let session = stream_bridge(server_conn, crate::compress::Suite::Plain);
+        let session = stream_bridge(server_conn, crate::compress::Suite::Plain, crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL);
         let movement_tx = session.movement_tx;
 
         let chunk_a: Arc<[u8]> = Bytes::from_static(b"abc").to_vec().into();

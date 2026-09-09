@@ -374,7 +374,8 @@ async fn ws_socket_bridge(
     // 下行 zstd 压缩器:消息级 flush 块,跨消息共享压缩上下文。zstd 套语义
     // 为单向:仅下行(服务端→客户端)压缩,上行恒为 plain 消息。
     let encoder = match suite.filter(|suite| suite.stream_zstd()) {
-        Some(_) => match crate::compress::StreamEncoder::new() {
+        Some(_) => match crate::compress::StreamEncoder::new(state.config.zstd_compression_level)
+        {
             Ok(encoder) => Some(encoder),
             Err(error) => {
                 warn!(%error, "zstd encoder unavailable, closing connection");
@@ -1996,7 +1997,8 @@ mod tests {
 
         let first_payload = vec![9u8; 4096];
         let second_payload = b"control-frame".to_vec();
-        let encoder = crate::compress::StreamEncoder::new().expect("zstd encoder");
+        let encoder = crate::compress::StreamEncoder::new(crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL)
+            .expect("zstd encoder");
         let egress = tokio::spawn(ws_egress_loop(
             sink,
             payload_rx,

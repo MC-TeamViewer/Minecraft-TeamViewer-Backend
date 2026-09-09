@@ -27,9 +27,9 @@ use bytes::Bytes;
 use crate::frame::MAX_FRAME_LEN;
 use crate::quic_transport::{ALPN_PLAIN, ALPN_ZSTD, ALPN_ZSTD_DICT};
 
-/// 服务端下行流压缩级别(压缩套语义为单向,上行恒 plain)。级别是纯
-/// 发送端决策,zstd 帧自描述,无需协商。
-pub(crate) const STREAM_COMPRESSION_LEVEL: i32 = 3;
+/// 下行流压缩级别的默认值(可用 `TEAMVIEWER_ZSTD_LEVEL` 覆盖,1..=22)。
+/// 级别是纯发送端决策,zstd 帧自描述,无需协商。
+pub(crate) const DEFAULT_STREAM_COMPRESSION_LEVEL: i32 = 3;
 
 /// 解压窗口上限(2^23 = 8 MiB):防对端大窗口帧逼出大内存分配。
 /// 仅测试用(服务端不再解压任何流,客户端实现须自行设同款上限)。
@@ -154,9 +154,9 @@ pub(crate) struct StreamEncoder {
 }
 
 impl StreamEncoder {
-    pub(crate) fn new() -> io::Result<StreamEncoder> {
+    pub(crate) fn new(compression_level: i32) -> io::Result<StreamEncoder> {
         Ok(StreamEncoder {
-            encoder: zstd::stream::Encoder::new(Vec::new(), STREAM_COMPRESSION_LEVEL)?,
+            encoder: zstd::stream::Encoder::new(Vec::new(), compression_level)?,
         })
     }
 
@@ -241,7 +241,7 @@ mod tests {
     /// 逐 envelope 压缩→按任意边界切开喂解码器→按序还原。
     #[test]
     fn round_trip_across_arbitrary_chunk_boundaries() {
-        let mut encoder = StreamEncoder::new().expect("encoder");
+        let mut encoder = StreamEncoder::new(DEFAULT_STREAM_COMPRESSION_LEVEL).expect("encoder");
         let mut decoder = StreamDecoder::new().expect("decoder");
         let mut compressed = Vec::new();
         let mut expected = Vec::new();
@@ -263,7 +263,7 @@ mod tests {
     /// 逐块解码(发送端 flush 对齐语义):每块解出恰好一个 envelope。
     #[test]
     fn per_chunk_decode_yields_envelopes_in_order() {
-        let mut encoder = StreamEncoder::new().expect("encoder");
+        let mut encoder = StreamEncoder::new(DEFAULT_STREAM_COMPRESSION_LEVEL).expect("encoder");
         let mut decoder = StreamDecoder::new().expect("decoder");
         for envelope in sample_envelopes() {
             let chunk = encoder.compress_chunk(&envelope).expect("compress");
