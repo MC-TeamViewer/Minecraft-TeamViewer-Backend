@@ -79,7 +79,8 @@ pub struct RegisterConnection {
     pub state: watch::Sender<Option<StateFrame>>,
     /// 服务端→客户端 movement datagram 批;无 datagram 的连接无人消费,空转无害。
     pub movement: watch::Sender<Option<Arc<MovementBatch>>>,
-    /// 连接声明消费 datagram 位置且传输层支持:可靠 patch 剥离逐 tick 位置字段。
+    /// 连接声明消费 datagram 位置且传输层支持(alpha.6 起 Player/WebMap 通用):
+    /// 可靠 patch 剥离逐 tick 位置字段,movement 批改走 datagram。
     pub unreliable_positions: bool,
 }
 
@@ -2118,11 +2119,11 @@ impl Relay {
                 // movement 批必须在 payload 判空之前发布:能力连接的可靠 patch
                 // 常因位置被剥离而为空,datagram 恰是这些 tick 的唯一位置来源。
                 // 仅对启用分流的连接编码发布,legacy 连接(WS/未声明能力)不浪费。
-                if kind == ConnectionKind::WebMap
-                    && self
-                        .connections
-                        .get(&id)
-                        .is_some_and(|connection| connection.unreliable_positions)
+                // alpha.6 起不再限 WebMap:Player 声明下行消费同样分流。
+                if self
+                    .connections
+                    .get(&id)
+                    .is_some_and(|connection| connection.unreliable_positions)
                 {
                     let batch = movement_batches
                         .entry(projection_key.clone())

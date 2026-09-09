@@ -546,6 +546,7 @@ pub(crate) async fn serve_web_map_session(
         complete_online_roster,
         unreliable_positions,
         unreliable_channels_accepted,
+        downlink_channels_accepted,
     ) = match envelope.payload {
         // 无 path 的门(WT/QUIC)靠首个握手的载荷类型自识别 Player/WebMap 通道
         Some(wire_envelope::Payload::PlayerHandshakeRequest(handshake)) => {
@@ -606,6 +607,18 @@ pub(crate) async fn serve_web_map_session(
                 } else {
                     Vec::new()
                 };
+            // 下行消费声明(alpha.6):客户端声明可经 datagram 消费的通道;
+            // 实际启用 = 声明 ∩ 已知值 ∩ 本门 datagram 预算装得下 movement 块
+            let downlink_channels_accepted: Vec<UnreliableChannel> = if datagram_capable {
+                handshake
+                    .accepts_channels
+                    .iter()
+                    .filter_map(|value| UnreliableChannel::try_from(*value).ok())
+                    .filter(|value| *value != UnreliableChannel::Unspecified)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             (
                 handshake.submit_player_id,
                 normalize_room(handshake.room_code.as_deref()),
@@ -616,9 +629,9 @@ pub(crate) async fn serve_web_map_session(
                 handshake.position_resolution,
                 handshake.local_program_version,
                 complete_online_roster,
-                // 玩家连接是位置的产出方,不做 movement datagram 分流
-                false,
+                downlink_channels_accepted.contains(&UnreliableChannel::Movement),
                 unreliable_channels_accepted,
+                downlink_channels_accepted,
             )
         }
         Some(wire_envelope::Payload::WebMapHandshakeRequest(handshake)) => {
@@ -630,10 +643,15 @@ pub(crate) async fn serve_web_map_session(
                 Err(_error) => return,
             };
             // 客户端声明可消费 movement datagram(0.9.0 列表或 0.8.1 布尔映射)
-            // 且 本连接 datagram 预算装得下 movement 块
-            let unreliable_positions = accepts_unreliable_channels(&handshake)
-                .contains(&UnreliableChannel::Movement)
-                && datagram_capable;
+            // 且 本连接 datagram 预算装得下 movement 块;回执 = 声明 ∩ 已知值
+            let declared_downlink = accepts_unreliable_channels(&handshake);
+            let unreliable_positions =
+                declared_downlink.contains(&UnreliableChannel::Movement) && datagram_capable;
+            let downlink_channels_accepted = if datagram_capable {
+                declared_downlink
+            } else {
+                Vec::new()
+            };
             (
                 format!("web-map-{}", Uuid::new_v4()),
                 normalize_room(handshake.room_code.as_deref()),
@@ -646,6 +664,7 @@ pub(crate) async fn serve_web_map_session(
                 false,
                 unreliable_positions,
                 Vec::new(),
+                downlink_channels_accepted,
             )
         }
         _ => {
@@ -717,6 +736,12 @@ pub(crate) async fn serve_web_map_session(
         } else {
             Vec::new()
         },
+        // 下行消费回执(alpha.6):Player 自 accepts_channels(14)、WebMap 自
+        // accepts_channels(6)/deprecated 布尔协商,两类连接统一在此回执
+        downlink_channels_accepted: downlink_channels_accepted
+            .iter()
+            .map(|value| *value as i32)
+            .collect(),
         ..Default::default()
     };
     let ack = encode_payload(channel, wire_envelope::Payload::HandshakeAck(ack));
@@ -2303,6 +2328,165 @@ mod tests {
         })
         .await;
         assert!(deadline.is_ok(), "位置未在超时内进入快照");
+
+        session.abort();
+    }
+
+    /// 下行消费对称化(alpha.6)端到端:Player 握手 accepts_channels 声明
+    /// MOVEMENT 且门具备 datagram 能力 → ack downlink_channels_accepted 回执;
+    /// 上报位置后 relay 向该 Player 的 movement watch 发布 movement 批
+    /// (0.9.0-alpha.5 及以前此路径为 WebMap 专属)。
+    #[tokio::test]
+    async fn door_session_downlink_movement_datagram_granted_and_published() {
+        use crate::proto::teamviewer::v1::{
+            PlayerDelta, PlayerHandshakeRequest, PlayerPatchScope, PlayerUpsert,
+            UnreliableChannel, wire_envelope,
+        };
+        use crate::web_transport::{MpscReceiver, MpscSink};
+
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        sqlx::migrate!().run(&db).await.expect("migrations");
+        let tab_history = Arc::new(TabHistoryStore::new(db.clone()));
+        tab_history.initialize().await.expect("tab history schema");
+        let relationships = Arc::new(RelationshipStore::new(db.clone()));
+        relationships
+            .initialize()
+            .await
+            .expect("relationship schema");
+        let config = Arc::new(RuntimeConfig::load());
+        let state = AppState {
+            relay: RelayHandle::spawn(config.clone()),
+            db,
+            tab_history,
+            relationships,
+            config,
+            metrics: Arc::new(Metrics::default()),
+            maintenance_rooms: Arc::new(RwLock::new(HashSet::new())),
+            bulk_hub: crate::bulk::Hub::new(),
+            #[cfg(feature = "memory-debug")]
+            resource_debug: None,
+        };
+
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(4);
+        let stream = WebMapFrameStream::new(MpscReceiver::new(inbound_rx));
+        let sink = MpscSink::new(outbound_tx);
+        // movement watch 留住接收端:relay 发布的 movement 批从这里观测
+        let (movement_tx, mut movement_rx) = watch::channel(None);
+
+        let session = tokio::spawn(serve_web_map_session(
+            crate::door::DoorSession {
+                incoming: stream,
+                outgoing: sink,
+                movement_tx,
+                bulk: None,
+                incoming_datagrams: None,
+                capabilities: crate::door::DoorCapabilities {
+                    datagram: true,
+                    ..Default::default()
+                },
+            },
+            state,
+            "test-remote".to_owned(),
+        ));
+
+        let handshake = PlayerHandshakeRequest {
+            submit_player_id: "downlink-player".to_owned(),
+            network_protocol_version: CURRENT_PROTOCOL_VERSION.to_string(),
+            minimum_compatible_network_protocol_version: MINIMUM_PROTOCOL_VERSION.to_string(),
+            room_code: Some("door-room".to_owned()),
+            accepts_channels: vec![UnreliableChannel::Movement as i32],
+            ..Default::default()
+        };
+        let envelope = WireEnvelope {
+            channel: WireChannel::Player as i32,
+            payload: Some(wire_envelope::Payload::PlayerHandshakeRequest(handshake)),
+        };
+        inbound_tx
+            .send(Ok(Bytes::from(envelope.encode_to_vec())))
+            .await
+            .expect("inbound frame");
+
+        let ack_bytes = tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("ack timeout")
+            .expect("ack frame");
+        let ack_envelope = WireEnvelope::decode(ack_bytes).expect("ack envelope");
+        let Some(wire_envelope::Payload::HandshakeAck(ack)) = ack_envelope.payload else {
+            panic!("expected handshake ack");
+        };
+        // 下行消费回执:声明获得回执;上行回执保持为空(未声明)
+        assert_eq!(
+            ack.downlink_channels_accepted,
+            vec![UnreliableChannel::Movement as i32]
+        );
+        assert!(ack.unreliable_channels_accepted.is_empty());
+
+        // 可靠流上报一个位置,驱动 relay 建立玩家并进入发布循环
+        let report = crate::proto::teamviewer::v1::PlayerReportBundle {
+            submit_player_id: "downlink-player".to_owned(),
+            players_patch: Some(PlayerPatchScope {
+                upsert: vec![PlayerUpsert {
+                    id: "downlink-player".to_owned(),
+                    data: Some(PlayerDelta {
+                        x: Some(3.5),
+                        y: Some(64.0),
+                        z: Some(-1.0),
+                        dimension: Some("minecraft:overworld".to_owned()),
+                        player_name: Some("downlink".to_owned()),
+                        ..Default::default()
+                    }),
+                    clear_fields: Vec::new(),
+                }],
+                delete: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let report_envelope = WireEnvelope {
+            channel: WireChannel::Player as i32,
+            payload: Some(wire_envelope::Payload::PlayerReportBundle(report)),
+        };
+        inbound_tx
+            .send(Ok(Bytes::from(report_envelope.encode_to_vec())))
+            .await
+            .expect("inbound report");
+
+        // relay 应向该 Player 的 movement watch 发布批(alpha.6 前仅 WebMap);
+        // 玩家建立前的空 tick 也会发布空批,等到首个含位置的批
+        let published = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if movement_rx.changed().await.is_err() {
+                    return None;
+                }
+                if let Some(batch) = movement_rx.borrow_and_update().clone()
+                    && !batch.chunks.is_empty()
+                {
+                    return Some(batch);
+                }
+            }
+        })
+        .await
+        .expect("movement batch timeout");
+        let batch = published.expect("movement batch published");
+        assert!(!batch.chunks.is_empty());
+        // movement 批载荷 = 裸 WebMap-channel Patch(与消费端角色无关的契约)
+        let chunk = &batch.chunks[0][..];
+        let datagram_envelope = WireEnvelope::decode(Bytes::copy_from_slice(chunk))
+            .expect("movement chunk envelope");
+        assert_eq!(datagram_envelope.channel, WireChannel::WebMap as i32);
+        let Some(wire_envelope::Payload::Patch(patch)) = datagram_envelope.payload else {
+            panic!("expected patch payload in movement chunk");
+        };
+        assert!(patch
+            .players
+            .expect("players scope")
+            .upsert
+            .iter()
+            .any(|upsert| upsert.id == "downlink-player"));
 
         session.abort();
     }
