@@ -39,6 +39,9 @@ async fn main() -> anyhow::Result<()> {
         .parse::<SqliteConnectOptions>()?
         .create_if_missing(true)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        // WAL 下 Normal 是安全档:fsync 只在 checkpoint 落盘,消除每次
+        // flush 提交的 fsync 尖峰(慢盘上单条 upsert 曾到 1.1s)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
         .busy_timeout(std::time::Duration::from_secs(5));
     let db = SqlitePoolOptions::new()
         .max_connections(4)

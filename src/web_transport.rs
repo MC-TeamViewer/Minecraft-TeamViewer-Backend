@@ -15,7 +15,7 @@ use futures_util::{Sink, Stream};
 
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use wtransport::error::SendDatagramError;
 use wtransport::{Endpoint, ServerConfig, endpoint::IncomingSession};
 
@@ -158,7 +158,7 @@ async fn accept_session(
         "WebTransport session accepted"
     );
     let mut session =
-        stream_bridge(connection, suite.unwrap_or_default(), state.config.zstd_compression_level);
+        stream_bridge(connection, suite.unwrap_or_default(), state.config.zstd_compression_level, remote_addr.clone());
     // bulk 触发通道入表(debug 端点按表投递;会话死透时发送失败自然逐出)
     if let Some(bulk_tx) = session.bulk.take() {
         let hub_id = state.bulk_hub.register(bulk_tx).await;
@@ -185,6 +185,7 @@ fn stream_bridge(
     connection: wtransport::Connection,
     suite: crate::compress::Suite,
     compression_level: i32,
+    remote_addr: String,
 ) -> crate::door::DoorSession {
     let (incoming_tx, incoming_rx) = mpsc::channel::<Result<Bytes, io::Error>>(256);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Bytes>(256);
@@ -423,6 +424,14 @@ use crate::proto::teamviewer::v1::{WireChannel, WireEnvelope, wire_envelope};
     tokio::spawn(async move {
         let control = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_connection.accept_bi()).await;
         let Ok(Ok((send, mut recv))) = control else {
+            // 客户端在 HANDSHAKE_TIMEOUT 内从未打开上行双向流:典型成因是
+            // 浏览器在 accept 后中止了会话(如 WT-Protocol 协商语义不合)。
+            // 此处绝不能静默——否则生产上只剩"session accepted 后无音信"。
+            warn!(
+                %remote_addr,
+                timeout_secs = HANDSHAKE_TIMEOUT.as_secs(),
+                "WebTransport control bi stream missing (client never opened uplink)"
+            );
             let _ = incoming_tx
                 .send(Err(io::Error::other("WebTransport control stream missing")))
                 .await;
@@ -445,6 +454,7 @@ use crate::proto::teamviewer::v1::{WireChannel, WireEnvelope, wire_envelope};
         let opening = match tokio::time::timeout(WRITE_TIMEOUT, write_connection.open_uni()).await {
             Ok(Ok(opening)) => opening,
             _ => {
+                warn!(%remote_addr, "WebTransport state stream open failed");
                 let _ = incoming_tx
                     .send(Err(io::Error::other(
                         "WebTransport state stream unavailable",
@@ -456,6 +466,7 @@ use crate::proto::teamviewer::v1::{WireChannel, WireEnvelope, wire_envelope};
         let mut state_stream = match opening.await {
             Ok(state_stream) => state_stream,
             Err(error) => {
+                warn!(%remote_addr, %error, "WebTransport state stream failed");
                 let _ = incoming_tx
                     .send(Err(io::Error::other(format!(
                         "WebTransport state stream failed: {error}"
@@ -937,7 +948,7 @@ mod tests {
                 .expect("incoming timeout")
                 .expect("session request");
             let connection = request.accept().await.expect("session accepted");
-            let _bridge = stream_bridge(connection, crate::compress::Suite::Plain, crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL);
+            let _bridge = stream_bridge(connection, crate::compress::Suite::Plain, crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL, "test-client".to_owned());
         });
         let _ = runtime;
 
@@ -992,7 +1003,7 @@ mod tests {
                 .expect("incoming timeout")
                 .expect("session request");
             let connection = request.accept().await.expect("session accepted");
-            let bridge = stream_bridge(connection, crate::compress::Suite::Plain, crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL);
+            let bridge = stream_bridge(connection, crate::compress::Suite::Plain, crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL, "test-client".to_owned());
             bridges_tx.send(bridge).await.ok();
         });
         let _ = runtime;
@@ -1081,7 +1092,7 @@ mod tests {
                 .expect("incoming timeout")
                 .expect("session request");
             let connection = request.accept().await.expect("session accepted");
-            let bridge = stream_bridge(connection, crate::compress::Suite::Plain, crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL);
+            let bridge = stream_bridge(connection, crate::compress::Suite::Plain, crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL, "test-client".to_owned());
             sessions_tx.send(bridge).await.ok();
         });
         let _ = runtime;
@@ -1190,7 +1201,7 @@ mod tests {
                 .expect("incoming timeout")
                 .expect("session request");
             let connection = request.accept().await.expect("session accepted");
-            let bridge = stream_bridge(connection, crate::compress::Suite::Zstd, crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL);
+            let bridge = stream_bridge(connection, crate::compress::Suite::Zstd, crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL, "test-client".to_owned());
             bridges_tx.send(bridge).await.ok();
         });
         let _ = runtime;
@@ -1289,7 +1300,7 @@ mod tests {
                 .expect("incoming timeout")
                 .expect("session request");
             let connection = request.accept().await.expect("session accepted");
-            let bridge = stream_bridge(connection, crate::compress::Suite::ZstdDict, crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL);
+            let bridge = stream_bridge(connection, crate::compress::Suite::ZstdDict, crate::compress::DEFAULT_STREAM_COMPRESSION_LEVEL, "test-client".to_owned());
             bridges_tx.send(bridge).await.ok();
         });
         let _ = runtime;

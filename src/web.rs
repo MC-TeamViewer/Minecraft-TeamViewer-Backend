@@ -523,6 +523,7 @@ pub(crate) async fn serve_web_map_session(
     let first = match tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
         Ok(Some(Ok(frame))) if !frame.is_empty() => frame,
         _ => {
+            warn!(%remote_addr, "door handshake first frame missing (client silent for 10s)");
             return;
         }
     };
@@ -861,9 +862,9 @@ pub(crate) async fn serve_web_map_session(
         (_, _, None) => None,
     };
 
-    tokio::select! {
-        _ = &mut writer => reader.abort(),
-        _ = &mut reader => writer.abort(),
+    let end_reason = tokio::select! {
+        _ = &mut writer => "writer_ended",
+        _ = &mut reader => "reader_ended",
         _ = async {
             match datagram_task.as_mut() {
                 Some(task) => {
@@ -877,14 +878,15 @@ pub(crate) async fn serve_web_map_session(
             }
             reader.abort();
             writer.abort();
+            "datagram_consumer_ended"
         }
-    }
+    };
     let _ = event_tx
         .send(RelayEvent::Disconnect { id: id.clone() })
         .await;
     record_connection_ended(&state.db, &id, &room, kind, &remote_addr).await;
     state.metrics.unregister(&id);
-    info!(connection_id = %id, "door session disconnected");
+    info!(connection_id = %id, reason = end_reason, "door session disconnected");
 }
 
 async fn sample_wire_traffic(
