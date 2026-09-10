@@ -75,7 +75,7 @@ docker build -t teamviewrelay-backend:local .
 已发布镜像：
 
 ```text
-professornuo/teamviewrelay-rust:v1.2.0-alpha.3-proto0.8.0
+professornuo/teamviewrelay:v1.2.0-alpha.10-proto0.9.0
 ```
 
 `docker-compose.yml` 默认使用该版本，并将 SQLite 数据目录挂载到宿主机的 `./data-rust`。
