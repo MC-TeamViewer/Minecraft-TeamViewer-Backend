@@ -339,10 +339,10 @@ use crate::proto::teamviewer::v1::{WireChannel, WireEnvelope, wire_envelope};
                 if bulk_door_tx.send(announce).await.is_err() {
                     break;
                 }
-                if let Some(door_ready) = door_ready_rx.as_mut() {
-                    if door_ready.await.is_err() {
-                        break;
-                    }
+                if let Some(door_ready) = door_ready_rx.as_mut()
+                    && door_ready.await.is_err()
+                {
+                    break;
                 }
                 let Ok(mut stream) = bulk_connection.open_uni().await else {
                     break;

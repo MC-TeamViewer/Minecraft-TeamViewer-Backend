@@ -78,27 +78,29 @@ pub fn scan_frame(buffer: &[u8]) -> Option<(Vec<u8>, usize)> {
 
 #[allow(deprecated)]
 pub fn web_handshake(room: &str) -> Vec<u8> {
-    let mut envelope = WireEnvelope::default();
-    envelope.channel = WireChannel::WebMap as i32;
-    envelope.payload = Some(wire_envelope::Payload::WebMapHandshakeRequest(
-        WebMapHandshakeRequest {
-            network_protocol_version: "0.8.0".into(),
-            minimum_compatible_network_protocol_version: "0.6.1".into(),
-            local_program_version: "burst-rust".into(),
-            room_code: Some(room.into()),
-            accepts_unreliable_positions: None,
-            accepts_channels: Vec::new(),
-        },
-    ));
+    let envelope = WireEnvelope {
+        channel: WireChannel::WebMap as i32,
+        payload: Some(wire_envelope::Payload::WebMapHandshakeRequest(
+            WebMapHandshakeRequest {
+                network_protocol_version: "0.8.0".into(),
+                minimum_compatible_network_protocol_version: "0.6.1".into(),
+                local_program_version: "burst-rust".into(),
+                room_code: Some(room.into()),
+                accepts_unreliable_positions: None,
+                accepts_channels: Vec::new(),
+            },
+        )),
+    };
     envelope.encode_to_vec()
 }
 
 pub fn ping_envelope() -> Vec<u8> {
-    let mut envelope = WireEnvelope::default();
-    envelope.channel = WireChannel::WebMap as i32;
-    envelope.payload = Some(wire_envelope::Payload::Ping(
-        teamviewrelay_rust::proto::teamviewer::v1::Ping {},
-    ));
+    let envelope = WireEnvelope {
+        channel: WireChannel::WebMap as i32,
+        payload: Some(wire_envelope::Payload::Ping(
+            teamviewrelay_rust::proto::teamviewer::v1::Ping {},
+        )),
+    };
     envelope.encode_to_vec()
 }
 

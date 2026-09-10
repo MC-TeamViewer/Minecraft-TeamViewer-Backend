@@ -87,13 +87,13 @@ async fn run(server: &str, room: &str, cert_sha: &str) -> Anyhow {
             let Ok(envelope) = WireEnvelope::decode(decoded.as_slice()) else {
                 continue;
             };
-            if matches!(envelope.payload, Some(wire_envelope::Payload::Pong(_))) {
-                if let Some(sent) = pong_state.lock().await.take() {
-                    pong_log
-                        .lock()
-                        .expect("rtt log")
-                        .push((Instant::now(), sent.elapsed().as_secs_f64() * 1000.0));
-                }
+            if matches!(envelope.payload, Some(wire_envelope::Payload::Pong(_)))
+                && let Some(sent) = pong_state.lock().await.take()
+            {
+                pong_log
+                    .lock()
+                    .expect("rtt log")
+                    .push((Instant::now(), sent.elapsed().as_secs_f64() * 1000.0));
             }
         }
     });

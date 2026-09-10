@@ -380,10 +380,10 @@ use crate::proto::teamviewer::v1::{WireChannel, WireEnvelope, wire_envelope};
                 if bulk_door_tx.send(announce).await.is_err() {
                     break;
                 }
-                if let Some(door_ready) = door_ready_rx.as_mut() {
-                    if door_ready.await.is_err() {
-                        break;
-                    }
+                if let Some(door_ready) = door_ready_rx.as_mut()
+                    && door_ready.await.is_err()
+                {
+                    break;
                 }
                 let Ok(opening) = bulk_connection.open_uni().await else {
                     break;
@@ -410,7 +410,9 @@ use crate::proto::teamviewer::v1::{WireChannel, WireEnvelope, wire_envelope};
                         break;
                     }
                 }
-                let _ = stream.finish();
+                // wtransport 的 finish 是 async(FIN 落网后才 resolve),丢弃
+                // future 等于从不发 FIN:必须 await;写侧已尽,错误无需处理
+                let _ = stream.finish().await;
                 stop.store(true, Ordering::Relaxed);
                 let _ = heartbeat_task.await;
                 debug!(%transfer_id, len = request.content.len(), "WebTransport bulk transfer done");
