@@ -754,6 +754,7 @@ pub(crate) async fn serve_web_map_session(
     .await
     .is_err()
     {
+        warn!(%remote_addr, "handshake ack enqueue failed/timed out; dropping door session");
         state.metrics.unregister(&id);
         return;
     }
@@ -946,7 +947,10 @@ async fn door_writer_loop<Si>(
             changed = state.changed() => { if changed.is_err() { None } else { state.borrow_and_update().clone().map(WriterAction::State) } }
             value = control.recv() => value.map(WriterAction::Control),
         };
-        let Some(action) = action else { break };
+        let Some(action) = action else {
+            info!(id = %context.id, "door writer ended: input channels closed (control/state dropped)");
+            break;
+        };
         let (payloads, state_frame): (Vec<Arc<[u8]>>, Option<StateFrame>) = match action {
             WriterAction::State(frame) => {
                 let mut payloads = Vec::new();
@@ -970,6 +974,11 @@ async fn door_writer_loop<Si>(
             )
             .await;
             if !matches!(sent, Ok(Ok(()))) {
+                match sent {
+                    Err(_) => warn!(id = %context.id, bytes = byte_count, "door writer send timeout (sink blocked 2s)"),
+                    Ok(Err(error)) => warn!(id = %context.id, %error, bytes = byte_count, "door writer send failed"),
+                    Ok(Ok(())) => unreachable!(),
+                }
                 failed = true;
                 break;
             }

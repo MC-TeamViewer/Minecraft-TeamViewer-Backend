@@ -5,6 +5,15 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。Backend 版本与网络协议版本分别演进；版本标题中的
 `protoX.Y.Z` 表示该 Backend 发布时使用的协议版本，而不是 Backend 版本的一部分。
 
+## [1.2.0-alpha.12-proto0.9.0] - 2026-09-11
+
+### 诊断
+
+- QUIC 门写出泵退出原因升级为 warn(state stream 写失败/压缩失败,带字节数与错误)
+- door_writer_loop 三条退出路径分别落日志(send 失败/2s 超时带错误、control 关闭、
+  state watch 关闭),与 disconnect reason="writer_ended" 配套定位 mod 会话秒断
+- 握手 ack 入队失败(原静默丢弃)补 warn
+
 ## [1.2.0-alpha.11-proto0.9.0] - 2026-09-11
 
 ### 修复

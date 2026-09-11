@@ -21,7 +21,7 @@ use anyhow::Context as AnyhowContext;
 use bytes::Bytes;
 use quinn::{Connection, Endpoint, ServerConfig, crypto::rustls::QuicServerConfig};
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     bulk,
@@ -469,7 +469,7 @@ use crate::proto::teamviewer::v1::{WireChannel, WireEnvelope, wire_envelope};
             match crate::compress::StreamEncoder::new(compression_level) {
                 Ok(encoder) => Some(encoder),
                 Err(error) => {
-                    debug!(%error, "QUIC downlink encoder unavailable");
+                    warn!(%error, "QUIC downlink encoder unavailable");
                     // 无下行通道即会话失效:结束写出循环,状态流关闭会
                     // 触发会话拆除;读向由 reader 任务独立处理
                     reader.abort();
@@ -480,11 +480,12 @@ use crate::proto::teamviewer::v1::{WireChannel, WireEnvelope, wire_envelope};
             None
         };
         while let Some(payload) = outgoing_rx.recv().await {
+            let payload_len = payload.len();
             let wire = match encoder.as_mut() {
                 Some(encoder) => match encoder.compress_chunk(&payload) {
                     Ok(chunk) => chunk,
                     Err(error) => {
-                        debug!(%error, "QUIC downlink compress failed");
+                        warn!(%error, bytes = payload_len, "QUIC downlink compress failed; state pump exiting");
                         break;
                     }
                 },
@@ -495,10 +496,13 @@ use crate::proto::teamviewer::v1::{WireChannel, WireEnvelope, wire_envelope};
                     .await
                     .unwrap_or(Err(io::Error::other("state stream write timeout")));
             if let Err(error) = result {
-                debug!(%error, "QUIC state write failed");
+                // 写出泵退出即会话出站死亡(writer_ended 的直接原因),必须
+                // 在生产日志里可见:错误类别定位是 reset/stop 还是超时
+                warn!(%error, bytes = payload_len, "QUIC state stream write failed; state pump exiting");
                 break;
             }
         }
+        warn!("QUIC state pump ended (outbound teardown)");
         reader.abort();
     });
 

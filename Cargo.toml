@@ -1,6 +1,6 @@
 [package]
 name = "teamviewrelay-rust"
-version = "1.2.0-alpha.11"
+version = "1.2.0-alpha.12"
 edition = "2024"
 publish = false
 
