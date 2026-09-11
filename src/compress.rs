@@ -120,13 +120,11 @@ impl Suite {
 
     /// 选定套回显给 WT 客户端的 `WT-Protocol` 头值。
     ///
-    /// **已停用回显**:生产实验实证(2026-09-11,Chrome 146/151)只要服务端
-    /// 按 RFC 9651 带引号回显 `WT-Protocol`,浏览器立即 "Opening handshake
-    /// failed" 中止会话建立;服务端不回显时同一浏览器全链路正常(offer 垃圾
-    /// 值使选择落空的对照组 OK)。规格中服务端选择协议是 MAY——不回显即
-    /// plain 行为,脚本与后端均已兼容 `protocol === ""`。协商恢复留待浏览器
-    /// 语义明确(届时回显值需实测裸 token 格式)。
-    #[allow(dead_code)]
+    /// 必须是**裸 token**(不带 RFC 9651 List 的引号):生产实验实证
+    /// (2026-09-11,Chrome 146/151)带引号回显使浏览器立即 "Opening
+    /// handshake failed" 中止会话建立;裸 token 回显则被 `session.protocol`
+    /// 正常读出(浏览器按 token 解析该头,见 42c47f9 及其恢复提交)。
+    /// 客户端无可识别 offer 时不回显,客户端按 `protocol === ""` 走 plain。
     pub(crate) fn wt_protocol_value(self) -> String {
         self.protocol_name().to_owned()
     }
@@ -135,7 +133,7 @@ impl Suite {
 /// 按客户端偏好序取第一个可识别的 teamviewrelay 协议值;输入是
 /// `WT-Available-Protocols` 头值按逗号切开的片段(RFC 9651 List 的字符串项
 /// 带引号,这里宽容剥引号以兼容非浏览器客户端的裸 token)。无可识别值返回
-/// None(浏览器尚未实现该头——Chromium issue 435589295——回落 plain 行为)。
+/// None(不回显 WT-Protocol,WT 门回落 plain 行为)。
 pub(crate) fn select_wt_protocol<'a, I>(offered: I) -> Option<Suite>
 where
     I: IntoIterator<Item = &'a str>,
@@ -351,8 +349,8 @@ mod tests {
         assert_eq!(select_wt_protocol(["\"chat\"", "other.v1"]), None);
         assert_eq!(select_wt_protocol(std::iter::empty::<&str>()), None);
         assert_eq!(select_wt_protocol(["   "]), None);
-        // wt_protocol_value 保留裸 token 形状(当前不回显,函数标注 dead_code;
-        // 未来恢复协商时需先以裸 token 实测浏览器接受度)
+        // wt_protocol_value 保持裸 token 形状(带引号回显会使 Chrome 中止
+        // 会话建立,见 42c47f9 与其恢复提交)
         assert_eq!(
             Suite::ZstdDict.wt_protocol_value(),
             "teamviewrelay.zstd-dict.v1"

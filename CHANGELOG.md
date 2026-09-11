@@ -5,6 +5,29 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。Backend 版本与网络协议版本分别演进；版本标题中的
 `protoX.Y.Z` 表示该 Backend 发布时使用的协议版本，而不是 Backend 版本的一部分。
 
+## [1.2.0-alpha.13-proto0.9.0] - 2026-09-11
+
+### 修复
+
+- WT 门恢复压缩套协商,修复 web 端 WebTransport "连不上":自停用回显
+  (42c47f9)起,服务端仍按客户端 `WT-Available-Protocols` offer 选套并对
+  下行流做 zstd 压缩,但不再回显 `WT-Protocol`,浏览器 `session.protocol`
+  为空串按 plain 解码——解密抓包实证下行流为 varint 分帧 + zstd 块
+  (magic `28 b5 2f fd`),脚本永远解不出,会话两侧互耗至超时。现以
+  **裸 token** 回显 `WT-Protocol`(带引号的 RFC 9651 List 格式回显会使
+  Chrome 中止会话建立,为 42c47f9 的死因;裸 token 是浏览器解析响应的
+  期望形状),脚本读到回执值即按该套装配 zstd/字典解压器,两端一致。
+  客户端无可识别 offer(旧客户端)不回显,维持 plain 行为。
+- 修正 `select_wt_protocol` 文档:解密抓包实证 Chrome 已发送该请求头
+  (Chromium issue 435589295 已落地),"浏览器尚未实现"的表述过时。
+
+### 验证
+
+- 部署后需在真实 Chrome 观测:WT 会话建立成功、`session.protocol` 非空
+  (裸 token 回显的浏览器接受度系首次实测;若个别版本异常,可临时以
+  42c47f9 方式再次停用回显,但需同步把选套钉死 plain,避免回到
+  "服务端压缩/脚本 plain"的错位)。
+
 ## [1.2.0-alpha.12-proto0.9.0] - 2026-09-11
 
 ### 诊断
