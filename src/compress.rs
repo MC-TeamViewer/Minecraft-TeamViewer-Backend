@@ -118,11 +118,17 @@ impl Suite {
         }
     }
 
-    /// 选定套回显给 WT 客户端的 `WT-Protocol` 头值:RFC 9651 字符串 Item,
-    /// 引号由这里带上(服务端直接写原始头值,Structured Fields 字符串必须
-    /// 带引号)。
+    /// 选定套回显给 WT 客户端的 `WT-Protocol` 头值。
+    ///
+    /// **已停用回显**:生产实验实证(2026-09-11,Chrome 146/151)只要服务端
+    /// 按 RFC 9651 带引号回显 `WT-Protocol`,浏览器立即 "Opening handshake
+    /// failed" 中止会话建立;服务端不回显时同一浏览器全链路正常(offer 垃圾
+    /// 值使选择落空的对照组 OK)。规格中服务端选择协议是 MAY——不回显即
+    /// plain 行为,脚本与后端均已兼容 `protocol === ""`。协商恢复留待浏览器
+    /// 语义明确(届时回显值需实测裸 token 格式)。
+    #[allow(dead_code)]
     pub(crate) fn wt_protocol_value(self) -> String {
-        format!("\"{}\"", self.protocol_name())
+        self.protocol_name().to_owned()
     }
 }
 
@@ -345,15 +351,11 @@ mod tests {
         assert_eq!(select_wt_protocol(["\"chat\"", "other.v1"]), None);
         assert_eq!(select_wt_protocol(std::iter::empty::<&str>()), None);
         assert_eq!(select_wt_protocol(["   "]), None);
-        // WT 门有 datagram:zstd-dict 回显原值(RFC 9651 字符串 Item 带引号)
+        // wt_protocol_value 保留裸 token 形状(当前不回显,函数标注 dead_code;
+        // 未来恢复协商时需先以裸 token 实测浏览器接受度)
         assert_eq!(
             Suite::ZstdDict.wt_protocol_value(),
-            "\"teamviewrelay.zstd-dict.v1\""
-        );
-        assert_eq!(Suite::Zstd.wt_protocol_value(), "\"teamviewrelay.zstd.v1\"");
-        assert_eq!(
-            Suite::Plain.wt_protocol_value(),
-            "\"teamviewrelay.plain.v1\""
+            "teamviewrelay.zstd-dict.v1"
         );
     }
 }

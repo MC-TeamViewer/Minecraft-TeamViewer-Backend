@@ -137,18 +137,13 @@ async fn accept_session(
     }
 
     // 压缩套协商搭 extended CONNECT 便车(0 额外 RTT):客户端在
-    // WT-Available-Protocols(RFC 9651 List)按偏好序携带协议值,服务端择一
-    // 并以 WT-Protocol 回显(必须取自客户端列表)。当前浏览器尚未实现该头,
-    // 不发即 None → plain 行为,与 alpha.5 完全一致;未来浏览器实现后自动激活。
+    // WT-Available-Protocols(RFC 9651 List):客户端 offer 的协议仅记录,
+    // **不回显 WT-Protocol**——Chrome 146/151 只要收到带引号回显立即
+    // "Opening handshake failed" 中止会话(2026-09-11 生产实验实证;
+    // 不回显的对照全链路 OK)。规格中回显是 MAY:不回显即 plain 行为,
+    // 脚本按 session.protocol==="" 走 plain 分支。协商恢复需先裸 token 实测。
     let suite = wt_suite_from_headers(request.headers());
-    let connection = match suite {
-        Some(suite) => {
-            request
-                .accept_with_headers([("WT-Protocol", suite.wt_protocol_value())])
-                .await?
-        }
-        None => request.accept().await?,
-    };
+    let connection = request.accept().await?;
     let remote_addr = remote_addr.to_string();
     info!(
         %remote_addr,
