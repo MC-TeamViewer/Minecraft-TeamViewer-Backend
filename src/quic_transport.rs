@@ -37,8 +37,9 @@ use crate::{
 /// 门合同违规的应用层错误码(混用/合同外流等,当场断连的唯一出口)。
 const DOOR_VIOLATION_CODE: u32 = 0x01;
 
-/// 协议版本线:ALPN 三套并列(alpha.6 压缩阶段启用),rustls 按客户端
-/// 偏好序选择;语义见 compress::Suite。
+/// 协议版本线:ALPN 三套并列(alpha.6 压缩阶段启用),rustls 按服务端
+/// 列表序取客户端也提供的第一个(rustls 不读客户端偏好序);语义见
+/// compress::Suite。
 pub(crate) const ALPN_PLAIN: &str = "teamviewrelay/v1";
 pub(crate) const ALPN_ZSTD: &str = "teamviewrelay/v1+zstd";
 pub(crate) const ALPN_ZSTD_DICT: &str = "teamviewrelay/v1+zstd-dict";
@@ -70,7 +71,7 @@ pub async fn serve(config: WebTransportConfig, state: crate::web::AppState) -> a
                 let state = state.clone();
                 tokio::spawn(async move {
                     if let Err(error) = accept_connection(incoming, state).await {
-                        debug!(%error, "QUIC connection rejected");
+                        info!(%error, "QUIC connection rejected");
                     }
                 });
             }
@@ -84,7 +85,8 @@ async fn build_server_endpoint(
 ) -> anyhow::Result<(CertRuntime, Endpoint)> {
     let (runtime, tls_config) = CertRuntime::load(config).await?;
     let mut tls_config = tls_config;
-    // 三套并列;rustls 按客户端偏好序选择,服务端列表即"全部接受"
+    // 三套并列;rustls 按服务端列表序取客户端也提供的第一个(本序即偏好:
+    // zstd-dict > zstd > plain),客户端不提供的套自然落选
     tls_config.alpn_protocols = vec![
         ALPN_ZSTD_DICT.as_bytes().to_vec(),
         ALPN_ZSTD.as_bytes().to_vec(),
@@ -134,7 +136,7 @@ pub(crate) fn bbr_transport_config() -> quinn::TransportConfig {
     transport
 }
 
-/// 读取握手协商出的 ALPN(现阶段仅日志;压缩阶段起据此选择压缩套)。
+/// 读取握手协商出的 ALPN——它是压缩套的唯一判定依据。
 fn negotiated_alpn(connection: &Connection) -> Option<String> {
     let data = connection
         .handshake_data()?
@@ -233,7 +235,9 @@ fn stream_bridge(
                 // 对端早退后通道关闭的热轮询(非 +zstd-dict 套恒关)
                 Some(id) = dict_ready_rx.recv(), if dict_encoder.dict_enabled() => {
                     dict_encoder.activate(&id);
-                    debug!(dictionary_id = %id, "QUIC datagram dictionary activated");
+                    // info 级:排障时回答「字典到底激活没有」(2026-09-12 抓包
+                    // 曾因无日志而只能靠帧头 dictID 反推)
+                    info!(dictionary_id = %id, "QUIC datagram dictionary activated");
                 }
                 else => return,
             }
@@ -411,10 +415,6 @@ use crate::proto::teamviewer::v1::{WireChannel, WireEnvelope, wire_envelope};
             };
         debug!("QUIC state stream opened");
 
-        // door-control 下行流:服务端第 2 条单向流,必须在状态流之后开启
-        // (流识别按开启序);全部压缩套常开(空闲零开销),字典载荷仍只在
-        // +zstd-dict 套产生。开不出来时字典永不激活、bulk 不启动,datagram
-        // 维持独立压缩,链路照常。
         // door-control 下行流:服务端第 2 条单向流,按需实体化——quinn 的
         // 流要等首帧写出才会过线,故泵任务在收到首帧时才 open_uni(流序仍
         // 为第 2 条:应用下行流的首帧 ack 必然先于任何门控帧,而 bulk 泵要

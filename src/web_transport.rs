@@ -33,7 +33,7 @@ use crate::{
 /// 门合同违规的应用层错误码(与 QUIC 门同值,断连出口唯一)。
 const DOOR_VIOLATION_CODE: u32 = 0x01;
 
-pub struct MpscReceiver {
+pub(crate) struct MpscReceiver {
     receiver: mpsc::Receiver<Result<Bytes, io::Error>>,
 }
 
@@ -51,7 +51,7 @@ impl Stream for MpscReceiver {
     }
 }
 
-pub struct MpscSink {
+pub(crate) struct MpscSink {
     sender: mpsc::Sender<Bytes>,
 }
 
@@ -281,7 +281,8 @@ fn stream_bridge(
                 // 对端早退后通道关闭的热轮询(非 +zstd-dict 套恒关)
                 Some(id) = dict_ready_rx.recv(), if dict_encoder.dict_enabled() => {
                     dict_encoder.activate(&id);
-                    debug!(dictionary_id = %id, "WebTransport datagram dictionary activated");
+                    // info 级:排障时回答「字典到底激活没有」(与 QUIC 门一致)
+                    info!(dictionary_id = %id, "WebTransport datagram dictionary activated");
                 }
                 else => return,
             }

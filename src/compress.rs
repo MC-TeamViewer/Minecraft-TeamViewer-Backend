@@ -3,12 +3,13 @@
 //! **套(suite)** 是"传输门原生协商载体"上商定的压缩行为组合:
 //! - `Plain`     ——流与 datagram 均不压缩;
 //! - `Zstd`      ——可靠流走 zstd,datagram 走独立压缩;
-//! - `ZstdDict`  ——可靠流同 Zstd,datagram 另有字典模式(后续切片接入)。
+//! - `ZstdDict`  ——可靠流同 Zstd,datagram 另有字典模式(door-control 约定)。
 //!
-//! 各门协商载体(0 额外 RTT,服务端确认制):裸 QUIC 用 ALPN
+//! 各门协商载体(0 额外 RTT):裸 QUIC 用 ALPN
 //! (`teamviewrelay/v1[+zstd[-dict]]`);WS 门用子协议
-//! (`teamviewrelay.{plain,zstd,zstd-dict}.v1`);WT 门用 extended CONNECT 的
-//! `WT-Available-Protocols`/`WT-Protocol` 头(协议值与 WS 子协议同名)。
+//! (`teamviewrelay.{plain,zstd,zstd-dict}.v1`);WT 门用 extended CONNECT
+//! 目标 URL 的 query 参数 `?suite=plain|zstd|zstd-dict`(缺省/未知值归
+//! ZstdDict;`WT-Protocol` 裸 token 回显仅前向兼容,请求头不参与决策)。
 //! 同一套语义在三门等价;WS 门无 datagram,其下 `ZstdDict` 与 `Zstd` 行为一致。
 //!
 //! **可靠流 zstd 语义 = 一条连续 zstd 流的分块切片**:发送端每连接一个持久

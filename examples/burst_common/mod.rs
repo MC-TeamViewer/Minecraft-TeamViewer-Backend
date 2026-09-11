@@ -16,7 +16,7 @@ use teamviewrelay_rust::proto::teamviewer::v1::{
     WebMapHandshakeRequest, WireChannel, WireEnvelope, wire_envelope,
 };
 
-#[allow(dead_code)] // 仅 quic_burst 使用(WT 套经 WT-Available-Protocols 头协商)
+#[allow(dead_code)] // 仅 quic_burst 使用
 pub const ALPN_ZSTD_DICT: &str = "teamviewrelay/v1+zstd-dict";
 pub const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 pub const HEARTBEAT_MAGIC: &[u8] = b"tvbulk-hb";

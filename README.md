@@ -240,17 +240,20 @@ WebSocket。证书更新成功只影响新 QUIC 连接，已有连接保留旧 T
 各门的协商载体与当前落地状态：
 
 - **QUIC 门**（ALPN）：`teamviewrelay/v1`（plain）、`teamviewrelay/v1+zstd`、
-  `teamviewrelay/v1+zstd-dict`，rustls 按客户端偏好序选择，未知 ALPN 拒绝握手；
+  `teamviewrelay/v1+zstd-dict`，rustls 按**服务端列表序**取客户端也提供的第一个
+  （服务端序即偏好序：zstd-dict 优先），未知 ALPN 拒绝握手；
 - **WS 门**（子协议）：`Sec-WebSocket-Protocol` 三套并列 `teamviewrelay.plain.v1`、
   `teamviewrelay.zstd.v1`、`teamviewrelay.zstd-dict.v1`，服务端按偏好序择一并在 101
   响应原样回显（RFC 6455 要求回显取自客户端提供的列表；zstd-dict 在 WS 门下流行为
   与 zstd 一致——无 datagram，客户端按收到 dict 回显即 zstd 流语义解释）。选定
   zstd 套时不协商 permessage-deflate（外层 deflate 对 zstd 输出零收益）；客户端未提供
   teamviewrelay 子协议则维持原 deflate 协商路径（旧客户端零变化）；
-- **WT 门**（extended CONNECT 的 `WT-Available-Protocols`/`WT-Protocol` 头，协议值与
-  WS 子协议同名）：服务端按 RFC 9651 解析客户端 List、择一并回显带引号的字符串
-  Item；当前浏览器尚未实现该头（Chromium issue 435589295、Firefox bug 1981483），
-  不发即 plain 行为，浏览器实现后自动激活。
+- **WT 门**（extended CONNECT 目标 URL 的 query 参数，`?suite=plain|zstd|zstd-dict`）：
+  query 是协商的**唯一权威**——浏览器不把 `WT-Protocol` 响应回执暴露给脚本
+  （Chromium issue 435589295），响应头协商通道在浏览器侧断裂，故改走两端共享的
+  URL。未携带 `suite`、值为空或无法识别时一律取 `zstd-dict`（压缩率最高）；
+  服务端仍以裸 token 回显 `WT-Protocol` 响应头，仅作未来浏览器实现协商语义后
+  的前向兼容。
 
 可靠流的 zstd 语义是一条**连续 zstd 流的分块切片**：发送端每连接一个持久 CCtx，逐
 envelope `write + flush` 保证即时可解码，压缩块作为一帧 payload 走 varint 分帧（WS 门

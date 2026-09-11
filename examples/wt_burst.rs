@@ -1,8 +1,8 @@
 //! 突发流量压测(WebTransport 门):与 quic_burst 同一测量语义,走
 //! wtransport 客户端打 WT 门。证书按 TEAMVIEWER_BURST_CERT_SHA256
 //! (DER 的 SHA-256 hex,由压测脚本计算)钉扎,等价浏览器
-//! serverCertificateHashes 语义。压缩套经 `WT-Available-Protocols`
-//! 头协商 +zstd-dict。
+//! serverCertificateHashes 语义。压缩套经 URL query `?suite=` 协商
+//! +zstd-dict(浏览器脚本同款语义)。
 //!
 //! 环境:TEAMVIEWER_BURST_SERVER(默认 127.0.0.1:8766)、
 //! TEAMVIEWER_BURST_CERT_SHA256(必填)、TEAMVIEWER_BURST_ROOM。
@@ -317,13 +317,11 @@ async fn connect(server: &str, cert_sha: &str) -> Result<wtransport::Connection>
         .with_server_certificate_hashes([Sha256Digest::from(hash_bytes)])
         .build();
     let endpoint = wtransport::Endpoint::client(config)?;
-    let url = format!("https://{host}:{port}/web-map/wt");
+    // 压缩套协商走 URL query(服务端 query 唯一权威;WT-Protocol 响应头
+    // 回显仅前向兼容,请求头不参与决策)
+    let url = format!("https://{host}:{port}/web-map/wt?suite=zstd-dict");
     let connection = endpoint
-        .connect(
-            wtransport::endpoint::ConnectOptions::builder(&url)
-                .add_header("WT-Available-Protocols", "\"teamviewrelay.zstd-dict.v1\"")
-                .add_header("WT-Protocol", "\"teamviewrelay.zstd-dict.v1\""),
-        )
+        .connect(wtransport::endpoint::ConnectOptions::builder(&url))
         .await?;
     Ok(connection)
 }
