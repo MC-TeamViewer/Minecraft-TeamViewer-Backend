@@ -5,6 +5,22 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。Backend 版本与网络协议版本分别演进；版本标题中的
 `protoX.Y.Z` 表示该 Backend 发布时使用的协议版本，而不是 Backend 版本的一部分。
 
+## [1.2.0-alpha.11-proto0.9.0] - 2026-09-11
+
+### 修复
+
+- WT 门停用 `WT-Protocol` 协商回显:生产实验实证 Chrome 146/151 只要收到带引号
+  回显立即 "Opening handshake failed" 中止会话建立;不回显(规格 MAY 语义)回落
+  plain 行为,浏览器脚本全链路恢复。
+- SQLite `synchronous` 降为 NORMAL(WAL 下安全):消除流量统计 flush 提交的
+  fsync 尖峰(慢盘上单条 upsert 曾达 1.1s)。
+
+### 变更
+
+- 观测补强:WT 门 accept_bi 超时/控制流缺失/状态流失败由静默改 `warn`(带远端
+  地址);door session disconnected 补 `reason`(writer/reader/datagram 谁先
+  结束);首帧 10s 缺失补 `warn`。
+
 ## [1.2.0-alpha.6-proto0.9.0] - 2026-09-08
 
 ### 新增

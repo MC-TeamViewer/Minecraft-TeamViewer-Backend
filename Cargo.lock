@@ -3190,7 +3190,7 @@ dependencies = [
 
 [[package]]
 name = "teamviewrelay-rust"
-version = "1.2.0-alpha.10"
+version = "1.2.0-alpha.11"
 dependencies = [
  "anyhow",
  "axum",
