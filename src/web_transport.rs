@@ -129,39 +129,40 @@ async fn accept_session(
         .await
         .context("WebTransport session timeout")??;
     let remote_addr = request.remote_address();
-    let path = request.path().to_owned();
+    let raw_target = request.path().to_owned();
     let user_agent = request.user_agent().map(str::to_owned);
+    // 套协商经 URL query(?suite=<token>),path 与 query 先分离再比较
+    let (path, query) = match raw_target.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (raw_target.as_str(), ""),
+    };
     if path != WEB_TRANSPORT_PATH {
         drop(request.not_found());
-        anyhow::bail!("unexpected WebTransport path: {path}");
+        anyhow::bail!("unexpected WebTransport path: {raw_target}");
     }
 
-    // 压缩套协商搭 extended CONNECT 便车(0 额外 RTT):客户端在
-    // WT-Available-Protocols(RFC 9651 List)提供候选,服务端择一后以
-    // **裸 token** 回显 WT-Protocol。回显值绝不能带 RFC 9651 的引号——
-    // Chrome 146/151 收到带引号回显立即 "Opening handshake failed" 中止
-    // 会话建立(2026-09-11 生产实验实证,见 42c47f9);裸 token 是浏览器
-    // 解析响应的期望形状,session.protocol 读到回执值即按该套装配解压器。
-    // 客户端无可识别 offer(旧客户端)不回显,保持 plain 行为。
-    let suite = wt_suite_from_headers(request.headers());
-    let connection = match &suite {
-        Some(selected) => {
-            request
-                .accept_with_headers([("wt-protocol", selected.wt_protocol_value())])
-                .await?
-        }
-        None => request.accept().await?,
-    };
+    // 压缩套协商搭 extended CONNECT 便车(0 额外 RTT),**URL query 是唯一
+    // 权威来源**:`?suite=<plain|zstd|zstd-dict>`,不指定默认 zstd-dict
+    // (压缩率最高)。浏览器脚本必须显式声明——Chromium 不把 `WT-Protocol`
+    // 回执暴露到 `session.protocol`(2026-09-11 抓包实证:裸 token 回执在线、
+    // 会话建立,脚本仍读到空串,全部下行按 plain 解失败),`WT-Available-
+    // Protocols` offer 头因此不参与决策。选定套仍以**裸 token** 回显
+    // WT-Protocol(带引号回显会使 Chrome 立即中止会话建立,见 42c47f9),
+    // 回显仅作未来浏览器实现协商语义后的前向兼容。
+    let suite = wt_suite_from_query(query);
+    let connection = request
+        .accept_with_headers([("wt-protocol", suite.wt_protocol_value())])
+        .await?;
     let remote_addr = remote_addr.to_string();
     info!(
         %remote_addr,
-        path = %path,
+        path = %raw_target,
         user_agent = user_agent.as_deref().unwrap_or("unknown"),
         ?suite,
         "WebTransport session accepted"
     );
     let mut session =
-        stream_bridge(connection, suite.unwrap_or_default(), state.config.zstd_compression_level, remote_addr.clone());
+        stream_bridge(connection, suite, state.config.zstd_compression_level, remote_addr.clone());
     // bulk 触发通道入表(debug 端点按表投递;会话死透时发送失败自然逐出)
     if let Some(bulk_tx) = session.bulk.take() {
         let hub_id = state.bulk_hub.register(bulk_tx).await;
@@ -171,17 +172,19 @@ async fn accept_session(
     Ok(())
 }
 
-/// 从 extended CONNECT 请求头解析压缩套:`WT-Available-Protocols`(RFC 9651
-/// 字符串 List,逗号分隔,客户端偏好序)。h3 头名本应小写,这里仍大小写不敏感
-/// 查找以防客户端实现差异;无该头或无可识别值 → None(plain)。
-fn wt_suite_from_headers(
-    headers: &std::collections::HashMap<String, String>,
-) -> Option<crate::compress::Suite> {
-    headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("wt-available-protocols"))
-        .map(|(_, value)| value)
-        .and_then(|value| crate::compress::select_wt_protocol(value.split(',')))
+/// 从 CONNECT 目标 URL 的 query 串解析压缩套:`suite=<plain|zstd|zstd-dict>`。
+/// 不带参数(或值不可识别)默认 `zstd-dict`(见 Suite::from_query_value)。
+/// query 无编码字符,手写 split 足够。
+fn wt_suite_from_query(query: &str) -> crate::compress::Suite {
+    query
+        .split('&')
+        .find_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            name.trim()
+                .eq_ignore_ascii_case("suite")
+                .then_some(value.trim())
+        })
+        .map_or(crate::compress::Suite::ZstdDict, crate::compress::Suite::from_query_value)
 }
 
 fn stream_bridge(
@@ -1143,36 +1146,23 @@ mod tests {
     }
 
     #[test]
-    fn wt_suite_negotiation_parses_available_protocols_header() {
-        let mut headers = std::collections::HashMap::new();
-        // 无该头:当前浏览器均未实现 → plain 路径(alpha.5 行为)
-        assert_eq!(wt_suite_from_headers(&headers), None);
-        // 规范形态:RFC 9651 List,带引号字符串项,按客户端偏好序择一
-        headers.insert(
-            "wt-available-protocols".to_string(),
-            "\"teamviewrelay.zstd.v1\", \"teamviewrelay.plain.v1\"".to_string(),
-        );
+    fn wt_suite_negotiation_parses_query_parameter() {
+        use crate::compress::Suite;
+        // 三种短名模式,大小写不敏感、容忍空白
+        assert_eq!(wt_suite_from_query("suite=plain"), Suite::Plain);
+        assert_eq!(wt_suite_from_query("suite=zstd"), Suite::Zstd);
+        assert_eq!(wt_suite_from_query("suite=zstd-dict"), Suite::ZstdDict);
+        assert_eq!(wt_suite_from_query("Suite=ZSTD"), Suite::Zstd);
+        // 多参数混排、值带空白
         assert_eq!(
-            wt_suite_from_headers(&headers),
-            Some(crate::compress::Suite::Zstd)
+            wt_suite_from_query("room=x&suite= plain &z=1"),
+            Suite::Plain
         );
-        // 头名大小写不敏感兜底
-        let mut upper = std::collections::HashMap::new();
-        upper.insert(
-            "WT-Available-Protocols".to_string(),
-            "\"teamviewrelay.plain.v1\"".to_string(),
-        );
-        assert_eq!(
-            wt_suite_from_headers(&upper),
-            Some(crate::compress::Suite::Plain)
-        );
-        // 无可识别值 → None
-        let mut other = std::collections::HashMap::new();
-        other.insert(
-            "wt-available-protocols".to_string(),
-            "\"chat.v2\", \"other\"".to_string(),
-        );
-        assert_eq!(wt_suite_from_headers(&other), None);
+        // 不指定 / 空值 / 未知值 / 只有别的参数 → 默认压缩率最高的字典套
+        assert_eq!(wt_suite_from_query(""), Suite::ZstdDict);
+        assert_eq!(wt_suite_from_query("suite="), Suite::ZstdDict);
+        assert_eq!(wt_suite_from_query("suite=chat.v2"), Suite::ZstdDict);
+        assert_eq!(wt_suite_from_query("room=nodemc2026"), Suite::ZstdDict);
     }
 
     /// zstd 套桥接单向压缩:上行 bi 流恒为 plain 分帧(原样解出 envelope),

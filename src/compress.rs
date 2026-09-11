@@ -120,35 +120,28 @@ impl Suite {
 
     /// 选定套回显给 WT 客户端的 `WT-Protocol` 头值。
     ///
-    /// 必须是**裸 token**(不带 RFC 9651 List 的引号):生产实验实证
-    /// (2026-09-11,Chrome 146/151)带引号回显使浏览器立即 "Opening
-    /// handshake failed" 中止会话建立;裸 token 回显则被 `session.protocol`
-    /// 正常读出(浏览器按 token 解析该头,见 42c47f9 及其恢复提交)。
-    /// 客户端无可识别 offer 时不回显,客户端按 `protocol === ""` 走 plain。
+    /// 必须是**裸 token**(不带 RFC 9651 List 的引号):带引号回显使
+    /// Chrome 146/151 立即 "Opening handshake failed" 中止会话建立
+    /// (2026-09-11 生产实验实证,见 42c47f9)。但裸 token 也只是「不中止」:
+    /// 同日抓包实证 Chromium 并不把该头暴露到 `session.protocol`(回执
+    /// 在线、会话建立,脚本仍读到空串),浏览器脚本的套协商因此走 URL
+    /// query(`?suite=<plain|zstd|zstd-dict>`,见 web_transport.rs)。回显
+    /// 保留仅作未来浏览器实现协商语义后的前向兼容。
     pub(crate) fn wt_protocol_value(self) -> String {
         self.protocol_name().to_owned()
     }
-}
 
-/// 按客户端偏好序取第一个可识别的 teamviewrelay 协议值;输入是
-/// `WT-Available-Protocols` 头值按逗号切开的片段(RFC 9651 List 的字符串项
-/// 带引号,这里宽容剥引号以兼容非浏览器客户端的裸 token)。无可识别值返回
-/// None(不回显 WT-Protocol,WT 门回落 plain 行为)。
-pub(crate) fn select_wt_protocol<'a, I>(offered: I) -> Option<Suite>
-where
-    I: IntoIterator<Item = &'a str>,
-{
-    offered
-        .into_iter()
-        .filter_map(|value| {
-            let trimmed = value.trim();
-            let unquoted = trimmed
-                .strip_prefix('"')
-                .and_then(|rest| rest.strip_suffix('"'))
-                .unwrap_or(trimmed);
-            (!unquoted.is_empty()).then_some(unquoted)
-        })
-        .find_map(Suite::from_subprotocol)
+    /// WT 门 URL query `suite=` 参数值 → 套。短名三选一(`plain` / `zstd` /
+    /// `zstd-dict`),大小写不敏感;其余任何值(含空串)一律 `ZstdDict`——
+    /// query 是 WT 门套协商的唯一权威来源,默认取压缩率最高的字典套,
+    /// 打错字的客户端与不声明能力的客户端行为一致,无需区分。
+    pub(crate) fn from_query_value(value: &str) -> Suite {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "plain" => Suite::Plain,
+            "zstd" => Suite::Zstd,
+            _ => Suite::ZstdDict,
+        }
+    }
 }
 
 /// 下行(服务端→客户端)持久压缩器:逐 envelope flush 出自包含可即时解码
@@ -325,32 +318,22 @@ mod tests {
     }
 
     #[test]
-    fn wt_protocol_selection_strips_structured_field_quotes() {
-        // 浏览器规范形态:RFC 9651 List 字符串项带引号,逗号+空格分隔,
-        // 按客户端偏好序取第一个可识别值
+    fn wt_query_value_selects_suite_with_zstd_dict_default() {
+        // 短名三选一,大小写不敏感、容忍空白
+        assert_eq!(Suite::from_query_value("plain"), Suite::Plain);
+        assert_eq!(Suite::from_query_value("zstd"), Suite::Zstd);
+        assert_eq!(Suite::from_query_value("zstd-dict"), Suite::ZstdDict);
+        assert_eq!(Suite::from_query_value(" ZSTD-DICT "), Suite::ZstdDict);
+        assert_eq!(Suite::from_query_value("Plain"), Suite::Plain);
+        // 其余任何值(含空串、打错字、长 token)一律默认字典套
+        assert_eq!(Suite::from_query_value(""), Suite::ZstdDict);
+        assert_eq!(Suite::from_query_value("chat"), Suite::ZstdDict);
         assert_eq!(
-            select_wt_protocol([
-                "\"teamviewrelay.zstd.v1\"",
-                "\"teamviewrelay.plain.v1\"",
-                "\"chat.v2\""
-            ]),
-            Some(Suite::Zstd)
+            Suite::from_query_value("teamviewrelay.zstd.v1"),
+            Suite::ZstdDict
         );
-        // 非浏览器客户端的裸 token 同样接受
-        assert_eq!(
-            select_wt_protocol(["teamviewrelay.plain.v1", SUBPROTOCOL_ZSTD]),
-            Some(Suite::Plain)
-        );
-        assert_eq!(
-            select_wt_protocol(["\"teamviewrelay.zstd-dict.v1\""]),
-            Some(Suite::ZstdDict)
-        );
-        // 无可识别值 → None(旧客户端不发该头,同样 None → plain 行为)
-        assert_eq!(select_wt_protocol(["\"chat\"", "other.v1"]), None);
-        assert_eq!(select_wt_protocol(std::iter::empty::<&str>()), None);
-        assert_eq!(select_wt_protocol(["   "]), None);
         // wt_protocol_value 保持裸 token 形状(带引号回显会使 Chrome 中止
-        // 会话建立,见 42c47f9 与其恢复提交)
+        // 会话建立,见 42c47f9;回执不被 Chromium 暴露,仅前向兼容保留)
         assert_eq!(
             Suite::ZstdDict.wt_protocol_value(),
             "teamviewrelay.zstd-dict.v1"

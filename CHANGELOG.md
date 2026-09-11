@@ -5,6 +5,29 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。Backend 版本与网络协议版本分别演进；版本标题中的
 `protoX.Y.Z` 表示该 Backend 发布时使用的协议版本，而不是 Backend 版本的一部分。
 
+## [1.2.0-alpha.14-proto0.9.0] - 2026-09-11
+
+### 修复
+
+- WT 门套协商改走 **URL query**(`/web-map/wt?suite=plain|zstd|zstd-dict`,
+  不指定默认 `zstd-dict`,压缩率最高),彻底修复 web 端地图空白:
+  alpha.13 的裸 token `WT-Protocol` 回显虽被 Chrome 接受(会话不再中止),
+  但抓包 + 控制台实证 **Chromium 不把该回执暴露到 `session.protocol`**——
+  脚本恒读空串按 plain 装配,服务端按 offer 选 zstd 压缩,下行每条消息
+  `unsupported_or_undecodable_transport_payload`,响应头协商通道在浏览器
+  侧断裂(Chromium issue 435589295 未 ship)。URL query 搭 extended CONNECT
+  便车(0 额外 RTT),两端读同一 URL 必然一致;`WT-Available-Protocols`
+  offer 头不再参与 WT 门决策(query 唯一权威),回显仍按最终套裸 token
+  保留(未来浏览器实现协商语义后自动对齐)。
+- 路由匹配先剥 query 再比较,`/web-map/wt?suite=...` 不再 404。
+
+### 部署
+
+- **先部署本后端,再更新 web 脚本(v0.5.0-alpha.7+)**:新脚本建连 URL 带
+  query,旧后端按整串 path 匹配会 404;旧脚本连本后端维持既有错位
+  (本就不可用),无额外劣化。脚本侧装配同样按 URL 解析(`suiteFromWtUrl`,
+  无参数默认 zstd-dict),手输 URL 加 `?suite=plain` 可强制明文调试。
+
 ## [1.2.0-alpha.13-proto0.9.0] - 2026-09-11
 
 ### 修复
